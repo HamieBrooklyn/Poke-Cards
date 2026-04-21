@@ -1,4 +1,4 @@
-# poke-pon-bot
+# Poke-Cards
 
 Discord bot built with [discord.py](https://discordpy.readthedocs.io/en/stable/discord.html). Layout is meant to stay small now and grow with **cogs** (see `poke_pon_bot/cogs/`).
 
@@ -10,7 +10,7 @@ Discord bot built with [discord.py](https://discordpy.readthedocs.io/en/stable/d
 4. **This repo**
 
    ```bash
-   cd ~/Projects/poke-pon-bot
+   cd ~/Documents/GitHub/Poke-Cards
    python3 -m venv .venv
    source .venv/bin/activate   # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
