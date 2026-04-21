@@ -18,6 +18,12 @@ Discord bot built with [discord.py](https://discordpy.readthedocs.io/en/stable/d
    # Edit .env: set DISCORD_TOKEN=...
    ```
 
+   If you **moved or cloned** this folder and `python` is missing after `source .venv/bin/activate`, the virtualenv still referenced the old directory. Recreate it:
+
+   ```bash
+   rm -rf .venv && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+   ```
+
    Optional: set `DEV_GUILD_ID` to your test server’s ID so slash commands sync quickly while you develop.
 
 5. **Run**
