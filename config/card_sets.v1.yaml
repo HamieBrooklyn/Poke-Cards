@@ -1,0 +1,6 @@
+# Pokémon TCG API set IDs to import for v1 (curated subset).
+# Add more under sets: — browse sets at https://pokemontcg.io/
+sets:
+  - sv1 # Scarlet & Violet base
+  - sv2 # Paldea Evolved
+  - sv3 # Obsidian Flames
