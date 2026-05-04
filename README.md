@@ -95,6 +95,8 @@ python -m poke_pon_bot.scripts.sync_catalog
 
 Already-imported cards are upserted by `tcg_card_id`.
 
+**Evolution:** Branch targets (for example Eevee) first use printings from the **same** expansion as your copy; if that set never printed a listed evolution (common), the bot picks a fallback **from any other synced set** (newest Scarlet & Violet–style block preferred). Import enough sets that those species exist somewhere.
+
 ## Moving to PostgreSQL later
 
 Keep code changes minimal: install an async Postgres driver (for example `asyncpg`), set:

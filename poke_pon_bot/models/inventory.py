@@ -17,6 +17,14 @@ class UserCardInstance(Base):
     __tablename__ = "user_card_instances"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Stable per-copy id for display and future trades: new rows use 16 url-safe chars (96 bits);
+    # existing rows may still be 32 hex. Not the same as integer primary `id`.
+    public_id: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
     discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     card_id: Mapped[int] = mapped_column(
         Integer,
@@ -30,5 +38,7 @@ class UserCardInstance(Base):
         nullable=False,
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="drop")
+    # Times this copy has been evolved (future costs scale with this).
+    evolution_stages: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     card = relationship("Card", back_populates="instances")

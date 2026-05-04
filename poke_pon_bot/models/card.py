@@ -24,7 +24,18 @@ class Card(Base):
     image_large_url: Mapped[str] = mapped_column(Text, nullable=False)
     supertype: Mapped[str | None] = mapped_column(String(64), nullable=True)
     hp: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Pokémon TCG API ``attacks`` (name, damage, text, cost); used for duels.
+    attacks: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     dex_numbers: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    # API evolvesTo / evolvesFrom — used to resolve ``evolves_to_card_id`` during sync.
+    evolves_to_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    evolves_from: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    evolves_to_card_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("cards.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     rarity_class_id: Mapped[int] = mapped_column(
         Integer,

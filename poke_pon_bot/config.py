@@ -12,10 +12,14 @@ class Settings:
     discord_token: str | None
     """Optional guild ID for faster slash-command sync while developing."""
     dev_guild_id: int | None
+    """Discord user IDs (snowflakes) allowed to use ``/dev`` commands; empty disables them."""
+    developer_ids: frozenset[int]
     database_url: str
     tcg_api_key: str | None
     """YAML listing Pokémon TCG set IDs to sync."""
     card_sets_config: Path
+    # True = request message content (see DISCORD_MESSAGE_CONTENT_INTENT in .env.example).
+    discord_message_content_intent: bool
 
 
 def _default_card_sets_path() -> Path:
@@ -40,6 +44,17 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
     else:
         dev_guild_id = None
 
+    raw_dev_ids = (os.environ.get("DEVELOPER_IDS") or "").replace(",", " ")
+    dev_id_parts: list[str] = [p for p in raw_dev_ids.split() if p]
+    dev_ids: set[int] = set()
+    for p in dev_id_parts:
+        try:
+            dev_ids.add(int(p))
+        except ValueError as exc:
+            raise SystemExit(
+                "DEVELOPER_IDS must be a comma- or space-separated list of numeric Discord user IDs."
+            ) from exc
+
     database_url = (
         os.environ.get("DATABASE_URL") or "sqlite+aiosqlite:///./data/poke_cards.db"
     ).strip()
@@ -50,10 +65,15 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
     raw_sets = (os.environ.get("CARD_SETS_CONFIG") or "").strip()
     card_sets_config = Path(raw_sets) if raw_sets else _default_card_sets_path()
 
+    raw_mci = (os.environ.get("DISCORD_MESSAGE_CONTENT_INTENT") or "").strip().lower()
+    discord_message_content_intent = raw_mci in ("1", "true", "yes", "on")
+
     return Settings(
         discord_token=token,
         dev_guild_id=dev_guild_id,
+        developer_ids=frozenset(dev_ids),
         database_url=database_url,
         tcg_api_key=tcg_api_key,
         card_sets_config=card_sets_config,
+        discord_message_content_intent=discord_message_content_intent,
     )

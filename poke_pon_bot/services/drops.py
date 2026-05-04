@@ -7,11 +7,13 @@ import secrets
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.drops import DropTable, DropWeight
 from poke_pon_bot.models.inventory import UserCardInstance
+from poke_pon_bot.services.instance_public_id import new_public_id
 from poke_pon_bot.services.weighted_rng import weighted_choice
 
 # After the first two guaranteed rolls: probability of each next card appearing,
@@ -24,6 +26,7 @@ _MAX_PACK_SIZE = min(25, 2 + len(_EXTRA_CARD_CHANCES))
 class DropResult:
     card: Card
     instance_id: int
+    public_id: str
 
 
 class DropService:
@@ -107,14 +110,23 @@ class DropService:
         source: str = "drop",
     ) -> DropResult:
         """Persist a single chosen card into the user inventory."""
-        row = UserCardInstance(
-            discord_user_id=discord_user_id,
-            card_id=card.id,
-            source=source,
-        )
-        session.add(row)
-        await session.flush()
-        return DropResult(card=card, instance_id=row.id)
+        for _ in range(12):
+            row = UserCardInstance(
+                public_id=new_public_id(),
+                discord_user_id=discord_user_id,
+                card_id=card.id,
+                source=source,
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(row)
+                    await session.flush()
+            except IntegrityError:
+                # Vanishingly rare id clash; new_public_id and retry. Savepoint spares a full rollback.
+                continue
+            return DropResult(card=card, instance_id=row.id, public_id=row.public_id)
+        msg = "Could not assign a unique Card ID — try again."
+        raise RuntimeError(msg)
 
     async def pull(
         self,
