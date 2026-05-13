@@ -94,6 +94,53 @@ def _compose_grid(tiles: Sequence[Image.Image], cols: int) -> Image.Image:
     return canvas
 
 
+def compose_vs_collage_with_gap_labels(tiles: Sequence[Image.Image], *, gap_labels: list[str]) -> Image.Image:
+    """Compose exactly **two** tiles side-by-side with centered gap lettering."""
+    if len(tiles) != 2:
+        raise ValueError("expected exactly two tiles")
+    if len(gap_labels) != 1:
+        raise ValueError("expected exactly one gap label between tiles")
+
+    a, b = tiles
+    row_h = max(a.height, b.height)
+    gap_px = max(34, min(72, int(min(a.width, b.width) * 0.10)))
+
+    canvas_w = a.width + gap_px + b.width
+    canvas_h = row_h
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), BG)
+
+    dy_a = max(0, (row_h - a.height) // 2)
+    dy_b = max(0, (row_h - b.height) // 2)
+
+    if a.mode == "RGBA":
+        canvas.paste(a, (0, dy_a), a)
+    else:
+        canvas.paste(a, (0, dy_a))
+
+    ax_gap = a.width + gap_px // 2
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default()
+    except OSError:
+        font = None  # type: ignore[assignment]
+
+    label = gap_labels[0]
+    bbox = draw.textbbox((0, 0), label, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = int(ax_gap - tw / 2)
+    ty = int((row_h - th) / 2)
+    draw.text((tx, ty), label, fill=(235, 240, 255), font=font)
+
+    x_b = a.width + gap_px
+    if b.mode == "RGBA":
+        canvas.paste(b, (x_b, dy_b), b)
+    else:
+        canvas.paste(b, (x_b, dy_b))
+
+    return canvas
+
+
 async def render_pack_collage_png(cards: list[Card]) -> io.BytesIO | None:
     """Download card art and return PNG bytes in a ``BytesIO``, or ``None`` on total failure."""
     if not cards:
@@ -115,5 +162,83 @@ async def render_pack_collage_png(cards: list[Card]) -> io.BytesIO | None:
 
     buf = io.BytesIO()
     collage.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+async def render_url_collage_png(urls: list[str], labels: list[str] | None = None) -> io.BytesIO | None:
+    """Download images by URL and return a PNG collage (2 columns when possible).
+
+    Used for duels where we only have image URLs, not `Card` rows.
+    """
+    if not urls:
+        return None
+    if labels is None:
+        labels = ["" for _ in urls]
+    if len(labels) != len(urls):
+        raise ValueError("labels must match urls length")
+
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "Poke-Cards-Bot/1.0"}) as client:
+        fetched = await asyncio.gather(*[_fetch_art(client, u) for u in urls])
+
+    tiles: list[Image.Image] = []
+    for label, raw in zip(labels, fetched, strict=True):
+        if raw is None:
+            tiles.append(_placeholder(260, TARGET_ROW_HEIGHT, label or "Card"))
+        else:
+            tiles.append(_resize_to_height(raw, TARGET_ROW_HEIGHT))
+
+    cols = 1 if len(tiles) == 1 else 2
+    collage = _compose_grid(tiles, cols=cols)
+    buf = io.BytesIO()
+    collage.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+async def render_url_vs_collage_png(
+    urls: list[str],
+    labels: list[str] | None = None,
+    *,
+    gap_label: str = "VS",
+) -> io.BytesIO | None:
+    """Side-by-side collage with centered gap label (typically VS)."""
+    if len(urls) != 2:
+        raise ValueError("render_url_vs_collage_png expects exactly two URLs")
+    if labels is None:
+        labels = ["", ""]
+    if len(labels) != 2:
+        raise ValueError("labels must match urls length")
+
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "Poke-Cards-Bot/1.0"}) as client:
+        fetched = await asyncio.gather(*[_fetch_art(client, u) for u in urls])
+
+    tiles: list[Image.Image] = []
+    for label, raw in zip(labels, fetched, strict=True):
+        if raw is None:
+            tiles.append(_placeholder(260, TARGET_ROW_HEIGHT, label or "Card"))
+        else:
+            tiles.append(_resize_to_height(raw, TARGET_ROW_HEIGHT))
+
+    collage = compose_vs_collage_with_gap_labels(tiles, gap_labels=[gap_label])
+    buf = io.BytesIO()
+    collage.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+async def render_single_card_png_from_url(url: str, *, label: str = "") -> io.BytesIO | None:
+    """Download one card image and return PNG bytes resized similarly to collages."""
+    if not url:
+        return None
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "Poke-Cards-Bot/1.0"}) as client:
+        raw = await _fetch_art(client, url)
+    if raw is None:
+        tile = _placeholder(260, TARGET_ROW_HEIGHT, label or "Card")
+    else:
+        tile = _resize_to_height(raw, TARGET_ROW_HEIGHT)
+
+    buf = io.BytesIO()
+    tile.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf

@@ -27,6 +27,8 @@ class Card(Base):
     # Pokémon TCG API ``attacks`` (name, damage, text, cost); used for duels.
     attacks: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     dex_numbers: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    # Pokémon TCG API ``types`` (e.g. Water, Fire); duel type matchups.
+    tcg_types: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     # API evolvesTo / evolvesFrom — used to resolve ``evolves_to_card_id`` during sync.
     evolves_to_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     evolves_from: Mapped[str | None] = mapped_column(String(512), nullable=True)

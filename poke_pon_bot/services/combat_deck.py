@@ -8,10 +8,108 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.combat_deck import UserCombatDeck
 from poke_pon_bot.models.inventory import UserCardInstance
-from poke_pon_bot.services.instance_public_id import normalize_public_id
+from poke_pon_bot.services.instance_public_id import compact_public_id_for_line, normalize_public_id
 
 MIN_DECK = 1
 MAX_DECK = 6
+
+
+def _truncate(text: str, max_len: int) -> str:
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+async def load_deck_slots_padded(session: AsyncSession, discord_user_id: int) -> list[int | None]:
+    """Six bench slots; unused trailing seats are ``None``."""
+    ids = await get_saved_instance_ids(session, discord_user_id)
+    out: list[int | None] = [None] * MAX_DECK
+    if not ids:
+        return out
+    for i, x in enumerate(ids[:MAX_DECK]):
+        try:
+            out[i] = int(x)
+        except (TypeError, ValueError):
+            return [None] * MAX_DECK
+    return out
+
+
+async def deck_slots_embed_body(
+    session: AsyncSession,
+    discord_user_id: int,
+    slots: list[int | None],
+) -> str:
+    """Human-readable lines for the deck editor embed."""
+    lines: list[str] = []
+    for i, sid in enumerate(slots):
+        prefix = f"**{i + 1}.**"
+        if i == 0:
+            prefix += " *(lead)*"
+        if sid is None:
+            lines.append(f"{prefix} — *empty*")
+            continue
+        inst = await session.get(UserCardInstance, sid)
+        if inst is None or inst.discord_user_id != discord_user_id:
+            lines.append(f"{prefix} — _(missing instance)_")
+            continue
+        card = await session.get(Card, inst.card_id)
+        if card is None:
+            lines.append(f"{prefix} — _(missing card)_")
+            continue
+        nm = _truncate(card.name, 36)
+        pid = compact_public_id_for_line(inst.public_id)
+        lines.append(f"{prefix} **{nm}** `{pid}`")
+    return "\n".join(lines)
+
+
+async def resolve_owned_instance_by_public_id(
+    session: AsyncSession,
+    discord_user_id: int,
+    raw: str,
+) -> tuple[int | None, str | None]:
+    """Resolve a pasted Card ID to ``UserCardInstance.id``, or return ``(None, error)``."""
+    n = normalize_public_id(raw.strip())
+    if n is None:
+        return None, "That doesn't look like a **Card ID**."
+    row = await session.execute(
+        select(UserCardInstance.id)
+        .where(
+            UserCardInstance.discord_user_id == discord_user_id,
+            UserCardInstance.public_id == n,
+        )
+        .limit(1),
+    )
+    first = row.first()
+    if first is None:
+        return None, "You don't own a card with that **Card ID**."
+    return int(first[0]), None
+
+
+async def persist_deck_slots(
+    session: AsyncSession,
+    discord_user_id: int,
+    slots: list[int | None],
+) -> str | None:
+    """Apply six-slot editor state to the DB. Returns an error string or ``None``."""
+    compact = [x for x in slots if x is not None]
+    if len(compact) == 0:
+        row = await session.get(UserCombatDeck, discord_user_id)
+        if row is not None:
+            await session.delete(row)
+        return None
+    if len(compact) < MIN_DECK:
+        return f"Keep at least **{MIN_DECK}** Pokémon in your deck (or clear every slot to delete the deck)."
+    if len(compact) > MAX_DECK:
+        return f"A deck can have at most **{MAX_DECK}** Pokémon."
+    if len(set(compact)) != len(compact):
+        return "That physical card is already in another slot."
+    check = await load_fighters_ordered(session, discord_user_id, compact)
+    if isinstance(check, str):
+        return check
+    existing = await session.get(UserCombatDeck, discord_user_id)
+    if existing is None:
+        session.add(UserCombatDeck(discord_user_id=discord_user_id, instance_ids=compact))
+    else:
+        existing.instance_ids = compact
+    return None
 
 
 def _parse_hp(hp_raw: str | None) -> int:
@@ -58,7 +156,7 @@ async def load_fighters_ordered(
     if len(ordered_instance_ids) < MIN_DECK or len(ordered_instance_ids) > MAX_DECK:
         return f"Deck must have **{MIN_DECK}**–**{MAX_DECK}** Pokémon."
     if len(set(ordered_instance_ids)) != len(ordered_instance_ids):
-        return "Deck can’t include the same physical card twice."
+        return "Deck can't include the same physical card twice."
     pairs: list[tuple[UserCardInstance, Card]] = []
     for iid in ordered_instance_ids:
         inst = await session.get(UserCardInstance, iid)

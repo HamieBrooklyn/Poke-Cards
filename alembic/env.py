@@ -20,7 +20,12 @@ if config.config_file_name is not None:
 
 
 def get_sync_database_url() -> str:
-    url = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/poke_cards.db").strip()
+    # Priority: explicit ``sqlalchemy.url`` set on the alembic Config (e.g. when the bot
+    # boots and calls ``command.upgrade`` programmatically) → ``DATABASE_URL`` env var →
+    # hardcoded local sqlite default. Without this fallback chain, in-process invocations
+    # silently fall back to the env var and skip the upgrade.
+    cfg_url = (config.get_main_option("sqlalchemy.url") or "").strip()
+    url = cfg_url or os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/poke_cards.db").strip()
     if "+aiosqlite" in url:
         return url.replace("sqlite+aiosqlite", "sqlite", 1)
     return url

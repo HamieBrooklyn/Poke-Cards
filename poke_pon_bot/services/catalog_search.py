@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.rarity import RarityClass
 from poke_pon_bot.services.collection_search import _apply_filters
+from poke_pon_bot.services.excluded_sets import excluded_set_clause
 
 # Max rows for /catalog search text list.
 CATALOG_TEXT_LIMIT = 25
@@ -57,7 +58,7 @@ def _build_catalog_select(
     tcg_card_id: str | None = None,
 ) -> Select:
     """Primary filtered ``SELECT cards.*`` (may join ``rarity_classes``)."""
-    stmt: Select = select(Card)
+    stmt: Select = select(Card).where(excluded_set_clause(Card.set_code))
     if tcg_card_id and tcg_card_id.strip():
         stmt = stmt.where(Card.tcg_card_id == tcg_card_id.strip())
     stmt = _apply_filters(

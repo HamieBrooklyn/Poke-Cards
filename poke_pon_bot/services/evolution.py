@@ -17,13 +17,29 @@ if TYPE_CHECKING:
 
     from poke_pon_bot.services.wallet import WalletService
 
-# Tuned to be "expensive" vs daily 100–200 ₽; rarer tiers and repeat evolutions scale up.
-_BASE = 500
-_TIER_PER_SORT_ORDER = 150
+# Tuned vs daily ~100–200 ₽: source tier, **target** tier + HP, and repeat evolutions scale up.
+_BASE = 380
+_SOURCE_SORT_WEIGHT = 95
+_TARGET_SORT_WEIGHT = 145
+_HP_ANCHOR = 72
+_HP_PER_POINT = 3
+_HP_ADJ_MIN = -450
+_HP_ADJ_MAX = 2400
 _STAGES_GROWTH = 1.48
 
 
 _SET_RANK_RE = re.compile(r"^[rz]?sv(\d+)(?:pt(\d+))?$", re.IGNORECASE)
+
+
+def _parse_hp_int(hp: str | None) -> int | None:
+    """Leading integer from printed HP (``120``, ``120+``); ``None`` if unknown."""
+    if hp is None:
+        return None
+    s = hp.strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d+)", s)
+    return int(m.group(1)) if m else None
 
 
 def _norm_set_rank_score(code: str) -> int:
@@ -122,25 +138,44 @@ class EvolutionQuote:
 
 def evolution_cost_pokedollars(
     *,
-    rarity_sort_order: int,
+    source_rarity_sort_order: int,
+    target_rarity_sort_order: int,
     current_evolution_stages: int,
+    target_hp: int | None,
 ) -> int:
-    """Cost to evolve *from* a card of this printed tier, given how many evolutions the copy already has."""
-    sort = max(1, int(rarity_sort_order))
+    """Cost to evolve into **target**, given source tier, stage depth, and target HP."""
+    sort_src = max(1, int(source_rarity_sort_order))
+    sort_tgt = max(1, int(target_rarity_sort_order))
     stages = max(0, int(current_evolution_stages))
-    raw = float(_BASE + sort * _TIER_PER_SORT_ORDER) * (_STAGES_GROWTH**stages)
-    return int(min(raw, 9_999_999))
+
+    body = float(
+        _BASE
+        + sort_src * _SOURCE_SORT_WEIGHT
+        + sort_tgt * _TARGET_SORT_WEIGHT
+    )
+
+    hp_adj = 0.0
+    if target_hp is not None:
+        h = max(30, min(int(target_hp), 420))
+        hp_adj = float((h - _HP_ANCHOR) * _HP_PER_POINT)
+        hp_adj = max(_HP_ADJ_MIN, min(hp_adj, _HP_ADJ_MAX))
+
+    raw = (body + hp_adj) * (_STAGES_GROWTH**stages)
+    return int(min(max(raw, 1), 9_999_999))
 
 
 def quote_evolution(
-    card: Card,
-    rarity: RarityClass,
+    source_rarity: RarityClass,
     instance_evolution_stages: int,
     target: Card,
+    target_rarity: RarityClass,
 ) -> EvolutionQuote:
+    hp = _parse_hp_int(target.hp)
     c = evolution_cost_pokedollars(
-        rarity_sort_order=rarity.sort_order,
+        source_rarity_sort_order=source_rarity.sort_order,
+        target_rarity_sort_order=target_rarity.sort_order,
         current_evolution_stages=instance_evolution_stages,
+        target_hp=hp,
     )
     return EvolutionQuote(
         cost=c,
@@ -180,11 +215,11 @@ async def run_collection_evolution(
         return "That copy is no longer in your collection."
     card = await session.get(Card, inst.card_id)
     if card is None:
-        return "This card can’t be evolved (no next stage in the catalog for this set)."
+        return "This card can't be evolved (no next stage in the catalog for this set)."
     valid_targets = await resolve_evolution_targets(session, card)
     allowed = {t.id for t in valid_targets}
     if not allowed:
-        return "This card can’t be evolved (no next stage in the catalog for this set)."
+        return "This card can't be evolved (no next stage in the catalog for this set)."
     if target_card_id is not None:
         if target_card_id not in allowed:
             return "That evolution isn’t available for this printing."
@@ -199,7 +234,10 @@ async def run_collection_evolution(
     rc = await session.get(RarityClass, card.rarity_class_id)
     if rc is None:
         return "Rarity data is missing. Try again later."
-    q = quote_evolution(card, rc, inst.evolution_stages, target)
+    target_rc = await session.get(RarityClass, target.rarity_class_id)
+    if target_rc is None:
+        return "Target rarity data is missing. Try again later."
+    q = quote_evolution(rc, inst.evolution_stages, target, target_rc)
     before_name = card.name
     try:
         new_balance = await wallet.try_debit(session, user_id, q.cost)

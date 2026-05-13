@@ -59,7 +59,7 @@ Discord bot using [discord.py](https://discordpy.readthedocs.io/en/stable/discor
 | `/collection show` | Full **image + details** for one owned card (nested under `/collection`) |
 | `/view_collection` | Same as **`/collection show`**, but a **top-level** command so it appears when you type `/view` |
 
-Run **`alembic upgrade head`** after pulling (adds indexes for search). Run `/drop` only after migrations + catalog sync; otherwise the bot explains that the catalog is empty.
+**Chat commands (`cd`, `coll`, `packd`, …):** type the command name directly in chat. Enabled by default in code if you turn on **Message Content Intent** in the Developer Portal (Bot → Privileged Gateway Intents). Set `DISCORD_MESSAGE_CONTENT_INTENT=0` in `.env` for slash-only.
 
 **`/collection search`** filters stack together (AND). **`slot`** picks the nth result when everything is sorted newest-first — use it alone to jump to your *n*th newest card overall, or combine filters to rank within matches only.
 
@@ -109,6 +109,42 @@ Generate a new Alembic revision if you need dialect-specific tweaks; the ORM mod
 
 - Add cogs under [`poke_pon_bot/cogs/`](poke_pon_bot/cogs/) and register them in [`poke_pon_bot/client.py`](poke_pon_bot/client.py) `setup_hook`.
 - Prefix commands (`!…`) require the **Message Content** privileged intent if you rely on plain messages.
+
+## Public web dashboard (optional)
+
+The bot can also serve an HTTP API that powers `collection.html` on the [GitHub Pages site](https://hamiebrooklyn.github.io/collection.html). Players sign in with Discord OAuth (`identify` scope only) and the page renders the same `user_card_instances` rows the bot sees — with search, sort by rarity / HP / damage, and a focused card view.
+
+It runs inside the bot process (one aiohttp app shared with the Top.gg webhook), so you only need to expose one port over HTTPS.
+
+1. **Developer Portal → OAuth2 → General** — copy the **Client ID** (your application id) and click **Reset Secret** to copy the **Client Secret**. Add `https://<your-public-host>/auth/discord/callback` to **Redirects**.
+2. Generate a session secret:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+3. Add to `.env` (see [`.env.example`](.env.example) for the full block):
+
+   ```bash
+   WEB_PORT=8080
+   WEB_PUBLIC_URL=https://your-tunnel.ngrok-free.app
+   WEB_ALLOWED_ORIGINS=https://hamiebrooklyn.github.io
+   WEB_FRONTEND_URL=https://hamiebrooklyn.github.io/collection.html
+   WEB_SESSION_SECRET=<openssl-output>
+   DISCORD_OAUTH_CLIENT_ID=<your-application-id>
+   DISCORD_OAUTH_CLIENT_SECRET=<reset-secret>
+   ```
+
+4. Front the listener with HTTPS — Cloudflare Tunnel, an Nginx reverse proxy, or `ngrok http 8080` all work. The browser refuses the session cookie without HTTPS because it uses `SameSite=None`.
+5. On the GitHub Pages repo (`hamiebrooklyn.github.io`), open `collection.html` and edit the meta tag to point at your API host:
+
+   ```html
+   <meta name="pokepon-api-base" content="https://your-tunnel.ngrok-free.app" />
+   ```
+
+   Commit and push; the page will start hitting your API.
+
+If `WEB_*` / `DISCORD_OAUTH_*` are missing, the dashboard endpoints simply stay off and the bot keeps running as before.
 
 ## References
 

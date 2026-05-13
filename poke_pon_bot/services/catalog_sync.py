@@ -14,6 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.rarity import RarityClass, TcgRarityMapping
+from poke_pon_bot.services.excluded_sets import (
+    filter_excluded_set_codes,
+    is_excluded_set_code,
+)
 from poke_pon_bot.services.rarity_normalize import normalize_tcg_rarity
 
 LOG = logging.getLogger(__name__)
@@ -44,6 +48,87 @@ def load_set_ids_from_yaml(path: Path) -> list[str]:
     if not isinstance(raw, list) or not raw:
         raise ValueError("YAML must contain a non-empty `sets:` list of TCG set IDs")
     return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def load_catalog_sync_plan_from_yaml(path: Path) -> dict[str, Any]:
+    """Load sync plan from YAML.
+
+    Supported keys (any combination may appear; they run in order):
+    - `all_sets: true` — discover every non-excluded set from the Pokémon TCG
+      ``/sets`` endpoint and import all of their cards. McDonald's promo sets are
+      skipped because they duplicate other cards/art.
+    - `query`: str — Pokémon TCG API `q=` expression (e.g. national dex range)
+    - `sets`: list[str] — curated TCG set IDs to import in addition to the above.
+    """
+    p = path if path.is_absolute() else Path.cwd() / path
+    if not p.is_file():
+        raise FileNotFoundError(f"CARD_SETS_CONFIG not found: {p}")
+
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("YAML must be a mapping/object at the top level.")
+
+    out: dict[str, Any] = {}
+    if bool(data.get("all_sets")):
+        out["all_sets"] = True
+
+    raw_query = data.get("query")
+    if isinstance(raw_query, str) and raw_query.strip():
+        out["query"] = raw_query.strip()
+
+    raw_sets = data.get("sets")
+    if raw_sets is not None:
+        if not isinstance(raw_sets, list):
+            raise ValueError("`sets` must be a list of TCG set IDs.")
+        sets = [str(x).strip() for x in raw_sets if str(x).strip()]
+        if sets:
+            out["sets"] = sets
+
+    if not out:
+        raise ValueError(
+            "YAML must contain at least one of `all_sets: true`, a non-empty "
+            "`sets:` list, or a `query:` string."
+        )
+    return out
+
+
+async def fetch_all_set_ids(api_key: str | None = None) -> list[str]:
+    """Hit ``/v2/sets`` and return every TCG set id known to pokemontcg.io.
+
+    The API caps responses at 250 sets per page — we paginate until exhausted so
+    even a future expansion past today's ~172 sets keeps working without code
+    changes. Returned ids are sorted newest-first by release date when present so
+    a partial sync still grabs the most recent expansions.
+    """
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+
+    rows: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
+        page = 1
+        page_size = 250
+        while True:
+            resp = await client.get(
+                f"{TCG_BASE}/sets",
+                params={"page": page, "pageSize": page_size},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data") or []
+            rows.extend(d for d in data if isinstance(d, dict))
+            total = int(body.get("totalCount") or 0)
+            if page * page_size >= total or not data:
+                break
+            page += 1
+
+    rows.sort(key=lambda d: str(d.get("releaseDate") or ""), reverse=True)
+    return [
+        str(d["id"])
+        for d in rows
+        if isinstance(d.get("id"), str)
+        and not is_excluded_set_code(str(d["id"]))
+    ]
 
 
 async def _rarity_lookup(session: AsyncSession) -> tuple[dict[str, int], dict[str, int]]:
@@ -212,6 +297,15 @@ def _card_row_dict(
     else:
         evolves_from = None
 
+    types_raw = payload.get("types")
+    tcg_types: list[str] | None
+    if isinstance(types_raw, list) and types_raw:
+        tcg_types = [str(x).strip() for x in types_raw if str(x).strip()]
+        if not tcg_types:
+            tcg_types = None
+    else:
+        tcg_types = None
+
     return {
         "tcg_card_id": payload["id"],
         "name": payload.get("name") or "Unknown",
@@ -225,6 +319,7 @@ def _card_row_dict(
         "hp": hp_str,
         "attacks": attacks,
         "dex_numbers": dex_numbers,
+        "tcg_types": tcg_types,
         "rarity_class_id": rarity_class_id,
         "evolves_to_names": evolves_to_names,
         "evolves_from": evolves_from,
@@ -238,6 +333,7 @@ async def sync_curated_sets(
     api_key: str | None = None,
 ) -> dict[str, int]:
     """Fetch all cards for each set ID and upsert into `cards`. Returns per-set counts."""
+    set_ids = filter_excluded_set_codes(set_ids)
 
     headers: dict[str, str] = {}
     if api_key:
@@ -266,6 +362,10 @@ async def sync_curated_sets(
                     total_count = int(body.get("totalCount") or 0)
 
                     for payload in data:
+                        payload_set = (payload.get("set") or {}).get("id")
+                        if is_excluded_set_code(str(payload_set or set_id)):
+                            continue
+
                         raw_rarity = payload.get("rarity")
                         key = (raw_rarity or "").strip().lower()
                         if key in rarity_overrides:
@@ -301,5 +401,86 @@ async def sync_curated_sets(
                         await session.commit()
                         break
                     page += 1
+
+    return counts
+
+
+async def sync_query(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    query: str,
+    api_key: str | None = None,
+    label: str = "query",
+) -> dict[str, int]:
+    """Fetch all cards matching an API `q=` query and upsert into `cards`.
+
+    Returns `{label: count}`.
+    """
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+
+    query = query.strip()
+    if not query:
+        raise ValueError("query must be non-empty")
+
+    counts: dict[str, int] = {label: 0}
+
+    async with session_factory() as session:
+        codes_by_class, rarity_overrides = await _rarity_lookup(session)
+
+        async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
+            page = 1
+            page_size = 250
+            seen_set_codes: set[str] = set()
+
+            while True:
+                params = {"q": query, "page": page, "pageSize": page_size}
+                resp = await client.get(f"{TCG_BASE}/cards", params=params)
+                resp.raise_for_status()
+                body = resp.json()
+                data = body.get("data") or []
+                total_count = int(body.get("totalCount") or 0)
+
+                for payload in data:
+                    payload_set = (payload.get("set") or {}).get("id")
+                    if is_excluded_set_code(str(payload_set or "")):
+                        continue
+
+                    raw_rarity = payload.get("rarity")
+                    key = (raw_rarity or "").strip().lower()
+                    if key in rarity_overrides:
+                        rid = rarity_overrides[key]
+                    else:
+                        code = normalize_tcg_rarity(raw_rarity)
+                        rid = codes_by_class.get(code)
+                        if rid is None:
+                            rid = codes_by_class["uncommon"]
+
+                    values = _card_row_dict(payload, rid)
+                    if values.get("set_code"):
+                        seen_set_codes.add(str(values["set_code"]))
+                    existing = await session.scalar(select(Card).where(Card.tcg_card_id == values["tcg_card_id"]))
+                    if existing:
+                        for k, v in values.items():
+                            setattr(existing, k, v)
+                    else:
+                        session.add(Card(**values))
+                    counts[label] += 1
+
+                await session.commit()
+
+                if page * page_size >= total_count or not data:
+                    LOG.info(
+                        "Finished query %s — stored %s cards (API reports %s)",
+                        label,
+                        counts[label],
+                        total_count,
+                    )
+                    for set_code in sorted(seen_set_codes):
+                        await _resolve_evolves_for_set(session, set_code)
+                    await session.commit()
+                    break
+                page += 1
 
     return counts

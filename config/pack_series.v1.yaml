@@ -1,0 +1,18 @@
+# Pack series — only used to **override** auto-discovered sets.
+#
+# By default the bot generates one pack series **per imported TCG set** at boot, using the
+# set's official logo (https://images.pokemontcg.io/{set_code}/logo.png) as pack art. List
+# entries here only if you want a custom code, display name, price, or umbrella that bundles
+# multiple sets together.
+#
+# Schema (all optional except `code` and `sets`):
+#   - `code`: stable identifier; do NOT change after launch (used for pack lookup / SKU mapping).
+#   - `display_name`: shown in `/packv` and `/packcolv`.
+#   - `crystal_price`: Crystal price for this specific series. Random pokedollar / SKU
+#                      packs ignore this and pick a random active series.
+#   - `cards_per_pack` / `code_cards_per_pack`: optional overrides (defaults are 10 and 1).
+#   - `pack_art_url`: optional override; if unset the bot constructs the pokemontcg.io logo URL.
+#   - `sets`: TCG set IDs (e.g. `sv1`) — must already be imported in the card catalog.
+
+# Override entries (none by default — auto-discovered sets cover the standard case):
+series: []

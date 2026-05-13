@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import UTC, datetime
+from typing import Literal
 
 import discord
 import httpx
@@ -25,6 +28,8 @@ from poke_pon_bot.services.catalog_search import (
 )
 from poke_pon_bot.services.collection_search import any_filter_set, search_collection
 from poke_pon_bot.services.drops import DropService
+from poke_pon_bot.config import Settings
+from poke_pon_bot.context_reply import reply_target_user_id, resolve_collection_display_target
 from poke_pon_bot.services.instance_public_id import compact_public_id_for_line, normalize_public_id
 from poke_pon_bot.services.evolution import (
     EvolutionSuccess,
@@ -37,8 +42,24 @@ from poke_pon_bot.services.wallet import WalletService, format_pokedollars
 
 _LOG = logging.getLogger(__name__)
 
+# Public packs: anyone can claim one unrevealed slot until this many seconds elapse (matches View timeout).
+_PACK_CLAIM_SECONDS = 180
+
 _COLL_MAX_FETCH = 5000
 _COLL_PAGE_CHAR_CAP = 1870
+# Hard cap so a long inventory paginates into bite-sized pages (◀ ▶ flips).
+_COLL_PAGE_LINE_CAP = 10
+
+# Public binder (search, sort, detail) — linked from ``/colv`` / ``/coll`` replies.
+COLLECTION_WEB_URL = "https://hamiebrooklyn.github.io/collection.html"
+
+
+def _collection_web_footer() -> str:
+    """Short line appended to collection list/flip replies so players can open the web binder."""
+    return (
+        f"\n\n_Browse and search your full binder (filters, card details):_\n"
+        f"<{COLLECTION_WEB_URL}>"
+    )
 
 
 def _hybrid_ephemeral(ctx: commands.Context) -> bool:
@@ -48,6 +69,37 @@ def _hybrid_ephemeral(ctx: commands.Context) -> bool:
 
 def _truncate(text: str, max_len: int) -> str:
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def _fmt_cd_sentence(seconds: float) -> str:
+    s = int(round(max(1.0, seconds)))
+    if s >= 120:
+        return f"**{s // 60}** minutes"
+    return f"**{s}** seconds"
+
+
+def _drop_cooldown_message(retry_after: float, *, per_seconds: float) -> str:
+    sec = max(1, int(round(retry_after)))
+    mins, s = divmod(sec, 60)
+    if mins and s:
+        left = f"{mins}m {s}s"
+    elif mins:
+        left = f"{mins} min"
+    else:
+        left = f"{s}s"
+    window = _fmt_cd_sentence(per_seconds)
+    return (
+        f"Pack drops are on a {window} cooldown for your account. "
+        f"You can open another pack in **{left}**."
+    )
+
+
+class _DropBoostShopView(discord.ui.View):
+    """Premium SKU button (checkout handled by Discord)."""
+
+    def __init__(self, *, sku_id: int, timeout: float = 300.0) -> None:
+        super().__init__(timeout=timeout)
+        self.add_item(discord.ui.Button(sku_id=sku_id))
 
 
 def _fmt_obtained(dt: datetime | None) -> str:
@@ -71,6 +123,15 @@ def _add_card_id_copy_field(embed: discord.Embed, public_id: str) -> None:
     )
 
 
+def _card_id_message_line(public_id: str) -> str:
+    """Plain-text Card ID line emitted **outside** the embed.
+
+    Mobile clients let you long-press inline backtick text (`like this`) to copy — embed bodies
+    don't, so we surface the ID in `content=` for tap-to-copy.
+    """
+    return f"**Card ID:** `{public_id}`"
+
+
 def _coll_one_line(rank: int, inst: UserCardInstance, card: Card) -> str:
     """Single compact row; Card ID in `` ` `` for tap-to-copy."""
     nm = _truncate(card.name, 22)
@@ -81,7 +142,12 @@ def _coll_one_line(rank: int, inst: UserCardInstance, card: Card) -> str:
 
 
 def _coll_pages(lines: list[str]) -> list[str]:
-    """Split into Discord-sized plain-text pages (no blank lines between rows)."""
+    """Split into Discord-sized plain-text pages (no blank lines between rows).
+
+    Caps each page at ``_COLL_PAGE_LINE_CAP`` rows even when more would fit in
+    ``_COLL_PAGE_CHAR_CAP`` characters — so a large inventory still flips in
+    readable chunks instead of dumping hundreds of lines into one page.
+    """
     if not lines:
         return []
     chunks: list[list[str]] = []
@@ -90,7 +156,7 @@ def _coll_pages(lines: list[str]) -> list[str]:
     cap = _COLL_PAGE_CHAR_CAP
     for line in lines:
         extra = len(line) + (1 if buf else 0)
-        if buf and used + extra > cap:
+        if buf and (used + extra > cap or len(buf) >= _COLL_PAGE_LINE_CAP):
             chunks.append(buf)
             buf = []
             used = 0
@@ -105,19 +171,20 @@ def _coll_pages(lines: list[str]) -> list[str]:
         body = "\n".join(chunk)
         if total > 1:
             body = f"{i + 1}/{total}\n{body}"
-        pages.append(body)
+        pages.append(body + _collection_web_footer())
     return pages
 
 
 class CollectionListFlipView(discord.ui.View):
     """Plain-text collection pages with ◀ ▶."""
 
-    def __init__(self, *, owner_id: int, pages: list[str]) -> None:
+    def __init__(self, *, owner_id: int, viewer_id: int, pages: list[str]) -> None:
         if not pages:
             msg = "pages must be non-empty"
             raise ValueError(msg)
         super().__init__(timeout=600.0)
         self._owner_id = owner_id
+        self._viewer_id = viewer_id
         self._pages = pages
         self._index = 0
 
@@ -149,16 +216,22 @@ class CollectionListFlipView(discord.ui.View):
                 pass
 
     async def _on_prev(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._owner_id:
-            await interaction.response.send_message("Not your list.", ephemeral=True)
+        if interaction.user.id != self._viewer_id:
+            await interaction.response.send_message(
+                "Only the person who opened this list can flip pages.",
+                ephemeral=True,
+            )
             return
         if self._index > 0:
             self._index -= 1
         await self._apply_page(interaction)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._owner_id:
-            await interaction.response.send_message("Not your list.", ephemeral=True)
+        if interaction.user.id != self._viewer_id:
+            await interaction.response.send_message(
+                "Only the person who opened this list can flip pages.",
+                ephemeral=True,
+            )
             return
         if self._index < len(self._pages) - 1:
             self._index += 1
@@ -177,11 +250,22 @@ def _collection_view_embed(
     card: Card,
     *,
     rank_note: str | None = None,
+    collection_owner_id: int | None = None,
+    viewer_id: int | None = None,
 ) -> discord.Embed:
     """Rich embed for one owned card (catalog + when you saved it)."""
     e = discord.Embed(title=card.name)
+    header_bits: list[str] = []
+    if (
+        collection_owner_id is not None
+        and viewer_id is not None
+        and collection_owner_id != viewer_id
+    ):
+        header_bits.append(f"<@{collection_owner_id}> — viewing their collection")
     if rank_note:
-        e.description = rank_note
+        header_bits.append(rank_note)
+    if header_bits:
+        e.description = "\n\n".join(header_bits)
     e.set_image(url=card.image_large_url or card.image_small_url)
 
     e.add_field(name="Set", value=f"{card.set_name}\n`{card.set_code}`", inline=True)
@@ -208,7 +292,8 @@ def _collection_view_embed(
             inline=True,
         )
 
-    _add_card_id_copy_field(e, inst.public_id)
+    # Card ID is intentionally **not** embedded — see _card_id_message_line. Callers attach it
+    # via `content=` so mobile users can long-press to copy the value.
     e.set_footer(text=f"Catalog printing `{card.tcg_card_id}`")
     return e
 
@@ -356,7 +441,11 @@ class EvolutionConfirmView(discord.ui.View):
             f"— balance **{format_pokedollars(su.new_balance)}**."
         )
         done = _collection_view_embed(su.inst, su.new_card, rank_note=line)
-        await interaction.edit_original_response(embed=done, view=None)
+        await interaction.edit_original_response(
+            content=_card_id_message_line(su.inst.public_id),
+            embed=done,
+            view=None,
+        )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=0)
     async def cancel(
@@ -466,7 +555,15 @@ class EvolutionBranchView(discord.ui.View):
         self._selected_id = target_id
         self._evolve_btn.disabled = False
         target = next(t for t in self._targets if t.id == self._selected_id)
-        q = quote_evolution(self._card, self._rc, self._inst.evolution_stages, target)
+        async with self._gacha.bot.async_session_factory() as session:
+            target_rc = await session.get(RarityClass, target.rarity_class_id)
+        if target_rc is None:
+            await interaction.response.send_message(
+                "Rarity data is missing for that evolution.",
+                ephemeral=True,
+            )
+            return
+        q = quote_evolution(self._rc, self._inst.evolution_stages, target, target_rc)
         preview = _evolution_confirm_embed(self._inst, self._card, target, q.cost)
         base_foot = preview.footer.text or ""
         if self._had_more:
@@ -522,7 +619,11 @@ class EvolutionBranchView(discord.ui.View):
             f"— balance **{format_pokedollars(su.new_balance)}**."
         )
         done = _collection_view_embed(su.inst, su.new_card, rank_note=line)
-        await interaction.edit_original_response(embed=done, view=None)
+        await interaction.edit_original_response(
+            content=_card_id_message_line(su.inst.public_id),
+            embed=done,
+            view=None,
+        )
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self._owner_id:
@@ -543,6 +644,7 @@ class CollectionFlipView(discord.ui.View):
         *,
         session_factory,
         owner_id: int,
+        viewer_id: int,
         instance_ids: list[int],
     ) -> None:
         if not instance_ids:
@@ -551,6 +653,7 @@ class CollectionFlipView(discord.ui.View):
         super().__init__(timeout=600.0)
         self._session_factory = session_factory
         self._owner_id = owner_id
+        self._viewer_id = viewer_id
         self._instance_ids = instance_ids
         self._index = 0
 
@@ -586,9 +689,9 @@ class CollectionFlipView(discord.ui.View):
                 pass
 
     async def _on_prev(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._owner_id:
+        if interaction.user.id != self._viewer_id:
             await interaction.response.send_message(
-                "This isn’t your collection browser.",
+                "Only the person who opened this browser can flip pages.",
                 ephemeral=True,
             )
             return
@@ -597,9 +700,9 @@ class CollectionFlipView(discord.ui.View):
         await self._update_message(interaction)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._owner_id:
+        if interaction.user.id != self._viewer_id:
             await interaction.response.send_message(
-                "This isn’t your collection browser.",
+                "Only the person who opened this browser can flip pages.",
                 ephemeral=True,
             )
             return
@@ -623,7 +726,10 @@ class CollectionFlipView(discord.ui.View):
                     inst,
                     card,
                     rank_note=self._rank_note(self._index, len(self._instance_ids)),
+                    collection_owner_id=self._owner_id,
+                    viewer_id=self._viewer_id,
                 )
+                content = _card_id_message_line(inst.public_id)
         except SQLAlchemyError:
             _LOG.exception("collection flip navigation for instance %s", iid)
             await interaction.response.send_message(
@@ -633,118 +739,171 @@ class CollectionFlipView(discord.ui.View):
             return
 
         self._sync_nav_buttons()
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(content=content, embed=embed, view=self)
 
 
-class KeepCardButton(discord.ui.Button):
-    """Pick one revealed slot — label shows slot index and Pokémon name."""
+class ClaimSlotButton(discord.ui.Button):
+    """Claim one revealed slot — first come per slot; each user may take at most one card."""
 
-    def __init__(
-        self,
-        *,
-        idx: int,
-        card_id: int,
-        card_name: str,
-        issuer_id: int,
-        session_factory,
-        row: int,
-    ) -> None:
-        label = _truncate(f"#{idx + 1} · {card_name}", 80)
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=label,
-            row=row,
-        )
+    def __init__(self, *, pick_view: "PackPickView", idx: int, card_name: str, row: int) -> None:
+        label = _truncate(f"#{idx + 1} · Take · {card_name}", 80)
+        super().__init__(style=discord.ButtonStyle.secondary, label=label, row=row)
+        # Do not set Item._parent — discord.py chains _run_checks to _parent (nested Items only).
+        self._pick_view = pick_view
         self._idx = idx
-        self._card_id = card_id
-        self._issuer_id = issuer_id
-        self._session_factory = session_factory
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._issuer_id:
-            await interaction.response.send_message(
-                "This pack isn’t yours to claim.",
-                ephemeral=True,
-            )
-            return
-
-        drop = DropService()
-        title: str
-        thumb: str
-        footer_text: str
-
-        try:
-            async with self._session_factory() as session:
-                card = await session.get(Card, self._card_id)
-                if card is None:
-                    await interaction.response.send_message(
-                        "That card no longer exists in the catalog.",
-                        ephemeral=True,
-                    )
-                    return
-
-                title = card.name
-                thumb = card.image_large_url or card.image_small_url
-                footer_text = (
-                    f"{card.set_name} · #{card.collector_number} · "
-                    f"{card.tcg_rarity or 'Unknown rarity'}"
-                )
-
-                result = await drop.claim_card(
-                    session,
-                    discord_user_id=interaction.user.id,
-                    card=card,
-                    source="drop",
-                )
-                await session.commit()
-        except SQLAlchemyError as exc:
-            await interaction.response.send_message(
-                f"Could not save that card: {exc}",
-                ephemeral=True,
-            )
-            return
-
-        kept = discord.Embed(title=f"Kept: {title}")
-        kept.set_image(url=thumb)
-        kept.set_footer(text=footer_text)
-        _add_card_id_copy_field(kept, result.public_id)
-
-        content = (
-            f"{interaction.user.mention} chose **{title}** "
-            f"(slot #{self._idx + 1}). The other revealed cards were not added."
-        )
-
-        await interaction.response.edit_message(
-            content=content,
-            embeds=[kept],
-            attachments=[],
-            view=None,
-        )
+        await self._pick_view.try_claim(interaction, self._idx, self)
 
 
 class PackPickView(discord.ui.View):
-    """Shown after a pack roll; user picks exactly one slot to keep."""
+    """Public pack fight: anyone can grab one unrevealed slot until the countdown expires."""
 
     def __init__(
         self,
         *,
         session_factory,
         issuer_id: int,
+        opener_mention: str,
         cards: list[Card],
+        deadline_unix: int,
+        private_pack: bool,
     ) -> None:
-        super().__init__(timeout=600.0)
+        super().__init__(timeout=float(_PACK_CLAIM_SECONDS))
+        self._session_factory = session_factory
+        self._issuer_id = issuer_id
+        self._opener_mention = opener_mention
+        self._cards = cards
+        self._deadline_unix = deadline_unix
+        self._private_pack = private_pack
+        self._lock = asyncio.Lock()
+        # slot_index -> claimer user id
+        self._slot_claimer: dict[int, int] = {}
+        # slot_index -> per-claim Card ID (public_id) so we can echo it in plain text
+        # outside the embed (mobile long-press copy).
+        self._slot_pid: dict[int, str] = {}
+        self._finished = False
+
         for i, card in enumerate(cards):
             row = i // 5
-            self.add_item(
-                KeepCardButton(
-                    idx=i,
-                    card_id=card.id,
-                    card_name=card.name,
-                    issuer_id=issuer_id,
-                    session_factory=session_factory,
-                    row=row,
-                )
+            self.add_item(ClaimSlotButton(pick_view=self, idx=i, card_name=card.name, row=row))
+
+    def build_content(self) -> str:
+        expiry = f"**Expires** <t:{self._deadline_unix}:R>"
+        if self._private_pack:
+            base = (
+                f"{self._opener_mention} opened a pack (**private** — only you see this).\n"
+                f"{expiry}\n"
+                "Tap **Take** on one slot to save it."
             )
+        else:
+            base = (
+                f"{self._opener_mention} dropped cards, it's up for grabs!\n"
+                f"{expiry}"
+            )
+        if not self._slot_pid:
+            return base
+        # Plain text outside the embed so mobile clients can long-press the inline `code` to copy.
+        claimed_lines = ["", "**Claimed Card IDs** (long-press to copy):"]
+        for i in sorted(self._slot_pid):
+            uid = self._slot_claimer.get(i)
+            who = f"<@{uid}>" if uid is not None else "?"
+            name = self._cards[i].name if 0 <= i < len(self._cards) else ""
+            name_part = f" {name} ·" if name else ""
+            claimed_lines.append(f"• #{i + 1} {who} ·{name_part} `{self._slot_pid[i]}`")
+        return base + "\n" + "\n".join(claimed_lines)
+
+    async def try_claim(self, interaction: discord.Interaction, idx: int, button: discord.ui.Button) -> None:
+        async with self._lock:
+            if self._finished:
+                await interaction.response.send_message("This pack is already finished.", ephemeral=True)
+                return
+            now = int(time.time())
+            if now >= self._deadline_unix:
+                await interaction.response.send_message("This pack has expired.", ephemeral=True)
+                return
+
+            uid = interaction.user.id
+            if interaction.user.bot:
+                await interaction.response.send_message("Bots can’t claim cards.", ephemeral=True)
+                return
+            if uid in self._slot_claimer.values():
+                await interaction.response.send_message(
+                    "You already claimed **one** card from this pack.",
+                    ephemeral=True,
+                )
+                return
+            if idx in self._slot_claimer:
+                await interaction.response.send_message("That slot was already taken.", ephemeral=True)
+                return
+
+            card = self._cards[idx]
+            drop = DropService()
+            try:
+                async with self._session_factory() as session:
+                    db_card = await session.get(Card, card.id)
+                    if db_card is None:
+                        await interaction.response.send_message(
+                            "That card no longer exists in the catalog.",
+                            ephemeral=True,
+                        )
+                        return
+                    drop_result = await drop.claim_card(
+                        session,
+                        discord_user_id=uid,
+                        card=db_card,
+                        source="drop",
+                    )
+                    await session.commit()
+            except SQLAlchemyError as exc:
+                await interaction.response.send_message(
+                    f"Could not save that card: {exc}",
+                    ephemeral=True,
+                )
+                return
+
+            self._slot_claimer[idx] = uid
+            self._slot_pid[idx] = drop_result.public_id
+            button.disabled = True
+            button.style = discord.ButtonStyle.success
+            # Keep the card name on the button after claim so the pack contents stay readable
+            # even though the embed no longer lists them in text.
+            button.label = _truncate(f"#{idx + 1} · Taken · {card.name}", 80)
+
+            all_taken = len(self._slot_claimer) >= len(self._cards)
+            if all_taken:
+                self._finished = True
+                for child in self.children:
+                    child.disabled = True
+                self.stop()
+                extra = f"\n\n✅ **All {len(self._cards)} card(s) claimed.**"
+                await interaction.response.edit_message(
+                    content=self.build_content() + extra,
+                    view=self,
+                )
+                return
+
+            await interaction.response.edit_message(
+                content=self.build_content(),
+                view=self,
+            )
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        self._finished = True
+        msg = getattr(self, "message", None)
+        if msg is None:
+            return
+        extra = (
+            "\n\n⏱ **Time's up** — unclaimed cards are gone.\n"
+            f"_Claimed **{len(self._slot_claimer)}** / **{len(self._cards)}**._"
+        )
+        try:
+            base = self.build_content()
+            await msg.edit(content=base + extra, view=self)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 _SCOPE = [
@@ -754,25 +913,101 @@ _SCOPE = [
 
 
 class GachaCog(commands.Cog):
-    """Weighted drops; chat prefix `c` (`cd`, `cs`, `cv`, `colv`, `cevolve`); slash equivalents."""
+    """Weighted drops; chat commands (`pcd`, `cs`, `cv`, `pcolv`, `cevolve`) plus slash equivalents."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._wallet = WalletService()
+        self._settings: Settings = bot.settings
+        self._drop_last_ts: dict[int, float] = {}
+        self._drop_boost_cache: dict[int, tuple[bool, float]] = {}
+
+    def _invalidate_drop_boost_cache(self, user_id: int | None) -> None:
+        if user_id is None:
+            return
+        self._drop_boost_cache.pop(user_id, None)
+
+    @commands.Cog.listener()
+    async def on_entitlement_create(self, entitlement: discord.Entitlement) -> None:
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None or entitlement.sku_id != sku:
+            return
+        self._invalidate_drop_boost_cache(entitlement.user_id)
+
+    @commands.Cog.listener()
+    async def on_entitlement_update(self, entitlement: discord.Entitlement) -> None:
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None or entitlement.sku_id != sku:
+            return
+        self._invalidate_drop_boost_cache(entitlement.user_id)
+
+    @commands.Cog.listener()
+    async def on_entitlement_delete(self, entitlement: discord.Entitlement) -> None:
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None or entitlement.sku_id != sku:
+            return
+        self._invalidate_drop_boost_cache(entitlement.user_id)
+
+    async def _user_has_drop_boost(self, ctx: commands.Context, user_id: int) -> bool:
+        if user_id in self._settings.drop_boost_test_user_ids:
+            return True
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None:
+            return False
+        inter = ctx.interaction
+        if inter is not None and sku in inter.entitlement_sku_ids:
+            return True
+        if self.bot.application_id is None:
+            return False
+        now = time.monotonic()
+        cached = self._drop_boost_cache.get(user_id)
+        if cached is not None:
+            has, until = cached
+            if until > now:
+                return has
+        has_ent = False
+        try:
+            async for ent in self.bot.entitlements(
+                user=discord.Object(user_id),
+                skus=[discord.Object(sku)],
+                limit=5,
+                exclude_ended=True,
+                exclude_deleted=True,
+            ):
+                if ent.sku_id != sku or ent.consumed or ent.is_expired():
+                    continue
+                has_ent = True
+                break
+        except discord.HTTPException:
+            _LOG.exception("entitlement list failed (drop boost) user=%s", user_id)
+            has_ent = False
+        ttl = max(5.0, float(self._settings.drop_boost_entitlement_cache_ttl))
+        self._drop_boost_cache[user_id] = (has_ent, now + ttl)
+        return has_ent
+
+    async def _effective_drop_cooldown_seconds(self, ctx: commands.Context, user_id: int) -> float:
+        if await self._user_has_drop_boost(ctx, user_id):
+            return float(self._settings.drop_cooldown_premium_seconds)
+        return float(self._settings.drop_cooldown_base_seconds)
 
     async def _collection_view_execute(
         self,
         ctx: commands.Context,
         *,
+        owner_id: int,
+        viewer_id: int,
         slot: int | None,
         name: str | None,
         rarity: str | None,
         pokedex: int | None,
         card_ref: str | None = None,
     ) -> None:
-        """`cv c` after defer — optional **card_ref** = your **Card ID**."""
+        """`cv c` after defer — optional **card_ref** = **Card ID** for ``owner_id``'s collection."""
         ephe = _hybrid_ephemeral(ctx)
-        uid = ctx.author.id
+        peer = owner_id != viewer_id
+        subj = f"<@{owner_id}>" if peer else "You"
+        poss = "their" if peer else "your"
+
         if card_ref and card_ref.strip():
             if normalize_public_id(card_ref) is None:
                 await ctx.send(
@@ -786,11 +1021,13 @@ class GachaCog(commands.Cog):
                     row = await _load_instance_by_public_id(
                         session,
                         card_ref,
-                        uid,
+                        owner_id,
                     )
                     if row is None:
                         await ctx.send(
-                            "You don’t have a copy with that **Card ID**.",
+                            f"{subj} doesn't have a copy with that **Card ID**."
+                            if peer
+                            else "You don't have a copy with that **Card ID**.",
                             ephemeral=ephe,
                         )
                         return
@@ -799,15 +1036,18 @@ class GachaCog(commands.Cog):
                         inst,
                         card,
                         rank_note="**cv c** by **card_ref** (Card ID).",
+                        collection_owner_id=owner_id if peer else None,
+                        viewer_id=viewer_id if peer else None,
                     )
+                    content = _card_id_message_line(inst.public_id)
             except SQLAlchemyError:
-                _LOG.exception("cv c card_ref for user %s", uid)
+                _LOG.exception("cv c card_ref owner %s viewer %s", owner_id, viewer_id)
                 await ctx.send(
                     "Could not load that card. Try again.",
                     ephemeral=ephe,
                 )
                 return
-            await ctx.send(embed=embed, ephemeral=ephe)
+            await ctx.send(content=content, embed=embed, ephemeral=ephe)
             return
 
         if not any_filter_set(
@@ -818,8 +1058,8 @@ class GachaCog(commands.Cog):
             public_id=None,
         ):
             await ctx.send(
-                "Use **`slot`** (e.g. **1** for your newest match), **`card_ref`** (your **Card ID**), and/or "
-                "**`name`** / **`rarity`** / **`pokedex`**.",
+                f"Use **`slot`** (e.g. **1** for newest match), **`card_ref`** (**Card ID**), and/or "
+                f"**`name`** / **`rarity`** / **`pokedex`** (searching **{poss}** collection).",
                 ephemeral=ephe,
             )
             return
@@ -828,7 +1068,7 @@ class GachaCog(commands.Cog):
             if slot is not None:
                 rows, total = await search_collection(
                     session,
-                    discord_user_id=uid,
+                    discord_user_id=owner_id,
                     name_contains=name,
                     rarity_contains=rarity,
                     pokedex=pokedex,
@@ -838,7 +1078,7 @@ class GachaCog(commands.Cog):
             else:
                 rows, total = await search_collection(
                     session,
-                    discord_user_id=uid,
+                    discord_user_id=owner_id,
                     name_contains=name,
                     rarity_contains=rarity,
                     pokedex=pokedex,
@@ -848,7 +1088,7 @@ class GachaCog(commands.Cog):
 
         if total == 0:
             await ctx.send(
-                "No cards matched — try different filters.",
+                f"No cards matched{' for ' + subj if peer else ''} — try different filters.",
                 ephemeral=ephe,
             )
             return
@@ -856,7 +1096,11 @@ class GachaCog(commands.Cog):
         if slot is not None:
             if slot > total:
                 await ctx.send(
-                    f"You only have **{total}** matching card(s); **`slot`** must be **1–{total}**.",
+                    (
+                        f"{subj} only has **{total}** matching card(s); **`slot`** must be **1–{total}**."
+                        if peer
+                        else f"You only have **{total}** matching card(s); **`slot`** must be **1–{total}**."
+                    ),
                     ephemeral=ephe,
                 )
                 return
@@ -872,15 +1116,31 @@ class GachaCog(commands.Cog):
                 if total > 1
                 else None
             )
-            embed = _collection_view_embed(inst, card, rank_note=note)
-            await ctx.send(embed=embed, ephemeral=ephe)
+            embed = _collection_view_embed(
+                inst,
+                card,
+                rank_note=note,
+                collection_owner_id=owner_id if peer else None,
+                viewer_id=viewer_id if peer else None,
+            )
+            await ctx.send(
+                content=_card_id_message_line(inst.public_id),
+                embed=embed,
+                ephemeral=ephe,
+            )
             return
 
         if total > 1:
             await ctx.send(
-                f"You have **{total}** cards matching those filters. Add **`slot`** "
-                f"(**1**–**{total}**, **1** = newest) or **`card_ref`** / narrow filters. "
-                "Use **`/cs c`** or in chat **`cs c`** (prefix **`c`**, then **`s`**, then scope **`c`**) to list with the same filters.",
+                (
+                    f"{subj} has **{total}** cards matching those filters. Add **`slot`** "
+                    f"(**1**–**{total}**, **1** = newest) or **`card_ref`** / narrow filters. "
+                    "Use **`/cs c`** or **`cs c`** (reply or same filters) to list."
+                    if peer
+                    else f"You have **{total}** cards matching those filters. Add **`slot`** "
+                    f"(**1**–**{total}**, **1** = newest) or **`card_ref`** / narrow filters. "
+                    "Use **`/cs c`** or in chat **`cs c`** to list with the same filters."
+                ),
                 ephemeral=ephe,
             )
             return
@@ -896,14 +1156,23 @@ class GachaCog(commands.Cog):
         embed = _collection_view_embed(
             inst,
             card,
-            rank_note="Only one card matched your filters.",
+            rank_note=(
+                "Only one card matched those filters."
+                if peer
+                else "Only one card matched your filters."
+            ),
+            collection_owner_id=owner_id if peer else None,
+            viewer_id=viewer_id if peer else None,
         )
-        await ctx.send(embed=embed, ephemeral=ephe)
+        await ctx.send(
+            content=_card_id_message_line(inst.public_id),
+            embed=embed,
+            ephemeral=ephe,
+        )
 
     @commands.hybrid_command(
         name="cs",
-        aliases=["s"],
-        description="Search: global (g) or your collection (c) — in chat, type cs (prefix c + s)",
+        description="Search: global (g) or your collection (c) — chat: cs",
     )
     @app_commands.choices(scope=_SCOPE)
     @app_commands.describe(
@@ -958,7 +1227,7 @@ class GachaCog(commands.Cog):
                 await ctx.send(
                     "For **catalog (g)**, add at least one of **name**, **rarity**, **pokedex**, **set_code**, "
                     "**set_name**, **supertype**, **rarity_tier**, or **card_ref** (catalog id). "
-                    "Slash: **`/cs`**. In chat, prefix **`c`**: e.g. **`cs g`** (same as **`/cs`**, scope g).",
+                    "Slash: **`/cs`**. In chat: e.g. **`cs g`** (same as **`/cs`**, scope g).",
                     ephemeral=ephe,
                 )
                 return
@@ -1069,8 +1338,7 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="cv",
-        aliases=["v"],
-        description="Card view (g) or your copy (c) — in chat, type cv (prefix c + v)",
+        description="Card view (g) or your copy (c) — chat: cv",
     )
     @app_commands.choices(scope=_SCOPE)
     @app_commands.describe(
@@ -1105,9 +1373,14 @@ class GachaCog(commands.Cog):
             await ctx.send("**scope** must be **g** or **c**.", ephemeral=False)
             return
         ephe = _hybrid_ephemeral(ctx)
+        viewer_id = ctx.author.id
+        reply_owner = await reply_target_user_id(self.bot, ctx)
+        owner_id = reply_owner if reply_owner is not None else viewer_id
         if scope == "c":
             await self._collection_view_execute(
                 ctx,
+                owner_id=owner_id,
+                viewer_id=viewer_id,
                 slot=slot,
                 name=name,
                 rarity=rarity,
@@ -1128,7 +1401,7 @@ class GachaCog(commands.Cog):
         ):
             await ctx.send(
                 "For **catalog view (g)**, set at least one of **name**, **rarity**, **pokedex**, set filters, **rarity_tier**, or "
-                "**`card_ref`**, optionally with **slot** — slash **`/cv`**, in chat type **`cv`** (prefix c).",
+                "**`card_ref`**, optionally with **slot** — slash **`/cv`**, in chat type **`cv`**.",
                 ephemeral=ephe,
             )
             return
@@ -1201,101 +1474,141 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="colv",
-        aliases=["olv"],
-        description="Flip through your collection (◀▶) — in chat, type colv (prefix c + olv)",
+        aliases=["pcolv"],
+        description="Flip through your collection (◀▶) — chat: pcolv (or colv)",
     )
     @app_commands.describe(
-        limit="Max cards to include, newest first (1–50)",
+        member="Whose collection to browse — omit for yours",
+        limit="Cap cards to flip through, newest first (omit to flip through the whole collection)",
     )
     async def collection_flip(
         self,
         ctx: commands.Context,
-        limit: app_commands.Range[int, 1, 50] = 25,
+        member: discord.Member | None = None,
+        # Omitting ``limit`` flips through the entire collection, newest → first claimed.
+        # Range cap is a sanity guard for the rare user who actually types a number — the
+        # uncapped path goes through `limit is None`.
+        limit: app_commands.Range[int, 1, 1000] | None = None,
     ) -> None:
         if ctx.interaction:
             await ctx.defer(ephemeral=False)
         ephe = _hybrid_ephemeral(ctx)
-        uid = ctx.author.id
-        lim = int(limit)
+        viewer_id = ctx.author.id
+        target = await resolve_collection_display_target(self.bot, ctx, member_param=member)
+        if target.bot:
+            await ctx.send("Bots don’t have collections.", ephemeral=ephe)
+            return
+        owner_id = int(target.id)
+        lim = int(limit) if limit is not None else None
         try:
             async with self.bot.async_session_factory() as session:
-                res = await session.execute(
+                stmt = (
                     select(UserCardInstance.id)
-                    .where(UserCardInstance.discord_user_id == uid)
+                    .where(UserCardInstance.discord_user_id == owner_id)
                     .order_by(UserCardInstance.obtained_at.desc())
-                    .limit(lim),
                 )
+                if lim is not None:
+                    stmt = stmt.limit(lim)
+                res = await session.execute(stmt)
                 ids = [int(r[0]) for r in res.all()]
                 if not ids:
-                    await ctx.send("Empty collection. **`cd`**", ephemeral=ephe)
+                    if owner_id != viewer_id:
+                        await ctx.send(f"<@{owner_id}> has an empty collection. **`pcd`**", ephemeral=ephe)
+                    else:
+                        await ctx.send("You have an empty collection. **`pcd`**", ephemeral=ephe)
                     return
-                row0 = await _load_instance_and_card(session, ids[0], uid)
+                row0 = await _load_instance_and_card(session, ids[0], owner_id)
                 if row0 is None:
-                    await ctx.send("Could not load your collection. Try again.", ephemeral=ephe)
+                    await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
                     return
                 inst0, card0 = row0
                 embed = _collection_view_embed(
                     inst0,
                     card0,
                     rank_note=CollectionFlipView._rank_note(0, len(ids)),
+                    collection_owner_id=owner_id,
+                    viewer_id=viewer_id,
                 )
+                first_pid = inst0.public_id
         except SQLAlchemyError:
-            _LOG.exception("colv for user %s", uid)
-            await ctx.send("Could not load your collection. Try again.", ephemeral=ephe)
+            _LOG.exception("colv for owner %s viewer %s", owner_id, viewer_id)
+            await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
             return
 
         view = CollectionFlipView(
             session_factory=self.bot.async_session_factory,
-            owner_id=uid,
+            owner_id=owner_id,
+            viewer_id=viewer_id,
             instance_ids=ids,
         )
-        await ctx.send(embed=embed, view=view, ephemeral=ephe)
+        await ctx.send(
+            content=_card_id_message_line(first_pid) + _collection_web_footer(),
+            embed=embed,
+            view=view,
+            ephemeral=ephe,
+        )
 
     @commands.hybrid_command(
         name="coll",
-        aliases=["oll"],
-        description="Collection text list (◀▶) — chat: coll",
+        aliases=["pcoll"],
+        description="Collection text list (◀▶) — chat: pcoll (or coll)",
     )
-    @app_commands.describe(limit="Max cards (1–5000)")
+    @app_commands.describe(
+        member="Whose collection to list — omit for yours",
+        limit="Max cards (1–5000)",
+    )
     async def collection_list(
         self,
         ctx: commands.Context,
+        member: discord.Member | None = None,
         limit: app_commands.Range[int, 1, 5000] = 500,
     ) -> None:
         if ctx.interaction:
             await ctx.defer(ephemeral=False)
         ephe = _hybrid_ephemeral(ctx)
-        uid = ctx.author.id
+        viewer_id = ctx.author.id
+        target = await resolve_collection_display_target(self.bot, ctx, member_param=member)
+        if target.bot:
+            await ctx.send("Bots don’t have collections.", ephemeral=ephe)
+            return
+        owner_id = int(target.id)
         lim = min(int(limit), _COLL_MAX_FETCH)
         try:
             async with self.bot.async_session_factory() as session:
                 stmt = (
                     select(UserCardInstance, Card)
                     .join(Card, UserCardInstance.card_id == Card.id)
-                    .where(UserCardInstance.discord_user_id == uid)
+                    .where(UserCardInstance.discord_user_id == owner_id)
                     .order_by(UserCardInstance.obtained_at.desc())
                     .limit(lim)
                 )
                 res = await session.execute(stmt)
                 pairs = res.all()
         except SQLAlchemyError:
-            _LOG.exception("coll for user %s", uid)
-            await ctx.send("Could not load your collection. Try again.", ephemeral=ephe)
+            _LOG.exception("coll for owner %s viewer %s", owner_id, viewer_id)
+            await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
             return
 
         if not pairs:
-            await ctx.send("Empty collection. **`cd`**", ephemeral=ephe)
+            if owner_id != viewer_id:
+                await ctx.send(f"<@{owner_id}> has an empty collection. **`pcd`**", ephemeral=ephe)
+            else:
+                await ctx.send("You have an empty collection. **`pcd`**", ephemeral=ephe)
             return
+
+        header = ""
+        if owner_id != viewer_id:
+            header = f"<@{owner_id}> — newest **{min(len(pairs), lim)}** saved cards\n\n"
 
         lines = [_coll_one_line(n, inst, card) for n, (inst, card) in enumerate(pairs, start=1)]
         pages = _coll_pages(lines)
-        view = CollectionListFlipView(owner_id=uid, pages=pages)
+        pages = [header + p for p in pages]
+        view = CollectionListFlipView(owner_id=owner_id, viewer_id=viewer_id, pages=pages)
         await ctx.send(content=pages[0], view=view, ephemeral=ephe)
 
     @commands.hybrid_command(
         name="cevolve",
-        aliases=["evolve"],
-        description="Evolve a saved copy (by Card ID) — in chat, type cevolve (prefix c + evolve)",
+        description="Evolve a saved copy (by Card ID) — chat: cevolve",
     )
     @app_commands.describe(
         card_ref="Your **Card ID** for that copy (same as **`cv c`** **card_ref**)",
@@ -1343,7 +1656,14 @@ class GachaCog(commands.Cog):
                     return
                 if len(targets) == 1:
                     target = targets[0]
-                    q = quote_evolution(card, rc, inst.evolution_stages, target)
+                    target_rc = await session.get(RarityClass, target.rarity_class_id)
+                    if target_rc is None:
+                        await ctx.send(
+                            "Rarity data is missing for the evolution target. Try again later.",
+                            ephemeral=ephe,
+                        )
+                        return
+                    q = quote_evolution(rc, inst.evolution_stages, target, target_rc)
                     preview = _evolution_confirm_embed(inst, card, target, q.cost)
                     view = EvolutionConfirmView(
                         self,
@@ -1378,20 +1698,83 @@ class GachaCog(commands.Cog):
         await ctx.send(embed=preview, view=view, ephemeral=ephe)
 
     @commands.hybrid_command(
+        name="drop_boost",
+        description="Half drop cooldown — buy the durable SKU in Discord (optional)",
+    )
+    async def drop_boost_shop(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await ctx.defer(ephemeral=True)
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None:
+            await ctx.send(
+                "Drop boost isn’t configured (`DISCORD_DROP_BOOST_SKU_ID`).",
+                ephemeral=True,
+            )
+            return
+        base = self._settings.drop_cooldown_base_seconds
+        prem = self._settings.drop_cooldown_premium_seconds
+        try:
+            await ctx.send(
+                "**Half drop cooldown** — one-time purchase: after checkout, your **`/cd`** / **`pcd`** wait drops from "
+                f"{_fmt_cd_sentence(base)} to {_fmt_cd_sentence(prem)}.\n"
+                "Tap **Buy** below to open Discord’s purchase flow.",
+                view=_DropBoostShopView(sku_id=sku),
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            # 50035 + sku_id: common when SKU is draft / not published in Developer Portal.
+            if exc.status == 400 and (
+                exc.code == 50035
+                or (exc.text and "sku" in exc.text.lower())
+            ):
+                _LOG.warning(
+                    "drop_boost premium button rejected (sku likely unpublished): sku=%s %s",
+                    sku,
+                    exc.text,
+                )
+                help_msg = (
+                    "Discord refused to show the **Buy** button: this SKU **does not exist or is unpublished** "
+                    "for your app (see Developer Portal → Store / Monetization — publish the listing). "
+                    "Confirm `DISCORD_DROP_BOOST_SKU_ID` matches an id from **`/dev list_skus`** with **purchasable** on."
+                )
+                if ctx.interaction is not None:
+                    await ctx.interaction.followup.send(help_msg, ephemeral=True)
+                else:
+                    await ctx.send(help_msg)
+                return
+            raise
+
+    @commands.hybrid_command(
         name="cd",
-        aliases=["d"],
-        description="Card drop (open a pack) — in chat, type cd (prefix c + d)",
+        aliases=["pcd"],
+        description="Card drop (open a pack) — chat: pcd (or cd)",
     )
     @app_commands.describe(
-        private="Only you see the pack (slash only; in chat, cd is a normal message)",
+        private="Pick this option (slash only) to make the pack visible to you only.",
     )
     async def card_drop(
         self,
         ctx: commands.Context,
-        private: bool = False,
+        # Single-value Literal renders as a one-option choice in Discord — picking it flips on
+        # ephemeral mode without the True/False follow-up that bools force.
+        private: Literal["yes"] | None = None,
     ) -> None:
+        is_private = private == "yes"
+        uid = ctx.author.id
+        per = await self._effective_drop_cooldown_seconds(ctx, uid)
+        now = time.time()
+        last = self._drop_last_ts.get(uid, 0.0)
+        if last and now - last < per:
+            msg = _drop_cooldown_message(per - (now - last), per_seconds=per)
+            if ctx.interaction is not None and not ctx.interaction.response.is_done():
+                await ctx.interaction.response.send_message(msg, ephemeral=_hybrid_ephemeral(ctx))
+            else:
+                await ctx.send(msg, ephemeral=_hybrid_ephemeral(ctx))
+            return
+        self._drop_last_ts[uid] = now
+
         if ctx.interaction:
-            await ctx.defer(ephemeral=private)
+            await ctx.defer(ephemeral=is_private)
         drop = DropService()
         async with self.bot.async_session_factory() as session:
             try:
@@ -1403,53 +1786,47 @@ class GachaCog(commands.Cog):
                 await ctx.send(str(exc), ephemeral=False)
                 return
 
-        header = (
-            "**Pack opened** — always **2** cards; extra slots may appear "
-            "(rarer each time). Tap **one** button below to save that card."
+        is_slash = ctx.interaction is not None
+        private_reply = is_slash and is_private
+        deadline_unix = int(time.time()) + _PACK_CLAIM_SECONDS
+        view = PackPickView(
+            session_factory=self.bot.async_session_factory,
+            issuer_id=ctx.author.id,
+            opener_mention=ctx.author.mention,
+            cards=pack,
+            deadline_unix=deadline_unix,
+            private_pack=private_reply,
         )
-
-        slots_text = "\n".join(
-            f"**#{i}** {c.name} — *{c.tcg_rarity or '?'}* · {c.set_name} #{c.collector_number}"
-            for i, c in enumerate(pack, start=1)
-        )
-        embed = discord.Embed(
-            title="Your reveals",
-            description=_truncate(slots_text, 4096),
-        )
-
         try:
             png = await render_pack_collage_png(pack)
         except (OSError, ValueError, httpx.HTTPError):
             png = None
-        view = PackPickView(
-            session_factory=self.bot.async_session_factory,
-            issuer_id=ctx.author.id,
-            cards=pack,
-        )
-        is_slash = ctx.interaction is not None
-        private_reply = is_slash and private
+        content = view.build_content()
         if png is not None:
             file = discord.File(png, filename="pack.png")
-            embed.set_image(url="attachment://pack.png")
-            await ctx.send(
-                content=header,
-                embed=embed,
+            msg = await ctx.send(
+                content=content,
                 file=file,
                 ephemeral=private_reply,
                 view=view,
             )
+            view.message = msg
         else:
-            await ctx.send(
-                content=header + "\n*(Could not build card collage.)*",
-                embed=embed,
+            # No collage — append a plain-text card list so the message still shows what dropped.
+            fallback = "\n".join(
+                f"**#{i + 1}** {c.name} — *{c.tcg_rarity or '?'}* · {c.set_name} #{c.collector_number}"
+                for i, c in enumerate(pack)
+            )
+            msg = await ctx.send(
+                content=content + "\n*(Could not build card collage.)*\n" + fallback,
                 ephemeral=private_reply,
                 view=view,
             )
-
+            view.message = msg
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(GachaCog(bot))
     _LOG.info(
-        "Loaded gacha cog: chat `cd`/`cs`/`cv`/… (prefix `c`), slash `/cd`, `/cs`, `/cv`, `/colv`, `/coll`, `/cevolve`."
+        "Loaded gacha cog: `pcd`, `/drop_boost`, `/cd`, `/cs`, `/cv`, `/colv`, `/coll`, `/cevolve`."
     )
 

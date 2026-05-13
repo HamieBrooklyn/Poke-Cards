@@ -155,7 +155,7 @@ class TradeOfferView(discord.ui.View):
 
 
 class TradeCog(commands.Cog):
-    """Slash **`/trade`** and prefix **`ctrade`** (`c` + `trade`)."""
+    """Slash **`/trade`** and chat **`trade`** for player trades."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -332,4 +332,4 @@ class TradeCog(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(TradeCog(bot))
-    _LOG.info("Loaded trade cog: slash `/trade offer`, `/trade gift`; prefix `ctrade …`.")
+    _LOG.info("Loaded trade cog: slash `/trade offer`, `/trade gift`; chat `trade …`.")

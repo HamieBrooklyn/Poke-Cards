@@ -15,22 +15,20 @@ class General(commands.Cog):
 
     @commands.hybrid_command(
         name="help",
-        description="PokePon: what the short commands mean (slash vs c+command in chat, like gachapon’s g+…)",
+        description="PokePon: what the short commands mean (slash menu vs typing the command name in chat)",
     )
     async def pokepon_help(self, ctx: commands.Context) -> None:
         e = discord.Embed(
             title="PokePon commands",
             description=(
-                "Use **slash** (`/cd`, `/cs`, `/cv`, `/colv`, `/coll`, `/cevolve`, `/duel`, `/deck`, `/trade`, `/help`) from the command menu. In a server, you can also type the "
-                "**`c` prefix** the same way [Gachapon](https://alternative.me/discord/bots/gachapon/commands) uses "
-                " **`g`**: **`cd`**, **`cs`**, **`cv`**, **`colv`**, **`coll`**, **`cevolve`**, **`duel`**, **`deck`**, **`trade`**, **`chelp`**. That needs "
-                "**`DISCORD_MESSAGE_CONTENT_INTENT=1` in .env** and **Message Content Intent** on the Developer Portal "
-                " **Bot** tab → **Privileged Gateway Intents** (not OAuth2 scopes, not invite permissions)."
+                "Use **slash** from the **`/`** menu (**`/cd`**, **`/cs`**, **`/auction create`**, **`/drop_boost`**, …) — pick the command so Discord shows the **blue pill**. Typing **`/auction`** as **plain chat text** is **not** a command.\n"
+                "**Chat commands** — just **type the command name directly** (**`cd`**, **`coll`**, **`packd`**, **`trade`**, **`help`**, …). This needs **Message Content Intent** on in the Developer Portal → **Bot** → **Privileged Gateway Intents** (not OAuth2 scopes). The bot requests that intent by default; set **`DISCORD_MESSAGE_CONTENT_INTENT=0`** in `.env` only if you want slash-only."
             ),
         )
         e.add_field(
             name="`cd` — card drop",
-            value="Open a pack and keep **one** of the revealed cards. Slash **`private`** hides the pack from the channel.",
+            value="Open a pack and keep **one** of the revealed cards. Slash **`private`** hides the pack from the channel. "
+            "Optional **half cooldown** durable SKU: **`/drop_boost`** (and configure `DISCORD_DROP_BOOST_SKU_ID`).",
             inline=False,
         )
         e.add_field(
@@ -63,10 +61,20 @@ class General(commands.Cog):
             inline=False,
         )
         e.add_field(
+            name="`packd` / `packv` / `packcolv` / `packcat` — **booster packs**",
+            value=(
+                "**`/packd`** — drop a random pack: **5,000** ₽, **10** 💎, or the consumable SKU.\n"
+                "**`/packv`** — search a specific series, flip pack visuals, and buy with **💎**.\n"
+                "**`/packcolv`** — flip through your **unopened** packs; **Open** rolls **10 + 1** card and grants 💎 from the code card.\n"
+                "**`/packcat`** — browse the catalog with **`sort:`** `popular` / `rarest` / cost, and **`scope:`** `server` / `global`."
+            ),
+            inline=False,
+        )
+        e.add_field(
             name="`duel` / `deck` — **PvP duels**",
-            value="**`/deck set`** — save **1–6** Pokémon you own (Card IDs, lead first). **`/deck view`** — your bench.\n"
+            value="**`/deck edit`** — interactive bench (**1–6** Pokémon): slot dropdown, reply with **Card ID**, clear/remove. **`/deck view`** — your bench.\n"
             "**`/duel challenge`** — challenge someone, optional **bet**; both **Accept** / **Ready**; decks stay hidden until the fight. "
-            "Turn-based: pick moves from the card’s attacks (damage from the printing; complex text is shown but not simulated yet). "
+            "Turn-based: damage uses each attack’s **energy cost** as its type vs the defender’s **card types** (main-series matchups: **green** = super effective, **red** = not very effective / no effect, **grey** = neutral in the battle log). "
             "Winner takes the **pot**.",
             inline=False,
         )
@@ -74,10 +82,22 @@ class General(commands.Cog):
             name="`trade` — **player trades**",
             value="**`/trade offer`** — you and another member list **Card IDs** (and optional **Pokedollars** on each side). "
             "They **Accept** or **Decline**; you can **Cancel offer**. **`/trade gift`** — give cards/₽ for nothing back. "
-            "Prefix: **`ctrade`** (same pattern as **`cd`**).",
+            "Chat: type **`trade`** for the same flow.",
             inline=False,
         )
-        e.set_footer(text="Other slash: /ping, /hello, /daily, /balance. In chat: chelp (prefix c + help) for this embed.")
+        e.add_field(
+            name="`auction` — **timed auctions**",
+            value="**`/auction create`** — list a card (modal: **Card ID**, starting bid, **duration**). "
+            "**`/auction search`** — optional **`seller`** (their listings only) plus name / rarity / Pokédex; in chat you can **reply** to someone instead of **`seller`**. "
+            "**`/auction bid`** · chat: **`auction create`**, **`auction search`**, **`auction bid`**.\n"
+            "**`/auction bid`** / chat **`auction bid`** — listing **#** or **Card ID** + ₽. "
+            "When time ends, highest bidder gets the card; seller receives the winning ₽.",
+            inline=False,
+        )
+        e.set_footer(
+            text="Other slash: /ping, /hello, /daily, /vote, /balance (+optional user). "
+            "In chat: type `help` for this embed.",
+        )
         await ctx.send(embed=e, ephemeral=False)
 
     @app_commands.command(name="ping", description="Check bot latency")

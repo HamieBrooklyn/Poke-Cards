@@ -9,6 +9,14 @@ from typing import Literal
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
+from poke_pon_bot.services.type_effectiveness import (
+    ansi_colored_battle_line,
+    combined_type_factor,
+    defense_types_from_card_types,
+    move_attacking_chart_type,
+    scaled_damage,
+    tcg_display_name,
+)
 
 Side = Literal["challenger", "opponent"]
 
@@ -46,9 +54,15 @@ def normalized_attacks(card: Card) -> list[dict]:
             dmg = parse_attack_damage(a.get("damage"))
             tx = a.get("text")
             text = str(tx).strip() if tx is not None and str(tx).strip() else None
-            out.append({"name": nm, "damage_int": max(0, dmg), "text": text})
+            cost_raw = a.get("cost")
+            cost: list[str] | None = None
+            if isinstance(cost_raw, list) and cost_raw:
+                cost = [str(c).strip() for c in cost_raw if c is not None and str(c).strip()]
+                if not cost:
+                    cost = None
+            out.append({"name": nm, "damage_int": max(0, dmg), "text": text, "cost": cost})
     if not out:
-        out.append({"name": "Struggle", "damage_int": 10, "text": None})
+        out.append({"name": "Struggle", "damage_int": 10, "text": None, "cost": None})
     return out
 
 
@@ -61,6 +75,7 @@ class Fighter:
     image_large: str | None
     max_hp: int
     current_hp: int
+    types: tuple[str, ...] = ("Normal",)
     attacks: list[dict] = field(default_factory=list)
 
     @classmethod
@@ -68,6 +83,7 @@ class Fighter:
         hp = max(1, parse_hp(card.hp))
         sm = card.image_small_url or card.image_large_url
         lg = card.image_large_url or card.image_small_url
+        deft = defense_types_from_card_types(card.tcg_types, supertype=card.supertype)
         return cls(
             instance_id=inst.id,
             public_id=inst.public_id,
@@ -76,8 +92,28 @@ class Fighter:
             image_large=lg,
             max_hp=hp,
             current_hp=hp,
+            types=deft,
             attacks=normalized_attacks(card),
         )
+
+
+def best_attack_index(attacker: Fighter, defender: Fighter) -> int:
+    """Pick the move index that deals the most **type-adjusted** damage (wild AI)."""
+    if not attacker.attacks:
+        return 0
+    best_i = 0
+    best_eff = -1
+    for k, mv in enumerate(attacker.attacks):
+        cost = mv.get("cost")
+        if not isinstance(cost, list):
+            cost = None
+        atk_t = move_attacking_chart_type(cost)
+        fac = combined_type_factor(atk_t, defender.types)
+        eff = scaled_damage(int(mv["damage_int"]), fac)
+        if eff > best_eff:
+            best_eff = eff
+            best_i = k
+    return best_i
 
 
 @dataclass
@@ -114,8 +150,7 @@ class DuelRuntime:
             turn=first,
         )
         r.log_lines.append(
-            f"**Battle start!** {'Challenger' if first == 'challenger' else 'Opponent'} moves first.\n"
-            f"{r._field_summary()}"
+            f"Battle start! {'Challenger' if first == 'challenger' else 'Opponent'} goes first.\n{r._field_summary()}"
         )
         return r
 
@@ -125,9 +160,9 @@ class DuelRuntime:
         if ca is None or oa is None:
             return ""
         return (
-            f"**Active:** {ca.name} (**{ca.current_hp}** / {ca.max_hp} HP) vs "
-            f"{oa.name} (**{oa.current_hp}** / {oa.max_hp} HP)\n"
-            f"_Bench: {max(0, len(self.challenger_lineup) - 1)} vs {max(0, len(self.opponent_lineup) - 1)}_"
+            f"Active: {ca.name} ({ca.current_hp} / {ca.max_hp} HP) vs "
+            f"{oa.name} ({oa.current_hp} / {oa.max_hp} HP)\n"
+            f"Bench: {max(0, len(self.challenger_lineup) - 1)} vs {max(0, len(self.opponent_lineup) - 1)}"
         )
 
     def current_turn_user_id(self) -> int:
@@ -154,24 +189,43 @@ class DuelRuntime:
         if attack_index < 0 or attack_index >= len(attacks):
             raise ValueError("Invalid attack index")
         move = attacks[attack_index]
-        dmg = int(move["damage_int"])
         name = str(move["name"])
-        defender.current_hp -= dmg
-        chunk = (
-            f"**{atk_name_side}’s {attacker.name}** uses **{name}** — **{dmg}** dmg to "
-            f"**{defender.name}** (now **{max(0, defender.current_hp)}** / {defender.max_hp} HP)."
+        base_dmg = int(move["damage_int"])
+        cost = move.get("cost")
+        if not isinstance(cost, list):
+            cost = None
+        atk_chart = move_attacking_chart_type(cost)
+        def_types = defender.types
+        factor = combined_type_factor(atk_chart, def_types)
+        final_dmg = scaled_damage(base_dmg, factor)
+        defender.current_hp -= final_dmg
+
+        move_label = tcg_display_name(atk_chart)
+        def_label = " / ".join(tcg_display_name(t) for t in def_types)
+        fac_disp = str(int(factor)) if float(factor) == int(factor) else f"{factor:g}"
+
+        main_line = (
+            f"{atk_name_side}'s {attacker.name} uses {name} — {final_dmg} damage to {defender.name} "
+            f"({max(0, defender.current_hp)}/{defender.max_hp} HP). "
+            f"Type: {move_label} vs {def_label} · card base {base_dmg} ×{fac_disp}"
         )
+
+        extra: list[str] = []
         winner: int | None = None
         if defender.current_hp <= 0:
-            chunk += f"\n**{defender.name}** is **Knocked Out**!"
+            extra.append(f"{defender.name} is Knocked Out!")
             def_line.pop(0)
             if not def_line:
                 winner = self.challenger_id if self.turn == "challenger" else self.opponent_id
-                chunk += "\n\n**No Pokémon left — duel over!**"
+                extra.append("No Pokémon left — duel over!")
             else:
                 nxt = def_line[0]
-                chunk += f"\n**{nxt.name}** is sent out (**{nxt.current_hp}** / {nxt.max_hp} HP)."
+                extra.append(f"{nxt.name} is sent out ({nxt.current_hp} / {nxt.max_hp} HP).")
 
+        body = main_line
+        if extra:
+            body = main_line + "\n" + "\n".join(extra)
+        chunk = ansi_colored_battle_line(body, type_factor=factor)
         self.log_lines.append(chunk)
         if winner is not None:
             return winner
