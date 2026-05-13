@@ -52,10 +52,44 @@ from poke_pon_bot.services.wallet import (
     InsufficientPokedollarsError,
     format_pokedollars,
 )
+from poke_pon_bot.services.wishlist import wishlist_user_ids_for_cards
 
 _LOG = logging.getLogger(__name__)
 
 _OPEN_VIEW_TIMEOUT = 600.0
+
+
+async def _notify_pack_wishlisters(
+    session_factory,
+    interaction: discord.Interaction,
+    *,
+    pairs: list[tuple[UserCardInstance, Card]],
+    obtainer_id: int,
+) -> None:
+    """After a pack is opened, tag guild members who wishlisted any of the obtained cards."""
+    guild = interaction.guild
+    if guild is None:
+        return
+    try:
+        card_ids = list({card.id for _, card in pairs})
+        async with session_factory() as session:
+            wl_map = await wishlist_user_ids_for_cards(
+                session, card_ids, exclude_user_id=obtainer_id,
+            )
+        if not wl_map:
+            return
+        guild_member_ids = {m.id for m in guild.members}
+        card_name_map = {card.id: card.name for _, card in pairs}
+        lines: list[str] = []
+        for cid, user_ids in wl_map.items():
+            mentions = [f"<@{uid}>" for uid in user_ids if uid in guild_member_ids]
+            if mentions:
+                name = card_name_map.get(cid, "Unknown")
+                lines.append(f"⭐ **{name}** — wishlisted by {', '.join(mentions)}")
+        if lines:
+            await interaction.followup.send("\n".join(lines))
+    except Exception:
+        _LOG.debug("pack wishlist notify failed", exc_info=True)
 
 
 def _pack_summary(pack: UserPackInstance, series: CardSeries) -> str:
@@ -1248,6 +1282,13 @@ class PacksCog(commands.Cog):
             return
 
         view.message = msg
+
+        await _notify_pack_wishlisters(
+            self.bot.async_session_factory,
+            interaction,
+            pairs=all_pairs,
+            obtainer_id=interaction.user.id,
+        )
 
     # ----------------------------------------------------------------------- /packd
 

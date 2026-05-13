@@ -12,6 +12,7 @@ from poke_pon_bot.models.pending_trade import PendingTrade
 from poke_pon_bot.models.pokedollars import UserPokedollars
 from poke_pon_bot.models.rarity import RarityClass, TcgRarityMapping
 from poke_pon_bot.models.topgg_processed_vote import TopggProcessedVote
+from poke_pon_bot.models.wishlist import UserWishlist
 
 __all__ = [
     "CardAuction",
@@ -29,4 +30,5 @@ __all__ = [
     "PendingTrade",
     "UserPokedollars",
     "TopggProcessedVote",
+    "UserWishlist",
 ]

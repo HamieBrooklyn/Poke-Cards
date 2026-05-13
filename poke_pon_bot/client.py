@@ -189,6 +189,7 @@ class PokePonBot(commands.Bot):
 
     def __init__(self, *, settings: Settings) -> None:
         intents = discord.Intents.default()
+        intents.members = True
         if settings.discord_message_content_intent:
             # Must match Developer Portal: **Bot** tab → **Privileged Gateway Intents** →
             # **Message Content Intent** (not OAuth2 URL Generator scopes, not the invite permissions grid).
@@ -267,6 +268,8 @@ class PokePonBot(commands.Bot):
         await self.load_extension("poke_pon_bot.cogs.trade")
         await self.load_extension("poke_pon_bot.cogs.auction")
         await self.load_extension("poke_pon_bot.cogs.packs")
+        await self.load_extension("poke_pon_bot.cogs.leaderboard")
+        await self.load_extension("poke_pon_bot.cogs.wishlist")
 
         await self._maybe_sync_slash_commands()
 

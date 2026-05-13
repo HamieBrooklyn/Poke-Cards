@@ -94,8 +94,23 @@ class General(commands.Cog):
             "When time ends, highest bidder gets the card; seller receives the winning ₽.",
             inline=False,
         )
+        e.add_field(
+            name="`leaderboard` — **rankings**",
+            value="**`/leaderboard`** — view **server** or **global** rankings. "
+            "Categories: **strongest** cards (attack damage), **tankiest** (HP), **rarest**, or **top auction sales**. "
+            "Chat: **`pcleaderboard`** or **`lb`**.",
+            inline=False,
+        )
+        e.add_field(
+            name="`wishlist` — **card wishlist**",
+            value="⭐ on **`/colv`** or **`/cv`** to wishlist a card. "
+            "When someone drops or opens a wishlisted card in your server, you get tagged.\n"
+            "**`/wishlist`** — view your wishlist. **`/wishlistremove`** — remove by name. "
+            "Chat: **`wl`** / **`wlr`**.",
+            inline=False,
+        )
         e.set_footer(
-            text="Other slash: /ping, /hello, /daily, /vote, /balance (+optional user). "
+            text="Other slash: /ping, /hello, /daily, /vote, /balance (+optional user), /leaderboard, /wishlist. "
             "In chat: type `help` for this embed.",
         )
         await ctx.send(embed=e, ephemeral=False)

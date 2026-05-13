@@ -39,6 +39,12 @@ from poke_pon_bot.services.evolution import (
 )
 from poke_pon_bot.services.pack_collage import render_pack_collage_png
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
+from poke_pon_bot.services.wishlist import (
+    add_wishlist,
+    is_wishlisted,
+    remove_wishlist,
+    wishlist_user_ids_for_cards,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -60,6 +66,36 @@ def _collection_web_footer() -> str:
         f"\n\n_Browse and search your full binder (filters, card details):_\n"
         f"<{COLLECTION_WEB_URL}>"
     )
+
+
+async def _notify_wishlisters(
+    session_factory,
+    interaction: discord.Interaction,
+    *,
+    card_id: int,
+    card_name: str,
+    obtainer_id: int,
+) -> None:
+    """Send a channel message tagging guild members who wishlisted the obtained card."""
+    guild = interaction.guild
+    if guild is None:
+        return
+    try:
+        async with session_factory() as session:
+            wl_map = await wishlist_user_ids_for_cards(
+                session, [card_id], exclude_user_id=obtainer_id,
+            )
+        user_ids = wl_map.get(card_id, [])
+        if not user_ids:
+            return
+        guild_member_ids = {m.id for m in guild.members}
+        mentions = [f"<@{uid}>" for uid in user_ids if uid in guild_member_ids]
+        if not mentions:
+            return
+        text = f"⭐ **{card_name}** was just obtained! Wishlisted by {', '.join(mentions)}"
+        await interaction.followup.send(text)
+    except Exception:
+        _LOG.debug("wishlist notify failed for card_id=%s", card_id, exc_info=True)
 
 
 def _hybrid_ephemeral(ctx: commands.Context) -> bool:
@@ -636,8 +672,85 @@ class EvolutionBranchView(discord.ui.View):
         await interaction.response.edit_message(embed=emb, view=None)
 
 
+class WishlistToggleButton(discord.ui.Button):
+    """Star button that toggles the current card on/off the viewer's wishlist."""
+
+    _STAR_ON = "⭐"
+    _STAR_OFF = "☆"
+
+    def __init__(self, *, session_factory, card_id: int, viewer_id: int, wishlisted: bool, row: int = 0) -> None:
+        emoji = self._STAR_ON if wishlisted else self._STAR_OFF
+        style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
+        super().__init__(emoji=emoji, style=style, row=row)
+        self._session_factory = session_factory
+        self._card_id = card_id
+        self._viewer_id = viewer_id
+        self._wishlisted = wishlisted
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._viewer_id:
+            await interaction.response.send_message(
+                "Only the person who opened this view can wishlist.",
+                ephemeral=True,
+            )
+            return
+        try:
+            async with self._session_factory() as session:
+                if self._wishlisted:
+                    await remove_wishlist(session, discord_user_id=self._viewer_id, card_id=self._card_id)
+                    self._wishlisted = False
+                else:
+                    added = await add_wishlist(session, discord_user_id=self._viewer_id, card_id=self._card_id)
+                    if not added:
+                        await interaction.response.send_message(
+                            "Wishlist is full (max 50 cards) or already wishlisted.",
+                            ephemeral=True,
+                        )
+                        return
+                    self._wishlisted = True
+        except SQLAlchemyError:
+            _LOG.exception("wishlist toggle card_id=%s user=%s", self._card_id, self._viewer_id)
+            await interaction.response.send_message("Could not update wishlist. Try again.", ephemeral=True)
+            return
+
+        self.emoji = self._STAR_ON if self._wishlisted else self._STAR_OFF
+        self.style = discord.ButtonStyle.primary if self._wishlisted else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(view=self.view)
+
+    def update(self, *, card_id: int, wishlisted: bool) -> None:
+        """Refresh the button state (e.g. after flipping to a new card)."""
+        self._card_id = card_id
+        self._wishlisted = wishlisted
+        self.emoji = self._STAR_ON if wishlisted else self._STAR_OFF
+        self.style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
+
+
+class SingleCardWishlistView(discord.ui.View):
+    """Lightweight view with just a ⭐ wishlist toggle for a single card display."""
+
+    def __init__(self, *, session_factory, card_id: int, viewer_id: int, wishlisted: bool) -> None:
+        super().__init__(timeout=600.0)
+        self.add_item(WishlistToggleButton(
+            session_factory=session_factory,
+            card_id=card_id,
+            viewer_id=viewer_id,
+            wishlisted=wishlisted,
+            row=0,
+        ))
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        msg = getattr(self, "message", None)
+        if msg is not None:
+            try:
+                await msg.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+
 class CollectionFlipView(discord.ui.View):
-    """Browse owned cards with ◀ ▶."""
+    """Browse owned cards with ◀ ▶ and ⭐ wishlist toggle."""
 
     def __init__(
         self,
@@ -646,6 +759,8 @@ class CollectionFlipView(discord.ui.View):
         owner_id: int,
         viewer_id: int,
         instance_ids: list[int],
+        first_card_id: int = 0,
+        first_wishlisted: bool = False,
     ) -> None:
         if not instance_ids:
             msg = "instance_ids must be non-empty"
@@ -663,6 +778,16 @@ class CollectionFlipView(discord.ui.View):
         self._next.callback = self._on_next
         self.add_item(self._prev)
         self.add_item(self._next)
+
+        self._wish_btn = WishlistToggleButton(
+            session_factory=session_factory,
+            card_id=first_card_id,
+            viewer_id=viewer_id,
+            wishlisted=first_wishlisted,
+            row=0,
+        )
+        self.add_item(self._wish_btn)
+
         self._sync_nav_buttons()
 
     def _sync_nav_buttons(self) -> None:
@@ -730,6 +855,9 @@ class CollectionFlipView(discord.ui.View):
                     viewer_id=self._viewer_id,
                 )
                 content = _card_id_message_line(inst.public_id)
+                wishlisted = await is_wishlisted(
+                    session, discord_user_id=self._viewer_id, card_id=card.id,
+                )
         except SQLAlchemyError:
             _LOG.exception("collection flip navigation for instance %s", iid)
             await interaction.response.send_message(
@@ -738,6 +866,7 @@ class CollectionFlipView(discord.ui.View):
             )
             return
 
+        self._wish_btn.update(card_id=card.id, wishlisted=wishlisted)
         self._sync_nav_buttons()
         await interaction.response.edit_message(content=content, embed=embed, view=self)
 
@@ -866,8 +995,6 @@ class PackPickView(discord.ui.View):
             self._slot_pid[idx] = drop_result.public_id
             button.disabled = True
             button.style = discord.ButtonStyle.success
-            # Keep the card name on the button after claim so the pack contents stay readable
-            # even though the embed no longer lists them in text.
             button.label = _truncate(f"#{idx + 1} · Taken · {card.name}", 80)
 
             all_taken = len(self._slot_claimer) >= len(self._cards)
@@ -881,11 +1008,18 @@ class PackPickView(discord.ui.View):
                     content=self.build_content() + extra,
                     view=self,
                 )
-                return
+            else:
+                await interaction.response.edit_message(
+                    content=self.build_content(),
+                    view=self,
+                )
 
-            await interaction.response.edit_message(
-                content=self.build_content(),
-                view=self,
+            await _notify_wishlisters(
+                self._session_factory,
+                interaction,
+                card_id=card.id,
+                card_name=card.name,
+                obtainer_id=uid,
             )
 
     async def on_timeout(self) -> None:
@@ -1040,6 +1174,9 @@ class GachaCog(commands.Cog):
                         viewer_id=viewer_id if peer else None,
                     )
                     content = _card_id_message_line(inst.public_id)
+                    wishlisted = await is_wishlisted(
+                        session, discord_user_id=viewer_id, card_id=card.id,
+                    )
             except SQLAlchemyError:
                 _LOG.exception("cv c card_ref owner %s viewer %s", owner_id, viewer_id)
                 await ctx.send(
@@ -1047,7 +1184,13 @@ class GachaCog(commands.Cog):
                     ephemeral=ephe,
                 )
                 return
-            await ctx.send(content=content, embed=embed, ephemeral=ephe)
+            view = SingleCardWishlistView(
+                session_factory=self.bot.async_session_factory,
+                card_id=card.id,
+                viewer_id=viewer_id,
+                wishlisted=wishlisted,
+            )
+            await ctx.send(content=content, embed=embed, view=view, ephemeral=ephe)
             return
 
         if not any_filter_set(
@@ -1123,9 +1266,18 @@ class GachaCog(commands.Cog):
                 collection_owner_id=owner_id if peer else None,
                 viewer_id=viewer_id if peer else None,
             )
+            async with self.bot.async_session_factory() as s2:
+                w = await is_wishlisted(s2, discord_user_id=viewer_id, card_id=card.id)
+            view = SingleCardWishlistView(
+                session_factory=self.bot.async_session_factory,
+                card_id=card.id,
+                viewer_id=viewer_id,
+                wishlisted=w,
+            )
             await ctx.send(
                 content=_card_id_message_line(inst.public_id),
                 embed=embed,
+                view=view,
                 ephemeral=ephe,
             )
             return
@@ -1164,9 +1316,18 @@ class GachaCog(commands.Cog):
             collection_owner_id=owner_id if peer else None,
             viewer_id=viewer_id if peer else None,
         )
+        async with self.bot.async_session_factory() as s2:
+            w = await is_wishlisted(s2, discord_user_id=viewer_id, card_id=card.id)
+        view = SingleCardWishlistView(
+            session_factory=self.bot.async_session_factory,
+            card_id=card.id,
+            viewer_id=viewer_id,
+            wishlisted=w,
+        )
         await ctx.send(
             content=_card_id_message_line(inst.public_id),
             embed=embed,
+            view=view,
             ephemeral=ephe,
         )
 
@@ -1530,6 +1691,9 @@ class GachaCog(commands.Cog):
                     viewer_id=viewer_id,
                 )
                 first_pid = inst0.public_id
+                first_wishlisted = await is_wishlisted(
+                    session, discord_user_id=viewer_id, card_id=card0.id,
+                )
         except SQLAlchemyError:
             _LOG.exception("colv for owner %s viewer %s", owner_id, viewer_id)
             await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
@@ -1540,6 +1704,8 @@ class GachaCog(commands.Cog):
             owner_id=owner_id,
             viewer_id=viewer_id,
             instance_ids=ids,
+            first_card_id=card0.id,
+            first_wishlisted=first_wishlisted,
         )
         await ctx.send(
             content=_card_id_message_line(first_pid) + _collection_web_footer(),
