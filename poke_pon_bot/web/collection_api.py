@@ -27,6 +27,7 @@ from poke_pon_bot.services.collection_sell import (
     quote_collection_sell_payout,
     run_collection_sell,
 )
+from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
 from poke_pon_bot.services.instance_public_id import normalize_public_id
 from poke_pon_bot.services.wallet import WalletService
 from poke_pon_bot.web.sessions import read_session
@@ -175,7 +176,8 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
         try:
             async with session_factory() as db:
                 count_stmt = select(func.count(UserCardInstance.id)).where(
-                    UserCardInstance.discord_user_id == session.user_id
+                    UserCardInstance.discord_user_id == session.user_id,
+                    user_instance_not_in_active_auction(),
                 )
                 if q:
                     count_stmt = count_stmt.join(
@@ -191,7 +193,10 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         RarityClass.id == Card.rarity_class_id,
                         isouter=True,
                     )
-                    .where(UserCardInstance.discord_user_id == session.user_id)
+                    .where(
+                        UserCardInstance.discord_user_id == session.user_id,
+                        user_instance_not_in_active_auction(),
+                    )
                 )
                 if q:
                     base = base.where(func.lower(Card.name).like(f"%{q}%"))
@@ -286,6 +291,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         .where(
                             UserCardInstance.public_id == n,
                             UserCardInstance.discord_user_id == session.user_id,
+                            user_instance_not_in_active_auction(),
                         )
                     )
                 ).first()
@@ -342,6 +348,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         .where(
                             UserCardInstance.public_id == n,
                             UserCardInstance.discord_user_id == sess.user_id,
+                            user_instance_not_in_active_auction(),
                         )
                     )
                 ).first()

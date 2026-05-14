@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
+from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
 from poke_pon_bot.services.instance_public_id import normalize_public_id
 
 
@@ -45,7 +46,10 @@ def _base_stmt(discord_user_id: int) -> Select:
     return (
         select(UserCardInstance, Card)
         .join(Card, UserCardInstance.card_id == Card.id)
-        .where(UserCardInstance.discord_user_id == discord_user_id)
+        .where(
+            UserCardInstance.discord_user_id == discord_user_id,
+            user_instance_not_in_active_auction(),
+        )
     )
 
 
@@ -87,6 +91,7 @@ async def search_collection(
             .where(
                 UserCardInstance.discord_user_id == discord_user_id,
                 UserCardInstance.public_id == n_pid,
+                user_instance_not_in_active_auction(),
             )
         )
     else:
@@ -102,7 +107,10 @@ async def search_collection(
             select(func.count())
             .select_from(UserCardInstance)
             .join(Card, UserCardInstance.card_id == Card.id)
-            .where(UserCardInstance.discord_user_id == discord_user_id)
+            .where(
+                UserCardInstance.discord_user_id == discord_user_id,
+                user_instance_not_in_active_auction(),
+            )
         )
         count_stmt = _apply_filters(
             count_stmt,

@@ -27,6 +27,7 @@ from poke_pon_bot.services.catalog_search import (
     search_catalog,
 )
 from poke_pon_bot.services.collection_search import any_filter_set, search_collection
+from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
 from poke_pon_bot.services.drops import DropService
 from poke_pon_bot.config import Settings
 from poke_pon_bot.context_reply import reply_target_user_id, resolve_collection_display_target
@@ -339,13 +340,19 @@ async def _load_instance_and_card(
     instance_id: int,
     owner_discord_id: int,
 ) -> tuple[UserCardInstance, Card] | None:
-    inst = await session.get(UserCardInstance, instance_id)
-    if inst is None or inst.discord_user_id != owner_discord_id:
+    row = await session.execute(
+        select(UserCardInstance, Card)
+        .join(Card, UserCardInstance.card_id == Card.id)
+        .where(
+            UserCardInstance.id == instance_id,
+            UserCardInstance.discord_user_id == owner_discord_id,
+            user_instance_not_in_active_auction(),
+        )
+    )
+    first = row.first()
+    if first is None:
         return None
-    card = await session.get(Card, inst.card_id)
-    if card is None:
-        return None
-    return (inst, card)
+    return (first[0], first[1])
 
 
 async def _load_instance_by_public_id(
@@ -362,6 +369,7 @@ async def _load_instance_by_public_id(
         .where(
             UserCardInstance.discord_user_id == owner_discord_id,
             UserCardInstance.public_id == n,
+            user_instance_not_in_active_auction(),
         )
     )
     first = row.first()
@@ -1665,7 +1673,10 @@ class GachaCog(commands.Cog):
             async with self.bot.async_session_factory() as session:
                 stmt = (
                     select(UserCardInstance.id)
-                    .where(UserCardInstance.discord_user_id == owner_id)
+                    .where(
+                        UserCardInstance.discord_user_id == owner_id,
+                        user_instance_not_in_active_auction(),
+                    )
                     .order_by(UserCardInstance.obtained_at.desc())
                 )
                 if lim is not None:
@@ -1744,7 +1755,10 @@ class GachaCog(commands.Cog):
                 stmt = (
                     select(UserCardInstance, Card)
                     .join(Card, UserCardInstance.card_id == Card.id)
-                    .where(UserCardInstance.discord_user_id == owner_id)
+                    .where(
+                        UserCardInstance.discord_user_id == owner_id,
+                        user_instance_not_in_active_auction(),
+                    )
                     .order_by(UserCardInstance.obtained_at.desc())
                     .limit(lim)
                 )
