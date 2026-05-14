@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from aiohttp import web
@@ -31,6 +32,14 @@ from poke_pon_bot.services.wallet import WalletService
 from poke_pon_bot.web.sessions import read_session
 
 _LOG = logging.getLogger(__name__)
+
+
+def _utc_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC).isoformat()
+    return dt.astimezone(UTC).isoformat()
 
 _DEFAULT_PAGE_SIZE = 60
 _MAX_PAGE_SIZE = 120
@@ -100,8 +109,9 @@ def _serialize_instance(
     sell: dict[str, Any],
 ) -> dict[str, Any]:
     return {
+        "instance_id": inst.id,
         "public_id": inst.public_id,
-        "obtained_at": inst.obtained_at.isoformat() if inst.obtained_at else None,
+        "obtained_at": _utc_iso(inst.obtained_at),
         "evolution_stages": int(inst.evolution_stages),
         "source": inst.source,
         "sell": sell,

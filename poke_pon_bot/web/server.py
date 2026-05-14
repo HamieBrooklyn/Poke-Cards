@@ -15,6 +15,15 @@ Hosts (each only when its config is present):
 * ``GET  /api/auctions/{id}``           — Auction detail + bid history.
 * ``POST /api/auctions``                — Create listing (session cookie).
 * ``POST /api/auctions/{id}/bid``       — Place bid (session cookie).
+* ``POST /api/me/trades``              — Create trade invite.
+* ``GET  /api/me/trades``              — List user's trade sessions.
+* ``GET  /api/me/trades/{id}``         — Trade session detail (poll endpoint).
+* ``POST /api/me/trades/{id}/accept``  — Accept invite.
+* ``POST /api/me/trades/{id}/decline`` — Decline invite.
+* ``POST /api/me/trades/{id}/update``  — Update caller's side.
+* ``POST /api/me/trades/{id}/ready``   — Toggle ready (executes if both ready).
+* ``POST /api/me/trades/{id}/cancel``  — Cancel trade.
+* ``GET  /api/me/trades/pending-count``— Incoming invite count (badge).
 
 Everything runs in one ``aiohttp.web.Application`` so the bot needs only one
 listening port / one reverse proxy / one ngrok tunnel exposed to the internet.
@@ -106,14 +115,16 @@ async def start_web_server(bot: Any) -> WebServer | None:
         from poke_pon_bot.web.collection_api import register_collection_api
         from poke_pon_bot.web.deck_api import register_deck_api
         from poke_pon_bot.web.oauth import register_oauth_routes
+        from poke_pon_bot.web.trade_api import register_trade_api
 
         register_oauth_routes(
-            app, settings=settings, secure_cookies=_secure_cookies(settings)
+            app, settings=settings, secure_cookies=_secure_cookies(settings), bot=bot
         )
         register_collection_api(app, bot=bot, settings=settings)
         register_deck_api(app, bot=bot, settings=settings)
         register_auction_api(app, bot=bot, settings=settings)
-        _LOG.info("Discord OAuth + Collection / Deck / Auction API mounted.")
+        register_trade_api(app, bot=bot, settings=settings)
+        _LOG.info("Discord OAuth + Collection / Deck / Auction / Trade API mounted.")
 
     if not list(app.router.routes()):
         _LOG.info("Web server disabled: no routes were enabled by settings.")

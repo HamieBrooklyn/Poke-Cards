@@ -89,6 +89,7 @@ def register_oauth_routes(
     *,
     settings: Any,
     secure_cookies: bool,
+    bot: Any = None,
 ) -> None:
     client_id = settings.discord_oauth_client_id
     client_secret = settings.discord_oauth_client_secret
@@ -188,6 +189,24 @@ def register_oauth_routes(
         username = str(user.get("username") or "")
         global_name = user.get("global_name")
         avatar = _avatar_url(user_id, user.get("avatar"))
+
+        try:
+            from poke_pon_bot.models.known_user import KnownUser
+
+            async with bot.async_session_factory() as db:  # type: ignore[union-attr]
+                ku = await db.get(KnownUser, user_id)
+                if ku is None:
+                    ku = KnownUser(discord_id=user_id, username=username, global_name=global_name, avatar_url=avatar)
+                    db.add(ku)
+                else:
+                    ku.username = username
+                    ku.global_name = global_name
+                    ku.avatar_url = avatar
+                    from datetime import UTC, datetime
+                    ku.last_seen_at = datetime.now(UTC)
+                await db.commit()
+        except Exception:
+            _LOG.debug("Failed to upsert KnownUser for %s", user_id)
 
         session_value = encode_session(
             session_secret,
