@@ -24,6 +24,7 @@ Hosts (each only when its config is present):
 * ``POST /api/me/trades/{id}/ready``   — Toggle ready (executes if both ready).
 * ``POST /api/me/trades/{id}/cancel``  — Cancel trade.
 * ``GET  /api/me/trades/pending-count``— Incoming invite count (badge).
+* ``GET  /api/me/trade-user-search``   — Autocomplete: Discord users in bot servers (``q``).
 
 Everything runs in one ``aiohttp.web.Application`` so the bot needs only one
 listening port / one reverse proxy / one ngrok tunnel exposed to the internet.

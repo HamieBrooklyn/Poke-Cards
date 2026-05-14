@@ -12,6 +12,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.models.known_user import KnownUser
+from poke_pon_bot.services.trade_user_search import (
+    resolve_username_in_bot_guilds,
+    search_members_shared_with_bot,
+)
 from poke_pon_bot.models.trade_session import (
     TRADE_STATUS_ACTIVE,
     TRADE_STATUS_INVITED,
@@ -91,19 +95,21 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                     except (ValueError, TypeError):
                         return web.json_response({"error": "invalid_partner_id"}, status=400)
                 elif partner_username:
-                    uname = str(partner_username).strip().lower()
-                    row = await db.execute(
-                        select(KnownUser.discord_id)
-                        .where(func.lower(KnownUser.username) == uname)
-                        .limit(1)
+                    resolved = await resolve_username_in_bot_guilds(
+                        bot,
+                        username=str(partner_username),
+                        requester_id=uid,
                     )
-                    first = row.first()
-                    if first is None:
+                    if resolved is None:
                         return web.json_response(
-                            {"error": "user_not_found", "message": "No user found with that username. They must have signed into the website at least once."},
+                            {
+                                "error": "user_not_found",
+                                "message": "No Discord user with that exact username found in any server with this bot. "
+                                "Use the search suggestions, or paste their numeric User ID.",
+                            },
                             status=404,
                         )
-                    partner_id = int(first[0])
+                    partner_id = resolved
                 else:
                     return web.json_response({"error": "missing_partner"}, status=400)
 
@@ -335,6 +341,24 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
             n = 0
         return web.json_response({"count": int(n or 0)})
 
+    async def handle_trade_user_search(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        uid = int(sess.user_id)
+        q = (request.query.get("q") or "").strip()
+        try:
+            lim = int(request.query.get("limit", "15"))
+        except ValueError:
+            lim = 15
+        try:
+            users = await search_members_shared_with_bot(
+                bot, query=q, requester_id=uid, limit=lim
+            )
+        except Exception:
+            _LOG.exception("trade user search q=%r", q)
+            return web.json_response({"error": "search_failed"}, status=500)
+        return web.json_response({"users": users})
+
+    app.router.add_get("/api/me/trade-user-search", handle_trade_user_search)
     app.router.add_post("/api/me/trades", handle_create)
     app.router.add_get("/api/me/trades", handle_list)
     app.router.add_get("/api/me/trades/pending-count", handle_pending_count)
