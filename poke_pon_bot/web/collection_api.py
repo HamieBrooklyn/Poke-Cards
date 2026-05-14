@@ -2,10 +2,13 @@
 
 The site at ``hamiebrooklyn.github.io`` calls these with ``credentials: 'include'``
 so the signed session cookie minted by ``poke_pon_bot.web.oauth`` reaches us.
+
+Shop sell quotes use ``quote_collection_sell_payout`` (same as Discord ``/colv``).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -16,6 +19,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
+from poke_pon_bot.services.collection_sell import (
+    collection_sell_block_reason,
+    collection_sell_block_reasons_for_instances,
+    collection_sell_needs_confirm,
+    quote_collection_sell_payout,
+    run_collection_sell,
+)
+from poke_pon_bot.services.instance_public_id import normalize_public_id
+from poke_pon_bot.services.wallet import WalletService
 from poke_pon_bot.web.sessions import read_session
 
 _LOG = logging.getLogger(__name__)
@@ -57,14 +69,42 @@ def _max_attack_damage(attacks: Any) -> int:
     return best
 
 
+def _sell_payload_for_copy(
+    inst: UserCardInstance,
+    card: Card,
+    rarity: RarityClass | None,
+    blocked_reason: str | None,
+) -> dict[str, Any]:
+    """Shop sell terms — same quote and block rules as Discord ``/colv``."""
+    if rarity is None:
+        return {
+            "quote_pokedollars": None,
+            "needs_confirm": False,
+            "blocked_reason": blocked_reason,
+            "can_sell": False,
+        }
+    quote = quote_collection_sell_payout(card, rarity, inst)
+    return {
+        "quote_pokedollars": quote,
+        "needs_confirm": collection_sell_needs_confirm(rarity),
+        "blocked_reason": blocked_reason,
+        "can_sell": blocked_reason is None,
+    }
+
+
 def _serialize_instance(
-    inst: UserCardInstance, card: Card, rarity: RarityClass | None
+    inst: UserCardInstance,
+    card: Card,
+    rarity: RarityClass | None,
+    *,
+    sell: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "public_id": inst.public_id,
         "obtained_at": inst.obtained_at.isoformat() if inst.obtained_at else None,
         "evolution_stages": int(inst.evolution_stages),
         "source": inst.source,
+        "sell": sell,
         "card": {
             "name": card.name,
             "set_code": card.set_code,
@@ -95,6 +135,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
     session_factory = bot.async_session_factory
     session_secret = settings.web_session_secret
     session_ttl = settings.web_session_ttl_seconds
+    wallet = WalletService()
 
     def _require_session(request: web.Request):
         sess = read_session(request, session_secret, max_age=session_ttl)
@@ -181,8 +222,22 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         )
                     ).all()
 
+                instance_ids = [inst.id for inst, _, _ in sliced]
+                block_map = await collection_sell_block_reasons_for_instances(
+                    db,
+                    discord_user_id=session.user_id,
+                    instance_ids=instance_ids,
+                )
                 items = [
-                    _serialize_instance(inst, card, rar) for inst, card, rar in sliced
+                    _serialize_instance(
+                        inst,
+                        card,
+                        rar,
+                        sell=_sell_payload_for_copy(
+                            inst, card, rar, block_map.get(inst.id)
+                        ),
+                    )
+                    for inst, card, rar in sliced
                 ]
         except SQLAlchemyError:
             _LOG.exception(
@@ -203,7 +258,10 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
 
     async def handle_card_detail(request: web.Request) -> web.StreamResponse:
         session = _require_session(request)
-        public_id = request.match_info.get("public_id", "")
+        raw_pid = request.match_info.get("public_id", "")
+        n = normalize_public_id(raw_pid)
+        if n is None:
+            return web.json_response({"error": "not found"}, status=404)
         try:
             async with session_factory() as db:
                 row = (
@@ -216,7 +274,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                             isouter=True,
                         )
                         .where(
-                            UserCardInstance.public_id == public_id,
+                            UserCardInstance.public_id == n,
                             UserCardInstance.discord_user_id == session.user_id,
                         )
                     )
@@ -224,12 +282,125 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                 if row is None:
                     return web.json_response({"error": "not found"}, status=404)
                 inst, card, rar = row
-                return web.json_response(_serialize_instance(inst, card, rar))
+                blocked = await collection_sell_block_reason(
+                    db,
+                    discord_user_id=session.user_id,
+                    instance_id=inst.id,
+                )
+                payload = _serialize_instance(
+                    inst,
+                    card,
+                    rar,
+                    sell=_sell_payload_for_copy(inst, card, rar, blocked),
+                )
+                return web.json_response(payload)
         except SQLAlchemyError:
             _LOG.exception(
-                "card_detail user=%s public_id=%s", session.user_id, public_id
+                "card_detail user=%s public_id=%s", session.user_id, raw_pid
             )
             return web.json_response({"error": "database error"}, status=500)
 
+    async def handle_sell_card(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        raw = request.match_info.get("public_id", "")
+        n = normalize_public_id(raw)
+        if n is None:
+            return web.json_response({"error": "invalid card id"}, status=400)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        try:
+            expected_int = int(body.get("expected_payout"))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "expected_payout must be an integer"}, status=400
+            )
+        confirm_rare = bool(body.get("confirm_rare"))
+
+        try:
+            async with session_factory() as db:
+                row = (
+                    await db.execute(
+                        select(UserCardInstance, Card, RarityClass)
+                        .join(Card, Card.id == UserCardInstance.card_id)
+                        .join(
+                            RarityClass,
+                            RarityClass.id == Card.rarity_class_id,
+                            isouter=True,
+                        )
+                        .where(
+                            UserCardInstance.public_id == n,
+                            UserCardInstance.discord_user_id == sess.user_id,
+                        )
+                    )
+                ).first()
+                if row is None:
+                    return web.json_response({"error": "not found"}, status=404)
+                inst, card, rar = row
+                if rar is None:
+                    return web.json_response(
+                        {"error": "rarity data missing — try again after a sync."},
+                        status=400,
+                    )
+                blocked = await collection_sell_block_reason(
+                    db,
+                    discord_user_id=sess.user_id,
+                    instance_id=inst.id,
+                )
+                if blocked is not None:
+                    return web.json_response(
+                        {"error": "cannot_sell", "reason": blocked},
+                        status=400,
+                    )
+                quote = quote_collection_sell_payout(card, rar, inst)
+                if quote != expected_int:
+                    return web.json_response(
+                        {
+                            "error": "quote_mismatch",
+                            "message": "Sell quote changed — refresh and retry.",
+                            "quote_pokedollars": quote,
+                        },
+                        status=409,
+                    )
+                if collection_sell_needs_confirm(rar) and not confirm_rare:
+                    return web.json_response(
+                        {
+                            "error": "confirm_required",
+                            "message": (
+                                "This printing is high tier — pass confirm_rare: true "
+                                "after acknowledging the sale."
+                            ),
+                        },
+                        status=400,
+                    )
+                outcome = await run_collection_sell(
+                    db,
+                    wallet,
+                    discord_user_id=sess.user_id,
+                    instance_id=inst.id,
+                    expected_payout=quote,
+                )
+        except SQLAlchemyError:
+            _LOG.exception(
+                "collection sell user=%s public_id=%s", sess.user_id, raw
+            )
+            return web.json_response({"error": "database error"}, status=500)
+
+        if not outcome.ok:
+            return web.json_response(
+                {"error": outcome.error or "sell failed"},
+                status=400,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "payout_pokedollars": outcome.payout,
+                "new_balance_pokedollars": outcome.new_balance,
+                "card_name": outcome.card_name,
+            }
+        )
+
     app.router.add_get("/api/me/collection", handle_collection)
     app.router.add_get(r"/api/me/cards/{public_id}", handle_card_detail)
+    app.router.add_post(r"/api/me/cards/{public_id}/sell", handle_sell_card)

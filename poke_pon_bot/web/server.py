@@ -9,6 +9,12 @@ Hosts (each only when its config is present):
 * ``GET  /api/me``                      — Current session payload (if any).
 * ``GET  /api/me/collection``           — Signed-in user's bot card collection.
 * ``GET  /api/me/cards/{public_id}``    — One owned card's detail.
+* ``POST /api/me/cards/{public_id}/sell`` — Sell to shop (same quote rules as ``/colv``).
+* ``GET  /api/me/balances``             — Signed-in user's Pokedollars and Crystals.
+* ``GET  /api/auctions``                — Browse/search active auctions.
+* ``GET  /api/auctions/{id}``           — Auction detail + bid history.
+* ``POST /api/auctions``                — Create listing (session cookie).
+* ``POST /api/auctions/{id}/bid``       — Place bid (session cookie).
 
 Everything runs in one ``aiohttp.web.Application`` so the bot needs only one
 listening port / one reverse proxy / one ngrok tunnel exposed to the internet.
@@ -96,6 +102,7 @@ async def start_web_server(bot: Any) -> WebServer | None:
         and settings.discord_oauth_client_id
         and settings.discord_oauth_client_secret
     ):
+        from poke_pon_bot.web.auction_api import register_auction_api
         from poke_pon_bot.web.collection_api import register_collection_api
         from poke_pon_bot.web.deck_api import register_deck_api
         from poke_pon_bot.web.oauth import register_oauth_routes
@@ -105,7 +112,8 @@ async def start_web_server(bot: Any) -> WebServer | None:
         )
         register_collection_api(app, bot=bot, settings=settings)
         register_deck_api(app, bot=bot, settings=settings)
-        _LOG.info("Discord OAuth + Collection / Deck API mounted.")
+        register_auction_api(app, bot=bot, settings=settings)
+        _LOG.info("Discord OAuth + Collection / Deck / Auction API mounted.")
 
     if not list(app.router.routes()):
         _LOG.info("Web server disabled: no routes were enabled by settings.")
