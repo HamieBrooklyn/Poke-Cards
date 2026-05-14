@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from poke_pon_bot.models.auction import AUCTION_STATUS_ACTIVE, CardAuction
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
+from poke_pon_bot.models.rarity import RarityClass
 from poke_pon_bot.models.trade_session import (
     ACTIVE_TTL_MINUTES,
     INVITE_TTL_MINUTES,
@@ -27,6 +29,35 @@ from poke_pon_bot.services.trades import MAX_TRADE_CARDS_PER_SIDE, MAX_TRADE_CRY
 from poke_pon_bot.services.wallet import WalletService
 
 _LIVE_STATUSES = (TRADE_STATUS_INVITED, TRADE_STATUS_ACTIVE)
+
+
+def _to_int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _max_attack_damage(attacks: Any) -> int:
+    """Best leading-digit ``damage`` field across a card's attacks (0 if none)."""
+    if not isinstance(attacks, list):
+        return 0
+    best = 0
+    for atk in attacks:
+        if not isinstance(atk, dict):
+            continue
+        raw = atk.get("damage")
+        if raw is None:
+            continue
+        digits: list[str] = []
+        for ch in str(raw):
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        if digits:
+            best = max(best, int("".join(digits)))
+    return best
 
 
 def _utc_now() -> datetime:
@@ -366,13 +397,36 @@ async def serialize_trade_session(
                 out.append({"instance_id": iid, "missing": True})
                 continue
             card = await session.get(Card, inst.card_id)
+            if card is None:
+                out.append({"instance_id": iid, "public_id": inst.public_id, "missing": True})
+                continue
+            rarity: RarityClass | None = None
+            if card.rarity_class_id is not None:
+                rarity = await session.get(RarityClass, card.rarity_class_id)
             out.append({
                 "instance_id": iid,
                 "public_id": inst.public_id,
-                "name": card.name if card else "Unknown",
-                "set_name": card.set_name if card else "",
-                "collector_number": card.collector_number if card else "",
-                "image_small_url": card.image_small_url if card else None,
+                "obtained_at": _utc_iso(inst.obtained_at),
+                "missing": False,
+                "card": {
+                    "name": card.name,
+                    "set_code": card.set_code,
+                    "set_name": card.set_name,
+                    "collector_number": card.collector_number,
+                    "image_small_url": card.image_small_url,
+                    "image_large_url": card.image_large_url,
+                    "supertype": card.supertype,
+                    "hp": _to_int_or_zero(card.hp),
+                    "types": card.tcg_types or [],
+                    "attacks": card.attacks or [],
+                    "max_damage": _max_attack_damage(card.attacks),
+                    "tcg_rarity": card.tcg_rarity,
+                    "rarity": {
+                        "code": rarity.code if rarity else None,
+                        "display_name": rarity.display_name if rarity else None,
+                        "sort_order": int(rarity.sort_order) if rarity else 0,
+                    },
+                },
             })
         return out
 
