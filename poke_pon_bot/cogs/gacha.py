@@ -41,6 +41,7 @@ from poke_pon_bot.services.evolution import (
 from poke_pon_bot.services.pack_collage import render_pack_collage_png
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
 from poke_pon_bot.services.wishlist import (
+    MAX_WISHLIST_ENTRIES,
     add_wishlist,
     is_wishlisted,
     remove_wishlist,
@@ -711,7 +712,7 @@ class WishlistToggleButton(discord.ui.Button):
                     added = await add_wishlist(session, discord_user_id=self._viewer_id, card_id=self._card_id)
                     if not added:
                         await interaction.response.send_message(
-                            "Wishlist is full (max 50 cards) or already wishlisted.",
+                            f"Wishlist is full (max {MAX_WISHLIST_ENTRIES} cards) or already wishlisted.",
                             ephemeral=True,
                         )
                         return
