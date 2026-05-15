@@ -344,7 +344,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
     async def handle_trade_user_search(request: web.Request) -> web.StreamResponse:
         sess = _require_session(request)
         uid = int(sess.user_id)
-        q = (request.query.get("q") or "").strip()
+        q = (request.query.get("q") or "").strip().lstrip("@").strip()
         try:
             lim = int(request.query.get("limit", "15"))
         except ValueError:

@@ -14,7 +14,7 @@ import discord
 
 _LOG = logging.getLogger(__name__)
 
-MIN_QUERY_LEN = 2
+MIN_QUERY_LEN = 1
 DEFAULT_RESULT_LIMIT = 15
 MAX_RESULT_LIMIT = 25
 DEFAULT_MAX_GUILDS = 28
@@ -53,7 +53,7 @@ async def search_members_shared_with_bot(
     Discord matches a **prefix** of the query string (case-insensitive). We dedupe
     by user id and cap the total list size.
     """
-    prefix = query.strip()
+    prefix = query.strip().lstrip("@").strip()
     if len(prefix) < MIN_QUERY_LEN:
         return []
     if not getattr(bot, "is_ready", lambda: True)():
@@ -95,8 +95,8 @@ async def resolve_username_in_bot_guilds(
     (``Member.name``) matches exactly (case-insensitive). Discord usernames are unique
     per user, so at most one id should match.
     """
-    needle = username.strip().lower()
-    if len(needle) < 2:
+    needle = username.strip().lstrip("@").lower()
+    if not needle:
         return None
     if not getattr(bot, "is_ready", lambda: True)():
         return None
@@ -104,7 +104,7 @@ async def resolve_username_in_bot_guilds(
     matches: dict[int, discord.Member] = {}
     for guild in _guilds_for_search(bot)[:RESOLVE_MAX_GUILDS]:
         try:
-            members = await guild.query_members(query=username.strip(), limit=PER_GUILD_QUERY_LIMIT)
+            members = await guild.query_members(query=needle, limit=PER_GUILD_QUERY_LIMIT)
         except (discord.Forbidden, discord.HTTPException, RuntimeError, OSError):
             continue
         for m in members:
