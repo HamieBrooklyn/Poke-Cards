@@ -378,9 +378,10 @@ async def serialize_trade_session(
     ts: TradeSession,
     *,
     viewer_id: int,
+    bot: Any | None = None,
 ) -> dict:
     """Full state of a trade session for the API, including card details."""
-    from poke_pon_bot.models.known_user import KnownUser
+    from poke_pon_bot.web.user_profiles import resolve_user_profiles
 
     def _utc_iso(dt: datetime | None) -> str | None:
         if dt is None:
@@ -430,17 +431,23 @@ async def serialize_trade_session(
             })
         return out
 
-    async def _user_info(uid: int) -> dict:
-        ku = await session.get(KnownUser, uid)
-        if ku:
-            return {"id": str(uid), "username": ku.username, "global_name": ku.global_name, "avatar_url": ku.avatar_url}
-        return {"id": str(uid), "username": None, "global_name": None, "avatar_url": None}
+    profiles = await resolve_user_profiles(
+        session, bot, [ts.initiator_id, ts.partner_id],
+    )
+    initiator = profiles.get(
+        int(ts.initiator_id),
+        {"id": str(ts.initiator_id), "username": None, "global_name": None, "avatar_url": None},
+    )
+    partner = profiles.get(
+        int(ts.partner_id),
+        {"id": str(ts.partner_id), "username": None, "global_name": None, "avatar_url": None},
+    )
 
     return {
         "id": ts.id,
         "status": ts.status,
-        "initiator": await _user_info(ts.initiator_id),
-        "partner": await _user_info(ts.partner_id),
+        "initiator": initiator,
+        "partner": partner,
         "initiator_side": {
             "cards": await _card_details(ts.initiator_card_ids),
             "pokedollars": int(ts.initiator_pokedollars),

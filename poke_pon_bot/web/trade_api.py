@@ -117,7 +117,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 if isinstance(result, str):
                     return web.json_response({"error": "trade_error", "message": result}, status=400)
                 await db.commit()
-                payload = await serialize_trade_session(db, result, viewer_id=uid)
+                payload = await serialize_trade_session(db, result, viewer_id=uid, bot=bot)
         except SQLAlchemyError:
             _LOG.exception("trade create uid=%s", uid)
             return web.json_response({"error": "database_error"}, status=500)
@@ -154,7 +154,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 )
                 out = []
                 for ts in rows.scalars():
-                    out.append(await serialize_trade_session(db, ts, viewer_id=uid))
+                    out.append(await serialize_trade_session(db, ts, viewer_id=uid, bot=bot))
         except SQLAlchemyError:
             _LOG.exception("trade list uid=%s", uid)
             return web.json_response({"error": "database_error"}, status=500)
@@ -176,7 +176,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                     return web.json_response({"error": "not_found"}, status=404)
                 if uid not in (ts.initiator_id, ts.partner_id):
                     return web.json_response({"error": "not_found"}, status=404)
-                payload = await serialize_trade_session(db, ts, viewer_id=uid)
+                payload = await serialize_trade_session(db, ts, viewer_id=uid, bot=bot)
         except SQLAlchemyError:
             _LOG.exception("trade detail tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)
