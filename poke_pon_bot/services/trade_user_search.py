@@ -1,12 +1,12 @@
 """Find Discord users visible to the bot for web trade invites.
 
-Uses :meth:`discord.Guild.query_members` (gateway request) across guilds the bot is in.
-Results are limited to members the bot can see — i.e. users who share at least one server
-with the bot (and where the bot has usable member resolution for that guild).
+Runs :meth:`discord.Guild.query_members` in parallel batches across the largest
+guilds first, then merges and dedupes (gateway requests; capped per guild).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -17,9 +17,11 @@ _LOG = logging.getLogger(__name__)
 MIN_QUERY_LEN = 1
 DEFAULT_RESULT_LIMIT = 15
 MAX_RESULT_LIMIT = 25
-DEFAULT_MAX_GUILDS = 28
-RESOLVE_MAX_GUILDS = 55
+DEFAULT_MAX_GUILDS = 24
+RESOLVE_MAX_GUILDS = 40
 PER_GUILD_QUERY_LIMIT = 20
+# ``query_members`` per guild is independent; run a bounded number in parallel (not 1-by-1).
+GUILD_QUERY_BATCH = 14
 
 
 def _serialize_member(m: discord.Member) -> dict[str, Any]:
@@ -38,6 +40,16 @@ def _guilds_for_search(bot: discord.Client) -> list[discord.Guild]:
     guilds = list(bot.guilds)
     guilds.sort(key=lambda g: g.member_count or 0, reverse=True)
     return guilds
+
+
+async def _query_members_safe(
+    guild: discord.Guild, *, query: str, limit: int
+) -> list[discord.Member]:
+    try:
+        return list(await guild.query_members(query=query, limit=limit))
+    except (discord.Forbidden, discord.HTTPException, RuntimeError, OSError) as exc:
+        _LOG.debug("trade user search: guild %s failed: %s", guild.id, exc)
+        return []
 
 
 async def search_members_shared_with_bot(
@@ -64,22 +76,28 @@ async def search_members_shared_with_bot(
 
     seen: set[int] = set()
     out: list[dict[str, Any]] = []
+    guild_list = _guilds_for_search(bot)[:max_guilds]
 
-    for guild in _guilds_for_search(bot)[:max_guilds]:
-        if len(out) >= limit:
-            break
-        try:
-            members = await guild.query_members(query=prefix, limit=PER_GUILD_QUERY_LIMIT)
-        except (discord.Forbidden, discord.HTTPException, RuntimeError, OSError) as exc:
-            _LOG.debug("trade user search: guild %s failed: %s", guild.id, exc)
-            continue
-        for m in members:
-            if m.bot or m.id == requester_id or m.id in seen:
+    for batch_start in range(0, len(guild_list), GUILD_QUERY_BATCH):
+        batch = guild_list[batch_start : batch_start + GUILD_QUERY_BATCH]
+        chunk = await asyncio.gather(
+            *(
+                _query_members_safe(g, query=prefix, limit=PER_GUILD_QUERY_LIMIT)
+                for g in batch
+            ),
+            return_exceptions=True,
+        )
+        for res in chunk:
+            if isinstance(res, BaseException):
+                _LOG.debug("trade user search gather: %s", res)
                 continue
-            seen.add(m.id)
-            out.append(_serialize_member(m))
-            if len(out) >= limit:
-                break
+            for m in res:
+                if m.bot or m.id == requester_id or m.id in seen:
+                    continue
+                seen.add(m.id)
+                out.append(_serialize_member(m))
+                if len(out) >= limit:
+                    return out[:limit]
     return out
 
 
@@ -102,17 +120,27 @@ async def resolve_username_in_bot_guilds(
         return None
 
     matches: dict[int, discord.Member] = {}
-    for guild in _guilds_for_search(bot)[:RESOLVE_MAX_GUILDS]:
-        try:
-            members = await guild.query_members(query=needle, limit=PER_GUILD_QUERY_LIMIT)
-        except (discord.Forbidden, discord.HTTPException, RuntimeError, OSError):
-            continue
-        for m in members:
-            if m.bot or m.id == requester_id:
+    guild_list = _guilds_for_search(bot)[:RESOLVE_MAX_GUILDS]
+    for batch_start in range(0, len(guild_list), GUILD_QUERY_BATCH):
+        batch = guild_list[batch_start : batch_start + GUILD_QUERY_BATCH]
+        chunk = await asyncio.gather(
+            *(
+                _query_members_safe(g, query=needle, limit=PER_GUILD_QUERY_LIMIT)
+                for g in batch
+            ),
+            return_exceptions=True,
+        )
+        for res in chunk:
+            if isinstance(res, BaseException):
                 continue
-            if m.name.lower() != needle:
-                continue
-            matches[m.id] = m
+            for m in res:
+                if m.bot or m.id == requester_id:
+                    continue
+                if m.name.lower() != needle:
+                    continue
+                matches[m.id] = m
+        if len(matches) > 1:
+            return None
     if len(matches) == 1:
         return int(next(iter(matches)))
     return None
