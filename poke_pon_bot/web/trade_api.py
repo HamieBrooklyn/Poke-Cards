@@ -99,6 +99,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                         bot,
                         username=str(partner_username),
                         requester_id=uid,
+                        session_factory=session_factory,
                     )
                     if resolved is None:
                         return web.json_response(
@@ -351,7 +352,11 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
             lim = 15
         try:
             users = await search_members_shared_with_bot(
-                bot, query=q, requester_id=uid, limit=lim
+                bot,
+                query=q,
+                requester_id=uid,
+                limit=lim,
+                session_factory=session_factory,
             )
         except Exception:
             _LOG.exception("trade user search q=%r", q)
