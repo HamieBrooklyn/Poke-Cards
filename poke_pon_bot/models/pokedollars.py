@@ -30,3 +30,8 @@ class UserPokedollars(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    #: Last ``/cd`` use (cooldown accounting).
+    last_drop_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )

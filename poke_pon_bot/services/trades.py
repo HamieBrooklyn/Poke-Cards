@@ -16,6 +16,7 @@ from poke_pon_bot.services.wallet import WalletService
 
 MAX_TRADE_CARDS_PER_SIDE = 10
 MAX_TRADE_POKEDOLLARS = 9_999_999
+MAX_TRADE_CRYSTALS = 9_999_999
 TRADE_OFFER_TTL_MINUTES = 15
 
 

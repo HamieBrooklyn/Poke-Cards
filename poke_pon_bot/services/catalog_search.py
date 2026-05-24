@@ -180,3 +180,108 @@ async def search_catalog(
     ordered = base.order_by(Card.id.asc()).limit(cap)
     res = await session.execute(ordered)
     return list(res.scalars().all()), total
+
+
+def _catalog_browse_order(sort: str):
+    key = (sort or "name").strip().lower()
+    if key in ("hp", "hp_desc"):
+        return Card.hp.desc().nullslast() if key == "hp_desc" else Card.hp.asc().nullslast()
+    if key in ("rarity", "rarity_desc"):
+        col = RarityClass.sort_order
+        return col.desc() if key == "rarity_desc" else col.asc()
+    if key == "name_desc":
+        return Card.name.desc()
+    return Card.name.asc()
+
+
+async def browse_catalog(
+    session: AsyncSession,
+    *,
+    q: str | None = None,
+    set_code: str | None = None,
+    supertype: str | None = None,
+    rarity_tier: str | None = None,
+    pokedex: int | None = None,
+    sort: str = "name",
+    page: int = 1,
+    page_size: int = 60,
+) -> tuple[list[tuple[Card, RarityClass | None]], int]:
+    """Paginated catalog browse for the public website API."""
+    base = _build_catalog_select(
+        name_contains=q,
+        rarity_contains=None,
+        pokedex=pokedex,
+        set_code=set_code,
+        set_name=None,
+        supertype=supertype,
+        rarity_tier=rarity_tier,
+    )
+    subq = base.subquery()
+    total = int(await session.scalar(select(func.count()).select_from(subq)) or 0)
+    if total == 0:
+        return [], 0
+
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), CATALOG_BROWSE_PAGE_CAP))
+    offset = (page - 1) * page_size
+
+    ordered = base
+    if (sort or "").strip().lower().startswith("rarity"):
+        ordered = ordered.join(
+            RarityClass, Card.rarity_class_id == RarityClass.id, isouter=True
+        )
+    ordered = ordered.order_by(_catalog_browse_order(sort), Card.id.asc())
+    cards = list(
+        (await session.execute(ordered.offset(offset).limit(page_size))).scalars().all()
+    )
+    if not cards:
+        return [], total
+
+    card_ids = [int(c.id) for c in cards]
+    rarity_rows = (
+        await session.execute(
+            select(Card.id, RarityClass)
+            .join(RarityClass, Card.rarity_class_id == RarityClass.id, isouter=True)
+            .where(Card.id.in_(card_ids))
+        )
+    ).all()
+    rarity_by_id = {int(cid): rarity for cid, rarity in rarity_rows}
+    return [(card, rarity_by_id.get(int(card.id))) for card in cards], total
+
+
+async def catalog_facets(session: AsyncSession) -> dict[str, list]:
+    """Distinct filter values for the public catalog UI."""
+    set_rows = (
+        await session.execute(
+            select(Card.set_code, Card.set_name)
+            .where(excluded_set_clause(Card.set_code), Card.set_code.isnot(None))
+            .distinct()
+            .order_by(Card.set_name.asc())
+        )
+    ).all()
+    supertype_rows = (
+        await session.execute(
+            select(Card.supertype)
+            .where(excluded_set_clause(Card.set_code), Card.supertype.isnot(None))
+            .distinct()
+            .order_by(Card.supertype.asc())
+        )
+    ).all()
+    rarity_rows = (
+        await session.execute(
+            select(RarityClass.code, RarityClass.display_name, RarityClass.sort_order)
+            .join(Card, Card.rarity_class_id == RarityClass.id)
+            .where(excluded_set_clause(Card.set_code))
+            .distinct()
+            .order_by(RarityClass.sort_order.asc())
+        )
+    ).all()
+    return {
+        "sets": [{"code": code, "name": name} for code, name in set_rows if code],
+        "supertypes": [s for (s,) in supertype_rows if s],
+        "rarity_tiers": [
+            {"code": code, "display_name": display_name}
+            for code, display_name, _ in rarity_rows
+            if code
+        ],
+    }

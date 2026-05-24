@@ -251,3 +251,18 @@ class WalletService:
             session, discord_user_id, vote_created_at=vote_created_at
         )
         return WebhookVoteResult(kind="paid", amount=amount, crystals_credited=crystals)
+
+    async def get_last_drop_at(
+        self, session: AsyncSession, discord_user_id: int
+    ) -> datetime | None:
+        row = await session.get(UserPokedollars, discord_user_id)
+        if row is None:
+            return None
+        last = row.last_drop_at
+        if last is None:
+            return None
+        return _utc(last)
+
+    async def record_drop(self, session: AsyncSession, discord_user_id: int) -> None:
+        row = await self._get_or_create(session, discord_user_id)
+        row.last_drop_at = datetime.now(UTC)

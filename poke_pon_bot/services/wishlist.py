@@ -11,10 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.card_wishlist import UserCardWishlist
+from poke_pon_bot.models.wishlist import UserWishlist
 
 _LOG = logging.getLogger(__name__)
 
 MAX_WISHLIST_ENTRIES = 500
+WISHLIST_CAP = MAX_WISHLIST_ENTRIES
 
 
 async def wishlist_count(session: AsyncSession, discord_user_id: int) -> int:
@@ -48,6 +50,59 @@ async def is_wishlisted(
     return await is_card_wishlisted(session, discord_user_id, card_id)
 
 
+async def user_wishlist_entries(
+    session: AsyncSession,
+    discord_user_id: int,
+    *,
+    limit: int = 10,
+    offset: int = 0,
+) -> tuple[list[tuple[UserWishlist, Card]], int]:
+    """Paginated wishlist rows for the ``/wishlist`` cog."""
+    total = int(
+        await session.scalar(
+            select(func.count(UserWishlist.id)).where(
+                UserWishlist.discord_user_id == discord_user_id
+            )
+        )
+        or 0
+    )
+    if total == 0:
+        return [], 0
+    rows = (
+        await session.execute(
+            select(UserWishlist, Card)
+            .join(Card, UserWishlist.card_id == Card.id)
+            .where(UserWishlist.discord_user_id == discord_user_id)
+            .order_by(UserWishlist.created_at.desc(), UserWishlist.id.desc())
+            .offset(max(0, int(offset)))
+            .limit(max(1, int(limit)))
+        )
+    ).all()
+    return list(rows), total
+
+
+async def list_wishlist_card_ids(
+    session: AsyncSession,
+    discord_user_id: int,
+    *,
+    max_ids: int = MAX_WISHLIST_ENTRIES,
+) -> tuple[list[int], int]:
+    """Return wishlisted catalog card ids (oldest first) and total count before the cap."""
+    total = await wishlist_count(session, discord_user_id)
+    if total == 0:
+        return [], 0
+    cap = max(1, min(int(max_ids), MAX_WISHLIST_ENTRIES))
+    rows = (
+        await session.execute(
+            select(UserCardWishlist.card_id)
+            .where(UserCardWishlist.discord_user_id == discord_user_id)
+            .order_by(UserCardWishlist.created_at.asc(), UserCardWishlist.id.asc())
+            .limit(cap)
+        )
+    ).all()
+    return [int(r[0]) for r in rows], total
+
+
 async def add_wishlist(
     session: AsyncSession,
     *,
@@ -71,17 +126,18 @@ async def remove_wishlist(
     card_id: int,
 ) -> None:
     """Remove wishlist row if present. Does not commit."""
-    result = await session.execute(
-        select(UserCardWishlist)
-        .where(
-            UserCardWishlist.discord_user_id == discord_user_id,
-            UserCardWishlist.card_id == card_id,
+    for model in (UserWishlist, UserCardWishlist):
+        result = await session.execute(
+            select(model)
+            .where(
+                model.discord_user_id == discord_user_id,
+                model.card_id == card_id,
+            )
+            .limit(1)
         )
-        .limit(1)
-    )
-    existing = result.scalar_one_or_none()
-    if existing is not None:
-        await session.delete(existing)
+        existing = result.scalar_one_or_none()
+        if existing is not None:
+            await session.delete(existing)
 
 
 async def wishlist_user_ids_for_cards(

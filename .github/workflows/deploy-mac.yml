@@ -1,0 +1,24 @@
+# Deploy to the home Mac when master is updated (merge from Slack @cursor PR, etc.).
+#
+# One-time setup on the Mac mini:
+#   1. GitHub → repo Settings → Actions → Runners → New self-hosted runner (macOS)
+#   2. Follow GitHub's install commands in the Poke-Cards repo folder
+#   3. ./scripts/install-bot-service.sh   (optional but recommended)
+#
+# The runner must stay online; deploy uses scripts/deploy-mac.sh on the machine.
+
+name: Deploy Mac bot
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      # Run the script on disk so git pull + data/poke_cards.db use your real install
+      # (not Actions' temporary checkout). Change path if your repo lives elsewhere.
+      - name: Deploy production install
+        run: /Users/hamie/Developer/Poke-Cards/scripts/deploy-mac.sh

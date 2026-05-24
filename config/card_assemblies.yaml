@@ -1,0 +1,21 @@
+# Manual assembly recipes (optional). V-UNION groups are auto-discovered on catalog sync.
+#
+# layout: horizontal_halves | quad
+# orientation: landscape | portrait
+# pieces: ordered slot list (left→right or TL→TR→BL→BR for quad)
+#
+# Example 2-piece BREAK-style (replace tcg_card_id values after pieces exist in catalog):
+#
+# assemblies:
+#   - code: yveltal_break_example
+#     display_name: Yveltal BREAK
+#     result_tcg_card_id: xy11-66
+#     layout: horizontal_halves
+#     orientation: landscape
+#     pieces:
+#       - tcg_card_id: piece-left-tcg-id
+#         rotation_deg: 0
+#       - tcg_card_id: piece-right-tcg-id
+#         rotation_deg: 0
+
+assemblies: []
