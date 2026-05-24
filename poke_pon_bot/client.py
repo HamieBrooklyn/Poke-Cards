@@ -151,8 +151,20 @@ def _run_alembic_upgrade_head(database_url: str) -> None:
     # launched from a different cwd, Alembic would otherwise fail to find the revision
     # scripts. Anchor it to the repo root so it works regardless of where Python was started.
     cfg.set_main_option("script_location", str(_ALEMBIC_INI_PATH.parent / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", _sync_database_url(database_url))
+    sync_url = _sync_database_url(database_url)
+    cfg.set_main_option("sqlalchemy.url", sync_url)
     cfg.attributes["configure_logger"] = False
+
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import create_engine, text
+
+    script = ScriptDirectory.from_config(cfg)
+    heads = set(script.get_heads())
+    with create_engine(sync_url).connect() as conn:
+        rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+    current = {str(r[0]) for r in rows}
+    if current and current <= heads:
+        return
     command.upgrade(cfg, "head")
 
 
@@ -251,8 +263,18 @@ class PokePonBot(commands.Bot):
             )
 
             await upsert_pack_series(self.async_session_factory)
-            await sync_pack_series_from_catalog(self.async_session_factory)
+            try:
+                await asyncio.wait_for(
+                    sync_pack_series_from_catalog(self.async_session_factory),
+                    timeout=180.0,
+                )
+            except TimeoutError:
+                _LOG.warning(
+                    "Pack series catalog sync timed out after 180s — bot will start; "
+                    "run `python -m poke_pon_bot.scripts.sync_pack_series` later if /packv looks stale."
+                )
             await prune_orphan_series(self.async_session_factory)
+            _LOG.info("Pack series sync finished.")
         except (OSError, ValueError, ImportError) as exc:
             _LOG.warning("Pack series sync skipped: %s", exc)
 
