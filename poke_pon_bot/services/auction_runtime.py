@@ -3,21 +3,63 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from poke_pon_bot.models.auction import (
+    AUCTION_BID_CURRENCY_CRYSTALS,
+    AUCTION_BID_CURRENCY_POKEDOLLARS,
     AUCTION_STATUS_ACTIVE,
     AUCTION_STATUS_ENDED_NO_BIDS,
     AUCTION_STATUS_ENDED_SOLD,
+    AuctionBid,
     CardAuction,
 )
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
+from poke_pon_bot.services.crystals import CrystalsService, InsufficientCrystalsError, format_crystals
 from poke_pon_bot.services.instance_public_id import normalize_public_id
+from poke_pon_bot.services.trades import MAX_TRADE_CRYSTALS, MAX_TRADE_POKEDOLLARS
 from poke_pon_bot.services.wallet import InsufficientPokedollarsError, WalletService, format_pokedollars
+
+
+@dataclass(frozen=True)
+class AuctionSettlement:
+    """Result placeholder for batch settlement (web hooks)."""
+
+    settled_count: int = 0
+
+
+def normalize_auction_bid_currency(raw: str) -> str:
+    """Return ``pokedollars`` or ``crystals``; empty string when unrecognized."""
+    s = (raw or "").strip().lower()
+    if not s or s in (
+        "pokedollars",
+        "pokedollar",
+        "poke",
+        "pd",
+        "₽",
+        "p",
+    ):
+        return AUCTION_BID_CURRENCY_POKEDOLLARS
+    if s in ("crystals", "crystal", "c", "💎", "gem", "gems"):
+        return AUCTION_BID_CURRENCY_CRYSTALS
+    return ""
+
+
+def max_bid_for_currency(currency: str) -> int:
+    if normalize_auction_bid_currency(currency) == AUCTION_BID_CURRENCY_CRYSTALS:
+        return MAX_TRADE_CRYSTALS
+    return MAX_TRADE_POKEDOLLARS
+
+
+def auction_amount_display(amount: int, currency: str) -> str:
+    if normalize_auction_bid_currency(currency) == AUCTION_BID_CURRENCY_CRYSTALS:
+        return format_crystals(amount)
+    return format_pokedollars(amount)
 
 MIN_AUCTION_DURATION_MINUTES = 5
 MAX_AUCTION_DURATION_MINUTES = 10080  # 7 days
@@ -135,18 +177,13 @@ def format_auction_time_remaining(ends_at: datetime) -> str:
 async def place_auction_bid(
     session: AsyncSession,
     wallet: WalletService,
+    crystals: CrystalsService,
     *,
     auction_id: int,
     bidder_discord_id: int,
     amount: int,
-    max_bid_amount: int,
 ) -> str | None:
-    """Place a bid; wallets mirror escrow (only highest bidder balance is held). Returns error or ``None``."""
-    if amount < 1:
-        return "Bid amount must be positive."
-    if amount > max_bid_amount:
-        return f"Bid cannot exceed **{format_pokedollars(max_bid_amount)}**."
-
+    """Place a bid; escrow held on the listing currency. Returns error or ``None``."""
     auc = await session.get(CardAuction, auction_id)
     if auc is None:
         return "That listing was not found."
@@ -155,31 +192,57 @@ async def place_auction_bid(
     if _ensure_utc(auc.ends_at) <= utc_now():
         return "That auction has ended."
 
+    cur = normalize_auction_bid_currency(auc.bid_currency)
+    if not cur:
+        return "This listing has an invalid bid currency."
+
+    cap = max_bid_for_currency(cur)
+    if amount < 1:
+        return "Bid amount must be positive."
+    if amount > cap:
+        return f"Bid cannot exceed **{auction_amount_display(cap, cur)}**."
+
     if bidder_discord_id == auc.seller_discord_id:
         return "You can't bid on your own auction."
 
-    if auc.high_bid_pokedollars is not None and int(auc.high_bid_pokedollars) >= max_bid_amount:
+    if auc.high_bid_pokedollars is not None and int(auc.high_bid_pokedollars) >= cap:
         return "That auction is already at the maximum possible bid."
 
     min_needed = int(auc.price_pokedollars)
     if auc.high_bid_pokedollars is not None:
         min_needed = int(auc.high_bid_pokedollars) + 1
     if amount < min_needed:
-        return f"Bid must be at least **{format_pokedollars(min_needed)}**."
+        return f"Bid must be at least **{auction_amount_display(min_needed, cur)}**."
 
     prev_bidder = auc.high_bidder_discord_id
     prev_amt = auc.high_bid_pokedollars
 
     try:
-        await wallet.try_debit(session, bidder_discord_id, amount)
+        if cur == AUCTION_BID_CURRENCY_CRYSTALS:
+            await crystals.try_debit(session, bidder_discord_id, amount)
+        else:
+            await wallet.try_debit(session, bidder_discord_id, amount)
+    except InsufficientCrystalsError:
+        return "You don't have enough **Crystals** for that bid."
     except InsufficientPokedollarsError:
         return "You don't have enough **Pokedollars** for that bid."
 
     if prev_bidder is not None and prev_amt is not None and prev_amt > 0:
-        await wallet.try_credit(session, prev_bidder, prev_amt)
+        if cur == AUCTION_BID_CURRENCY_CRYSTALS:
+            await crystals.try_credit(session, prev_bidder, prev_amt)
+        else:
+            await wallet.try_credit(session, prev_bidder, prev_amt)
 
     auc.high_bidder_discord_id = bidder_discord_id
     auc.high_bid_pokedollars = amount
+    session.add(
+        AuctionBid(
+            auction_id=auc.id,
+            bidder_discord_id=bidder_discord_id,
+            amount=amount,
+            currency=cur,
+        )
+    )
     return None
 
 
@@ -209,8 +272,10 @@ async def _settle_one(session: AsyncSession, wallet: WalletService, auc: CardAuc
 async def settle_due_auctions(
     async_session_factory: async_sessionmaker[AsyncSession],
     wallet: WalletService,
+    crystals: CrystalsService | None = None,
 ) -> int:
     """Close expired **active** auctions (sold or no bids). Returns how many were settled."""
+    _ = crystals
     settled = 0
     while True:
         async with async_session_factory() as session:

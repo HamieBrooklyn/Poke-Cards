@@ -24,6 +24,7 @@ from poke_pon_bot.services.auction_runtime import (
 )
 from poke_pon_bot.services.auction_search import any_auction_filter_set, search_auctions
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
+from poke_pon_bot.services.crystals import CrystalsService
 from poke_pon_bot.services.instance_public_id import compact_public_id_for_line, normalize_public_id
 from poke_pon_bot.services.trades import MAX_TRADE_POKEDOLLARS
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
@@ -177,6 +178,7 @@ class AuctionCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._wallet = WalletService()
+        self._crystals = CrystalsService()
 
     async def cog_load(self) -> None:
         self._auction_settler.start()
@@ -187,7 +189,9 @@ class AuctionCog(commands.Cog):
     @tasks.loop(seconds=45)
     async def _auction_settler(self) -> None:
         try:
-            n = await settle_due_auctions(self.bot.async_session_factory, self._wallet)
+            n = await settle_due_auctions(
+                self.bot.async_session_factory, self._wallet, self._crystals
+            )
             if n:
                 _LOG.info("Settled %s auction(s).", n)
         except SQLAlchemyError:
@@ -245,7 +249,9 @@ class AuctionCog(commands.Cog):
             await ctx.defer(ephemeral=False)
         ephe = _hybrid_ephemeral(ctx)
         uid = ctx.author.id
-        await settle_due_auctions(self.bot.async_session_factory, self._wallet)
+        await settle_due_auctions(
+            self.bot.async_session_factory, self._wallet, self._crystals
+        )
         resolved_listing_id: int | None = None
         try:
             async with self.bot.async_session_factory() as session:
@@ -257,10 +263,10 @@ class AuctionCog(commands.Cog):
                 err = await place_auction_bid(
                     session,
                     self._wallet,
+                    self._crystals,
                     auction_id=int(resolved_listing_id),
                     bidder_discord_id=uid,
                     amount=int(amount),
-                    max_bid_amount=MAX_AUCTION_PRICE,
                 )
                 if err is not None:
                     await ctx.send(err, ephemeral=ephe)
@@ -303,7 +309,9 @@ class AuctionCog(commands.Cog):
         if ctx.interaction:
             await ctx.defer(ephemeral=False)
         ephe = _hybrid_ephemeral(ctx)
-        await settle_due_auctions(self.bot.async_session_factory, self._wallet)
+        await settle_due_auctions(
+            self.bot.async_session_factory, self._wallet, self._crystals
+        )
         if seller is not None and seller.bot:
             await ctx.send("Use a **member**, not a bot.", ephemeral=ephe)
             return
