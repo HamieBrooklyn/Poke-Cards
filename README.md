@@ -48,6 +48,8 @@ Discord bot using [discord.py](https://discordpy.readthedocs.io/en/stable/discor
 
    **If zsh says `command not found: alembic` or `python`**, you ran system commands outside the venv — use `.venv/bin/alembic` / `.venv/bin/python` as above (or activate the venv first).
 
+**Remote deployment:** For production hosting, consider platforms like Railway, Fly.io, or Heroku — set environment variables, run migrations with `alembic upgrade head`, then start the bot with `python -m poke_pon_bot`.
+
 ## Slash commands
 
 | Command | Description |
