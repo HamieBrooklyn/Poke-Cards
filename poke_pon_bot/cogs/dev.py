@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -10,12 +11,26 @@ from discord.ext import commands
 from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.config import Settings
+from poke_pon_bot.services.rarity_luck_boost import (
+    clear_rarity_luck_boost,
+    format_stored_luck_summary,
+    get_luck_boost_row,
+    upsert_rarity_luck_boost,
+)
+from poke_pon_bot.services.cd_drop_themes import (
+    clear_cd_drop_theme,
+    format_stored_theme_summary,
+    get_theme_row,
+    upsert_cd_drop_theme,
+    validate_theme_config,
+)
 from poke_pon_bot.services.crystals import (
     CRYSTAL_CURRENCY_NAME,
     CrystalsService,
     format_crystals,
 )
 from poke_pon_bot.services.discord_entitlement_admin import create_test_user_entitlement
+from poke_pon_bot.services.catalog_card_ref import resolve_catalog_card_ref
 from poke_pon_bot.services.drops import DropService
 from poke_pon_bot.services.packs import (
     NoActiveSeriesError,
@@ -51,6 +66,359 @@ class DevCog(commands.Cog):
         name="dev",
         description="Bot developer tools (set DEVELOPER_IDS in the environment).",
     )
+    drop_theme = app_commands.Group(
+        name="drop_theme",
+        description="Global or server-wide /cd drop themes.",
+        parent=dev,
+    )
+    luck_boost = app_commands.Group(
+        name="luck_boost",
+        description="Global or server-wide rarity luck (/cd, packs, wild duels).",
+        parent=dev,
+    )
+
+    async def _dev_denied(self, interaction: discord.Interaction) -> bool:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return True
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.",
+                ephemeral=True,
+            )
+            return True
+        return False
+
+    def _theme_guild_for_scope(
+        self,
+        interaction: discord.Interaction,
+        scope: str,
+    ) -> int | None:
+        if scope == "global":
+            return None
+        if scope == "server":
+            if interaction.guild is None:
+                raise ValueError("**server** scope must be run in the target Discord server.")
+            return int(interaction.guild.id)
+        raise ValueError("**scope** must be **global** or **server**.")
+
+    @drop_theme.command(
+        name="set",
+        description="Set or update the /cd drop theme for global or this server.",
+    )
+    @app_commands.describe(
+        scope="**global** = all servers · **server** = only where you run this command",
+        kind="**series** = pack series code · **set** = one TCG set · **pokemon** = name contains",
+        value="Series code (e.g. sv), set code (e.g. sv1), or Pokémon name (e.g. Pikachu)",
+        chance_percent=(
+            "**0** = theme never applies · **100** = every /cd card uses the theme · "
+            "in between = per-card chance"
+        ),
+    )
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="Global (all servers)", value="global"),
+            app_commands.Choice(name="This server only", value="server"),
+        ],
+        kind=[
+            app_commands.Choice(name="Pack series (CardSeries code)", value="series"),
+            app_commands.Choice(name="Single TCG set code", value="set"),
+            app_commands.Choice(name="Pokémon name contains", value="pokemon"),
+        ],
+    )
+    async def drop_theme_set(
+        self,
+        interaction: discord.Interaction,
+        scope: str,
+        kind: str,
+        value: str,
+        chance_percent: app_commands.Range[int, 0, 100],
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            guild_id = self._theme_guild_for_scope(interaction, scope)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                constraints = await validate_theme_config(session, kind=kind, value=value)
+                row = await upsert_cd_drop_theme(
+                    session,
+                    guild_id=guild_id,
+                    kind=kind,
+                    value=value.strip(),
+                    chance_percent=int(chance_percent),
+                    updated_by_discord_user_id=interaction.user.id,
+                )
+                await session.commit()
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except SQLAlchemyError:
+            _LOG.exception("drop_theme set failed")
+            await interaction.response.send_message(
+                "Could not save the drop theme. Try again.",
+                ephemeral=True,
+            )
+            return
+        scope_name = "global" if guild_id is None else f"server `{guild_id}`"
+        hint = ""
+        if int(chance_percent) == 0:
+            hint = "\n\n*At **0%** the theme is saved but will not affect `/cd` until you raise the chance.*"
+        elif int(chance_percent) == 100:
+            hint = "\n\n*At **100%** every card in each `/cd` pack will use this theme.*"
+        detail = ""
+        if constraints.set_codes:
+            detail = f"\nSets: {', '.join(f'`{c}`' for c in constraints.set_codes[:6])}"
+            if len(constraints.set_codes) > 6:
+                detail += f" (+{len(constraints.set_codes) - 6} more)"
+        elif constraints.name_contains:
+            detail = f"\nName filter: **{constraints.name_contains}**"
+        await interaction.response.send_message(
+            f"Saved **{scope_name}** drop theme — **`{kind}`** `{value.strip()}` @ "
+            f"**{int(chance_percent)}%** per card.{detail}{hint}",
+            ephemeral=True,
+        )
+
+    @drop_theme.command(
+        name="clear",
+        description="Remove the global or server /cd drop theme.",
+    )
+    @app_commands.describe(
+        scope="**global** or **server** (same as `/dev drop_theme set`)",
+    )
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="Global (all servers)", value="global"),
+            app_commands.Choice(name="This server only", value="server"),
+        ],
+    )
+    async def drop_theme_clear(
+        self,
+        interaction: discord.Interaction,
+        scope: str,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            guild_id = self._theme_guild_for_scope(interaction, scope)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                removed = await clear_cd_drop_theme(session, guild_id=guild_id)
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("drop_theme clear failed")
+            await interaction.response.send_message(
+                "Could not clear the drop theme. Try again.",
+                ephemeral=True,
+            )
+            return
+        scope_name = "global" if guild_id is None else f"server `{guild_id}`"
+        if removed:
+            await interaction.response.send_message(
+                f"Cleared the **{scope_name}** drop theme.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"No **{scope_name}** drop theme was set.",
+                ephemeral=True,
+            )
+
+    @drop_theme.command(
+        name="show",
+        description="Show the global and current-server /cd drop themes.",
+    )
+    async def drop_theme_show(self, interaction: discord.Interaction) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                global_row = await get_theme_row(session, guild_id=None)
+                server_row = None
+                if interaction.guild is not None:
+                    server_row = await get_theme_row(session, guild_id=interaction.guild.id)
+                global_line = await format_stored_theme_summary(
+                    session, global_row, scope_name="Global",
+                )
+                if interaction.guild is not None:
+                    server_line = await format_stored_theme_summary(
+                        session,
+                        server_row,
+                        scope_name=f"Server (`{interaction.guild.id}`)",
+                    )
+                else:
+                    server_line = "**Server:** *(run this in a server to view its theme)*"
+        except SQLAlchemyError:
+            _LOG.exception("drop_theme show failed")
+            await interaction.response.send_message(
+                "Could not load drop themes. Try again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "**`/cd` drop themes**\n\n"
+            f"{global_line}\n"
+            f"{server_line}\n\n"
+            "_Server theme overrides global when both are set. "
+            "Use `/dev drop_theme set` to configure.",
+            ephemeral=True,
+        )
+
+    @luck_boost.command(
+        name="set",
+        description="Set rarity luck for /cd, booster packs, and wild /pd opponents.",
+    )
+    @app_commands.describe(
+        scope="**global** or **server** (this server only)",
+        luck_percent=(
+            "**0** = normal · **+100** = much rarer · **-100** = much more common · "
+            "beyond ±100 adds extra bias"
+        ),
+    )
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="Global (all servers)", value="global"),
+            app_commands.Choice(name="This server only", value="server"),
+        ],
+    )
+    async def luck_boost_set(
+        self,
+        interaction: discord.Interaction,
+        scope: str,
+        luck_percent: int,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            guild_id = self._theme_guild_for_scope(interaction, scope)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                await upsert_rarity_luck_boost(
+                    session,
+                    guild_id=guild_id,
+                    luck_percent=int(luck_percent),
+                    updated_by_discord_user_id=interaction.user.id,
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("luck_boost set failed")
+            await interaction.response.send_message(
+                "Could not save luck boost. Try again.",
+                ephemeral=True,
+            )
+            return
+        scope_name = "global" if guild_id is None else f"server `{guild_id}`"
+        direction = (
+            "rarer"
+            if int(luck_percent) > 0
+            else "more common"
+            if int(luck_percent) < 0
+            else "normal"
+        )
+        await interaction.response.send_message(
+            f"Saved **{scope_name}** rarity luck: **{int(luck_percent):+d}%** "
+            f"({direction} `/cd`, packs, wild `/pd`).",
+            ephemeral=True,
+        )
+
+    @luck_boost.command(
+        name="clear",
+        description="Remove the global or server rarity luck boost.",
+    )
+    @app_commands.describe(scope="**global** or **server**")
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="Global (all servers)", value="global"),
+            app_commands.Choice(name="This server only", value="server"),
+        ],
+    )
+    async def luck_boost_clear(
+        self,
+        interaction: discord.Interaction,
+        scope: str,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            guild_id = self._theme_guild_for_scope(interaction, scope)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                removed = await clear_rarity_luck_boost(session, guild_id=guild_id)
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("luck_boost clear failed")
+            await interaction.response.send_message(
+                "Could not clear luck boost. Try again.",
+                ephemeral=True,
+            )
+            return
+        scope_name = "global" if guild_id is None else f"server `{guild_id}`"
+        if removed:
+            await interaction.response.send_message(
+                f"Cleared **{scope_name}** rarity luck.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"No **{scope_name}** rarity luck was set.",
+                ephemeral=True,
+            )
+
+    @luck_boost.command(
+        name="show",
+        description="Show global and server rarity luck boosts.",
+    )
+    async def luck_boost_show(self, interaction: discord.Interaction) -> None:
+        if await self._dev_denied(interaction):
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                global_row = await get_luck_boost_row(session, guild_id=None)
+                server_row = None
+                if interaction.guild is not None:
+                    server_row = await get_luck_boost_row(
+                        session, guild_id=interaction.guild.id
+                    )
+                global_line = await format_stored_luck_summary(
+                    session, global_row, scope_name="Global"
+                )
+                if interaction.guild is not None:
+                    server_line = await format_stored_luck_summary(
+                        session,
+                        server_row,
+                        scope_name=f"Server (`{interaction.guild.id}`)",
+                    )
+                else:
+                    server_line = "**Server:** *(run in a server to view its boost)*"
+        except SQLAlchemyError:
+            _LOG.exception("luck_boost show failed")
+            await interaction.response.send_message(
+                "Could not load luck boosts. Try again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "**Rarity luck boosts**\n\n"
+            f"{global_line}\n"
+            f"{server_line}\n\n"
+            "_Server boost overrides global. Stacks with `/dev drop` luck on that command only._",
+            ephemeral=True,
+        )
 
     @dev.command(
         name="pokedollars",
@@ -282,6 +650,186 @@ class DevCog(commands.Cog):
         await interaction.response.send_message(line, ephemeral=True)
 
     @dev.command(
+        name="drop",
+        description="Open a /cd-style card drop with optional size, luck, and private mode.",
+    )
+    @app_commands.describe(
+        private="Only you see the pack (same as /cd private).",
+        card_count=(
+            "Fixed number of cards in the pack (2–25). Omit for normal /cd (2 + random extras)."
+        ),
+        max_grabs=(
+            "Max cards each user can claim from this drop (1–25; cannot exceed card_count)."
+        ),
+        runout_seconds=(
+            "Seconds until the drop expires and unclaimed cards are gone (30–3600; default 180)."
+        ),
+        luck_percent="Extra rarity luck (stacks with server/global boost; can be below 0 or above 100).",
+    )
+    async def dev_drop(
+        self,
+        interaction: discord.Interaction,
+        private: Literal["yes"] | None = None,
+        card_count: app_commands.Range[int, 2, 25] | None = None,
+        max_grabs: app_commands.Range[int, 1, 25] | None = None,
+        runout_seconds: app_commands.Range[int, 30, 3600] | None = None,
+        luck_percent: int = 0,
+    ) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.",
+                ephemeral=True,
+            )
+            return
+        gacha = self.bot.cogs.get("GachaCog")
+        if gacha is None or not hasattr(gacha, "run_card_drop"):
+            await interaction.response.send_message(
+                "Card drop is unavailable (gacha cog not loaded).",
+                ephemeral=True,
+            )
+            return
+        ctx = await self.bot.get_context(interaction)
+        grabs = int(max_grabs) if max_grabs is not None else 1
+        runout = int(runout_seconds) if runout_seconds is not None else 180
+        if card_count is not None and grabs > int(card_count):
+            await interaction.response.send_message(
+                f"`max_grabs` cannot exceed `card_count` (**{int(card_count)}**).",
+                ephemeral=True,
+            )
+            return
+
+        header_bits = ["**Developer drop**"]
+        if card_count is not None:
+            header_bits.append(f"**{int(card_count)}** cards")
+        if grabs > 1:
+            header_bits.append(f"**{grabs}** grabs/user")
+        if runout != 180:
+            header_bits.append(f"**{runout}s** runout")
+        if int(luck_percent) != 0:
+            header_bits.append(f"**{int(luck_percent):+d}%** extra luck")
+        if private == "yes":
+            header_bits.append("**private**")
+        header = " · ".join(header_bits)
+        try:
+            await gacha.run_card_drop(
+                ctx,
+                is_private=private == "yes",
+                skip_cooldown=True,
+                card_count=int(card_count) if card_count is not None else None,
+                luck_percent=float(luck_percent),
+                apply_drop_accounting=False,
+                content_header=header,
+                max_grabs_per_user=grabs,
+                claim_seconds=runout,
+            )
+        except Exception:
+            _LOG.exception("dev drop failed for user %s", interaction.user.id)
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Dev drop failed — check logs.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "Dev drop failed — check logs.",
+                    ephemeral=True,
+                )
+
+    @dev.command(
+        name="sync_assemblies",
+        description="Rebuild V-UNION assembly groups from the catalog (developers only).",
+    )
+    async def dev_sync_assemblies(self, interaction: discord.Interaction) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.assembly_catalog import sync_all_assemblies
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                n = await sync_all_assemblies(session)
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev sync_assemblies failed")
+            await interaction.response.send_message(
+                "Could not sync assembly groups. Try again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"Assembly registry synced — **{n}** group(s) upserted from catalog + YAML.",
+            ephemeral=True,
+        )
+
+    @dev.command(
+        name="grant_card",
+        description="Grant one specific catalog card printing to a user (developers only).",
+    )
+    @app_commands.describe(
+        card=(
+            "Global catalog id: Pokémon TCG API ``tcg_card_id`` (e.g. ``swshp-SWSH159``, ``xy11-66``) "
+            "or internal numeric catalog id."
+        ),
+        user="Who receives the card; omit to grant to yourself.",
+    )
+    async def dev_grant_card(
+        self,
+        interaction: discord.Interaction,
+        card: str,
+        user: discord.User | None = None,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        ref = (card or "").strip()
+        if not ref:
+            await interaction.response.send_message(
+                "Pass a **card** id (`tcg_card_id` from the catalog or a numeric catalog id).",
+                ephemeral=True,
+            )
+            return
+        target = user or interaction.user
+        ds = DropService()
+        try:
+            async with self.bot.async_session_factory() as session:
+                catalog_card = await resolve_catalog_card_ref(session, ref)
+                if catalog_card is None:
+                    await interaction.response.send_message(
+                        f"No catalog card matches **`{ref}`**. "
+                        "Use the Pokémon TCG API id (same as Pokédex / catalog sync), "
+                        "or run catalog sync if the printing is missing.",
+                        ephemeral=True,
+                    )
+                    return
+                result = await ds.claim_card(
+                    session,
+                    discord_user_id=int(target.id),
+                    card=catalog_card,
+                    source="dev",
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev grant_card failed user=%s ref=%s", target.id, ref)
+            await interaction.response.send_message(
+                "Could not grant the card. Try again.",
+                ephemeral=True,
+            )
+            return
+        except RuntimeError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Granted **{catalog_card.name}** (`{catalog_card.tcg_card_id}`) to {target.mention}.\n"
+            f"Card ID: `{result.public_id}` · set **{catalog_card.set_name}** "
+            f"#{catalog_card.collector_number}",
+            ephemeral=True,
+        )
+
+    @dev.command(
         name="grant_pack",
         description="Grant a pack to a user (random active series, or a specific series code).",
     )
@@ -342,6 +890,218 @@ class DevCog(commands.Cog):
             return
         await interaction.response.send_message(
             f"Granted a **{series_row.display_name}** pack `{pack.public_id}` to {target.mention}.",
+            ephemeral=True,
+        )
+
+    @dev.command(
+        name="test_referral",
+        description="Force-record a referral (bypasses inviter 7-day account-age check).",
+    )
+    @app_commands.describe(
+        invitee="The 'referred friend' (their account joining your server).",
+        inviter="The person who supposedly invited them; omit to use yourself.",
+    )
+    async def dev_test_referral(
+        self,
+        interaction: discord.Interaction,
+        invitee: discord.User,
+        inviter: discord.User | None = None,
+    ) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.", ephemeral=True
+            )
+            return
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run this in a server (need a guild id to record the referral).",
+                ephemeral=True,
+            )
+            return
+
+        inviter_user = inviter or interaction.user
+        if invitee.id == inviter_user.id:
+            await interaction.response.send_message(
+                "Invitee and inviter must be different users.", ephemeral=True
+            )
+            return
+
+        from poke_pon_bot.services.referrals import (
+            mark_first_guild_join,
+            register_referral_join,
+        )
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                await mark_first_guild_join(
+                    session,
+                    guild_id=int(interaction.guild_id),
+                    discord_user_id=int(invitee.id),
+                )
+                # Re-check whether they are first-join after the upsert above.
+                from poke_pon_bot.models.guild_member_seen import GuildMemberSeen
+
+                seen_row = await session.get(
+                    GuildMemberSeen, (int(interaction.guild_id), int(invitee.id))
+                )
+                # mark_first_guild_join only flags True the first time; force True here
+                # so the dev command can create a referral row.
+                created, reason = await register_referral_join(
+                    session,
+                    inviter_discord_id=int(inviter_user.id),
+                    invitee_discord_id=int(invitee.id),
+                    guild_id=int(interaction.guild_id),
+                    invitee_account_created_at=invitee.created_at,
+                    inviter_account_created_at=inviter_user.created_at,
+                    is_first_guild_join=True,
+                    skip_inviter_age_check=True,
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception(
+                "dev test_referral failed inviter=%s invitee=%s",
+                inviter_user.id,
+                invitee.id,
+            )
+            await interaction.response.send_message(
+                "Database error — check logs.", ephemeral=True
+            )
+            return
+
+        if created:
+            line = (
+                f"Test referral recorded: {inviter_user.mention} → {invitee.mention} "
+                f"in this server. Have **{invitee.mention}** run `/cd` 10 times "
+                "to fire the reward DM."
+            )
+        else:
+            human = {
+                "self_invite": "inviter and invitee are the same user",
+                "rejoin": "invitee already counted in this guild",
+                "inviter_too_new": "inviter account too new (override didn’t apply)",
+                "already_referred": "invitee already has a referral row "
+                "(use `/dev reset_referral` first)",
+            }.get(reason, reason)
+            line = f"Referral **not** recorded — {human}."
+        await interaction.response.send_message(line, ephemeral=True)
+
+    @dev.command(
+        name="reset_referral",
+        description="Clear referral + first-join tracking for a user (testing alts).",
+    )
+    @app_commands.describe(
+        user="The invitee to reset (their referral row and first-join flag).",
+        guild_only="Only clear first-join in this server; omit to clear all servers.",
+    )
+    async def dev_reset_referral(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        guild_only: Literal["yes"] | None = None,
+    ) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.", ephemeral=True
+            )
+            return
+        if guild_only == "yes" and interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run this in a server when using **guild_only**.",
+                ephemeral=True,
+            )
+            return
+
+        from poke_pon_bot.services.referrals import reset_referral_test_state
+
+        guild_id = int(interaction.guild_id) if guild_only == "yes" else None
+        try:
+            async with self.bot.async_session_factory() as session:
+                counts = await reset_referral_test_state(
+                    session,
+                    discord_user_id=int(user.id),
+                    guild_id=guild_id,
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev reset_referral failed user=%s", user.id)
+            await interaction.response.send_message(
+                "Database error — check logs.", ephemeral=True
+            )
+            return
+
+        scope = f"guild `{guild_id}`" if guild_id is not None else "all guilds"
+        await interaction.response.send_message(
+            f"Reset referral test state for {user.mention} (`{user.id}`) — "
+            f"referral row removed: **{counts['referral_deleted']}**, "
+            f"first-join cleared ({scope}): **{counts['seen_deleted']}**. "
+            "They can join again via a personal invite link to re-test.",
+            ephemeral=True,
+        )
+
+    @dev.command(
+        name="reset_tutorial",
+        description="Clear tutorial progress (and tutorial packs) for testing.",
+    )
+    @app_commands.describe(
+        user="Discord user to reset",
+        remove_member_role="Also remove the tutorial Member role in the main server",
+    )
+    async def dev_reset_tutorial(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        remove_member_role: bool = False,
+    ) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.", ephemeral=True
+            )
+            return
+
+        from poke_pon_bot.services.tutorial import reset_tutorial_for_testing
+
+        try:
+            counts = await reset_tutorial_for_testing(
+                self.bot,
+                self.bot.async_session_factory,
+                discord_user_id=int(user.id),
+                remove_member_role=remove_member_role,
+            )
+        except SQLAlchemyError:
+            _LOG.exception("dev reset_tutorial failed user=%s", user.id)
+            await interaction.response.send_message(
+                "Database error — check logs.", ephemeral=True
+            )
+            return
+
+        role_note = (
+            " Member role removed in the main server."
+            if remove_member_role
+            else " Member role was not changed — set **remove_member_role** if needed."
+        )
+        await interaction.response.send_message(
+            f"Reset tutorial for {user.mention} (`{user.id}`) — "
+            f"progress row deleted: **{counts['tutorial_row_deleted']}**, "
+            f"tutorial pack(s) removed: **{counts['tutorial_packs_deleted']}**.{role_note} "
+            "They can use **Verify** or **`/tutorial`** again.",
             ephemeral=True,
         )
 

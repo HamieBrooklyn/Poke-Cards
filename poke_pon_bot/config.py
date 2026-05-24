@@ -18,7 +18,7 @@ class Settings:
     tcg_api_key: str | None
     """YAML listing Pokémon TCG set IDs to sync."""
     card_sets_config: Path
-    # True = request privileged message content. Chat commands (`cd`, `coll`, `packd`, …)
+    # True = request privileged message content. Chat commands (`ppcd`, `ppcoll`, `pppackd`, …)
     # need this *and* the Developer Portal toggle. Default True; set
     # DISCORD_MESSAGE_CONTENT_INTENT=0 to opt out (slash-only).
     discord_message_content_intent: bool
@@ -37,6 +37,16 @@ class Settings:
     topgg_api_token: str | None
     """Public Top.gg vote page (button link in /vote)."""
     topgg_vote_url: str
+    """After any successful command, poll Top.gg and DM vote rewards (no ``/vote`` required)."""
+    topgg_auto_claim_enabled: bool
+    """Minimum seconds between Top.gg API polls per user (rate-limit protection)."""
+    topgg_vote_poll_min_seconds: float
+    """Top.gg reviews page linked from the one-time review reminder DM."""
+    topgg_review_url: str
+    """Send a private Top.gg review reminder after enough successful commands."""
+    topgg_review_prompt_enabled: bool
+    """Successful commands (slash + chat) before the review reminder DM."""
+    topgg_review_prompt_min_commands: int
     """Top.gg v1 webhook HMAC secret (``whs_…``). When set with ``topgg_webhook_port``, starts a local HTTP listener."""
     topgg_webhook_secret: str | None
     topgg_webhook_host: str
@@ -59,7 +69,7 @@ class Settings:
     Required for OAuth callback construction; falls back to ``http://<web_host>:<web_port>``."""
     web_public_url: str | None
     """Comma-separated list of allowed CORS origins for the collection API. Typically the
-    GitHub Pages origin (``https://hamiebrooklyn.github.io``)."""
+    Public site origin (``https://pokepon.org``; legacy ``https://hamiebrooklyn.github.io``)."""
     web_allowed_origins: tuple[str, ...]
     """Where the browser is redirected after a successful OAuth login (and ``Logout``).
     Typically the public Collection page URL."""
@@ -72,6 +82,31 @@ class Settings:
     discord_oauth_client_id: int | None
     """Discord OAuth2 client secret (Developer Portal -> OAuth2 -> Reset Secret)."""
     discord_oauth_client_secret: str | None
+    """Stripe secret API key (``sk_live_…`` or ``sk_test_…``). Enables the web shop when set."""
+    stripe_secret_key: str | None
+    """Stripe webhook signing secret (``whsec_…``) for ``checkout.session.completed``."""
+    stripe_webhook_secret: str | None
+    """Internal SKU id → Stripe Price id (``price_…``) from environment."""
+    stripe_price_ids: dict[str, str]
+    """Guild where new members must finish the DM tutorial before Member role."""
+    tutorial_guild_id: int | None
+    """Role granted after tutorial completion (main server)."""
+    tutorial_member_role_id: int | None
+    tutorial_enabled: bool
+    """Channel where the persistent Verify panel is posted."""
+    tutorial_verify_channel_id: int | None
+    """Optional message id to edit on restart instead of searching history."""
+    tutorial_verify_panel_message_id: int | None
+    """Channels visible to @everyone before Member role (comma-separated in env)."""
+    tutorial_pre_member_channel_ids: frozenset[int]
+    """Guild where personal referral invites are minted. Defaults to ``tutorial_guild_id``."""
+    referral_invite_guild_id: int | None
+    """Channel used to create personal referral invites. Defaults to the first text channel."""
+    referral_invite_channel_id: int | None
+    """Guild whose scheduled events appear on pokepon.org (defaults to tutorial server)."""
+    discord_events_guild_id: int | None
+    """Vanity invite code for event links (``https://discord.gg/<code>?event=…``)."""
+    discord_events_invite_code: str | None
 
 
 def _default_card_sets_path() -> Path:
@@ -117,7 +152,7 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
     raw_sets = (os.environ.get("CARD_SETS_CONFIG") or "").strip()
     card_sets_config = Path(raw_sets) if raw_sets else _default_card_sets_path()
 
-    # Default **on** so chat commands (`cd`, `coll`, `packd`, …) and `@Bot cd` style mentions
+    # Default **on** so chat commands (`ppcd`, `ppcoll`, `pppackd`, …) and `@Bot ppcd` mentions
     # work once the same intent is enabled in the Developer Portal (Bot → Privileged Gateway
     # Intents → Message Content Intent). Set DISCORD_MESSAGE_CONTENT_INTENT=0 to force
     # slash-only and skip requesting this intent.
@@ -194,6 +229,35 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
             raise SystemExit("TOPGG_BOT_ID must be a numeric Discord application / bot id.") from exc
     else:
         topgg_vote_url = "https://top.gg/bot/1496227239803748362/vote"
+
+    raw_review_url = (os.environ.get("TOPGG_REVIEW_URL") or "").strip()
+    if raw_review_url:
+        topgg_review_url = raw_review_url
+    elif raw_topgg_bot_id:
+        try:
+            topgg_review_url = f"https://top.gg/bot/{int(raw_topgg_bot_id)}/reviews"
+        except ValueError as exc:
+            raise SystemExit("TOPGG_BOT_ID must be a numeric Discord application / bot id.") from exc
+    else:
+        topgg_review_url = "https://top.gg/bot/1496227239803748362/reviews"
+
+    raw_review_prompt = (os.environ.get("TOPGG_REVIEW_PROMPT_ENABLED") or "1").strip().lower()
+    topgg_review_prompt_enabled = raw_review_prompt not in ("0", "false", "no", "off")
+
+    raw_review_min = (os.environ.get("TOPGG_REVIEW_PROMPT_MIN_COMMANDS") or "10").strip()
+    try:
+        topgg_review_prompt_min_commands = max(1, int(raw_review_min))
+    except ValueError as exc:
+        raise SystemExit("TOPGG_REVIEW_PROMPT_MIN_COMMANDS must be an integer.") from exc
+
+    raw_auto_claim = (os.environ.get("TOPGG_AUTO_CLAIM_ENABLED") or "1").strip().lower()
+    topgg_auto_claim_enabled = raw_auto_claim not in ("0", "false", "no", "off")
+
+    raw_poll = (os.environ.get("TOPGG_VOTE_POLL_MIN_SECONDS") or "90").strip()
+    try:
+        topgg_vote_poll_min_seconds = max(30.0, float(raw_poll))
+    except ValueError as exc:
+        raise SystemExit("TOPGG_VOTE_POLL_MIN_SECONDS must be a number.") from exc
 
     topgg_webhook_secret = (os.environ.get("TOPGG_WEBHOOK_SECRET") or "").strip() or None
 
@@ -273,6 +337,16 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         discord_oauth_client_id = None
     discord_oauth_client_secret = (os.environ.get("DISCORD_OAUTH_CLIENT_SECRET") or "").strip() or None
 
+    from poke_pon_bot.services.shop_catalog import SKU_ENV_KEYS
+
+    stripe_secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip() or None
+    stripe_webhook_secret = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip() or None
+    stripe_price_ids: dict[str, str] = {}
+    for sku_id, env_key in SKU_ENV_KEYS.items():
+        price = (os.environ.get(env_key) or "").strip()
+        if price:
+            stripe_price_ids[sku_id] = price
+
     raw_plat = (os.environ.get("TOPGG_WEBHOOK_EXPECTED_PLATFORM_ID") or "").strip()
     if raw_plat:
         try:
@@ -281,6 +355,105 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
             raise SystemExit("TOPGG_WEBHOOK_EXPECTED_PLATFORM_ID must be numeric.") from exc
     else:
         topgg_webhook_expected_platform_id = None
+
+    raw_tutorial = (os.environ.get("TUTORIAL_ENABLED") or "1").strip().lower()
+    tutorial_enabled = raw_tutorial not in ("0", "false", "no", "off")
+
+    raw_tutorial_guild = (os.environ.get("TUTORIAL_GUILD_ID") or "1500891048652705843").strip()
+    tutorial_guild_id: int | None
+    if raw_tutorial_guild:
+        try:
+            tutorial_guild_id = int(raw_tutorial_guild)
+        except ValueError as exc:
+            raise SystemExit("TUTORIAL_GUILD_ID must be numeric.") from exc
+    else:
+        tutorial_guild_id = None
+
+    raw_tutorial_role = (os.environ.get("TUTORIAL_MEMBER_ROLE_ID") or "1505682058452668577").strip()
+    tutorial_member_role_id: int | None
+    if raw_tutorial_role:
+        try:
+            tutorial_member_role_id = int(raw_tutorial_role)
+        except ValueError as exc:
+            raise SystemExit("TUTORIAL_MEMBER_ROLE_ID must be numeric.") from exc
+    else:
+        tutorial_member_role_id = None
+
+    raw_verify_ch = (
+        os.environ.get("TUTORIAL_VERIFY_CHANNEL_ID") or "1500892639304876205"
+    ).strip()
+    tutorial_verify_channel_id: int | None
+    if raw_verify_ch:
+        try:
+            tutorial_verify_channel_id = int(raw_verify_ch)
+        except ValueError as exc:
+            raise SystemExit("TUTORIAL_VERIFY_CHANNEL_ID must be numeric.") from exc
+    else:
+        tutorial_verify_channel_id = None
+
+    raw_panel_msg = (os.environ.get("TUTORIAL_VERIFY_PANEL_MESSAGE_ID") or "").strip()
+    tutorial_verify_panel_message_id: int | None
+    if raw_panel_msg:
+        try:
+            tutorial_verify_panel_message_id = int(raw_panel_msg)
+        except ValueError as exc:
+            raise SystemExit("TUTORIAL_VERIFY_PANEL_MESSAGE_ID must be numeric.") from exc
+    else:
+        tutorial_verify_panel_message_id = None
+
+    default_pre_member = (
+        "1501550017289392288,"
+        "1505578147024867540,"
+        "1501851386596429907,"
+        "1500892639304876205"
+    )
+    raw_pre_member = (os.environ.get("TUTORIAL_PRE_MEMBER_CHANNEL_IDS") or default_pre_member).strip()
+    pre_member_ids: set[int] = set()
+    if raw_pre_member:
+        for part in raw_pre_member.replace(" ", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                pre_member_ids.add(int(part))
+            except ValueError as exc:
+                raise SystemExit(
+                    "TUTORIAL_PRE_MEMBER_CHANNEL_IDS must be comma-separated numeric channel IDs."
+                ) from exc
+    tutorial_pre_member_channel_ids = frozenset(pre_member_ids)
+
+    raw_ref_guild = (os.environ.get("REFERRAL_INVITE_GUILD_ID") or "").strip()
+    referral_invite_guild_id: int | None
+    if raw_ref_guild:
+        try:
+            referral_invite_guild_id = int(raw_ref_guild)
+        except ValueError as exc:
+            raise SystemExit("REFERRAL_INVITE_GUILD_ID must be numeric.") from exc
+    else:
+        referral_invite_guild_id = tutorial_guild_id
+
+    raw_ref_channel = (os.environ.get("REFERRAL_INVITE_CHANNEL_ID") or "").strip()
+    referral_invite_channel_id: int | None
+    if raw_ref_channel:
+        try:
+            referral_invite_channel_id = int(raw_ref_channel)
+        except ValueError as exc:
+            raise SystemExit("REFERRAL_INVITE_CHANNEL_ID must be numeric.") from exc
+    else:
+        referral_invite_channel_id = tutorial_verify_channel_id
+
+    raw_events_guild = (os.environ.get("DISCORD_EVENTS_GUILD_ID") or "").strip()
+    if raw_events_guild:
+        try:
+            discord_events_guild_id = int(raw_events_guild)
+        except ValueError as exc:
+            raise SystemExit("DISCORD_EVENTS_GUILD_ID must be numeric.") from exc
+    else:
+        discord_events_guild_id = tutorial_guild_id
+
+    discord_events_invite_code = (
+        (os.environ.get("DISCORD_EVENTS_INVITE_CODE") or "CgFRtYck").strip() or None
+    )
 
     return Settings(
         discord_token=token,
@@ -298,6 +471,11 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         drop_boost_test_user_ids=frozenset(drop_boost_test_user_ids),
         topgg_api_token=topgg_api_token,
         topgg_vote_url=topgg_vote_url,
+        topgg_auto_claim_enabled=topgg_auto_claim_enabled,
+        topgg_vote_poll_min_seconds=topgg_vote_poll_min_seconds,
+        topgg_review_url=topgg_review_url,
+        topgg_review_prompt_enabled=topgg_review_prompt_enabled,
+        topgg_review_prompt_min_commands=topgg_review_prompt_min_commands,
         topgg_webhook_secret=topgg_webhook_secret,
         topgg_webhook_host=topgg_webhook_host,
         topgg_webhook_port=topgg_webhook_port,
@@ -314,4 +492,17 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         web_session_ttl_seconds=web_session_ttl_seconds,
         discord_oauth_client_id=discord_oauth_client_id,
         discord_oauth_client_secret=discord_oauth_client_secret,
+        stripe_secret_key=stripe_secret_key,
+        stripe_webhook_secret=stripe_webhook_secret,
+        stripe_price_ids=stripe_price_ids,
+        tutorial_guild_id=tutorial_guild_id,
+        tutorial_member_role_id=tutorial_member_role_id,
+        tutorial_enabled=tutorial_enabled,
+        tutorial_verify_channel_id=tutorial_verify_channel_id,
+        tutorial_verify_panel_message_id=tutorial_verify_panel_message_id,
+        tutorial_pre_member_channel_ids=tutorial_pre_member_channel_ids,
+        referral_invite_guild_id=referral_invite_guild_id,
+        referral_invite_channel_id=referral_invite_channel_id,
+        discord_events_guild_id=discord_events_guild_id,
+        discord_events_invite_code=discord_events_invite_code,
     )

@@ -23,11 +23,14 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
+from poke_pon_bot.chat_commands import pp_alias
 from poke_pon_bot.cogs.gacha import (
-    _card_id_message_line,
+    _CardIdReplyBinding,
     _collection_view_embed,
+    _edit_card_id_reply,
     _fmt_obtained,
     _hybrid_ephemeral,
+    _reply_card_id_below,
     _truncate,
 )
 from poke_pon_bot.models.card import Card
@@ -48,48 +51,38 @@ from poke_pon_bot.services.packs import (
     PackService,
     UnknownSeriesError,
 )
+from poke_pon_bot.services.shop_catalog import RANDOM_PACK_SKU_ID
+from poke_pon_bot.web.frontend_urls import shop_page_url
 from poke_pon_bot.services.wallet import (
     InsufficientPokedollarsError,
     format_pokedollars,
 )
-from poke_pon_bot.services.wishlist import wishlist_user_ids_for_cards
 
 _LOG = logging.getLogger(__name__)
 
-_OPEN_VIEW_TIMEOUT = 600.0
 
-
-async def _notify_pack_wishlisters(
-    session_factory,
-    interaction: discord.Interaction,
-    *,
-    pairs: list[tuple[UserCardInstance, Card]],
-    obtainer_id: int,
-) -> None:
-    """After a pack is opened, tag guild members who wishlisted any of the obtained cards."""
-    guild = interaction.guild
-    if guild is None:
-        return
+async def _packd_discord_sku_id(bot: commands.Bot) -> int | None:
+    """SKU button for ``/packd`` — omitted when Stripe sells random packs or SKU is invalid."""
+    settings = bot.settings
+    if (settings.stripe_price_ids or {}).get(RANDOM_PACK_SKU_ID):
+        return None
+    sku = settings.discord_pack_consumable_sku_id
+    if sku is None:
+        return None
     try:
-        card_ids = list({card.id for _, card in pairs})
-        async with session_factory() as session:
-            wl_map = await wishlist_user_ids_for_cards(
-                session, card_ids, exclude_user_id=obtainer_id,
-            )
-        if not wl_map:
-            return
-        guild_member_ids = {m.id for m in guild.members}
-        card_name_map = {card.id: card.name for _, card in pairs}
-        lines: list[str] = []
-        for cid, user_ids in wl_map.items():
-            mentions = [f"<@{uid}>" for uid in user_ids if uid in guild_member_ids]
-            if mentions:
-                name = card_name_map.get(cid, "Unknown")
-                lines.append(f"⭐ **{name}** — wishlisted by {', '.join(mentions)}")
-        if lines:
-            await interaction.followup.send("\n".join(lines))
-    except Exception:
-        _LOG.debug("pack wishlist notify failed", exc_info=True)
+        app_skus = await bot.fetch_skus()
+    except discord.HTTPException:
+        _LOG.warning("fetch_skus failed; omitting /packd Discord SKU button")
+        return None
+    if any(s.id == sku for s in app_skus):
+        return sku
+    _LOG.warning(
+        "DISCORD_PACK_CONSUMABLE_SKU_ID %s is missing or unpublished — /packd will skip the SKU button",
+        sku,
+    )
+    return None
+
+_OPEN_VIEW_TIMEOUT = 600.0
 
 
 def _pack_summary(pack: UserPackInstance, series: CardSeries) -> str:
@@ -109,6 +102,9 @@ def _pack_view_embed(pack: UserPackInstance, series: CardSeries) -> discord.Embe
     e.description = "\n".join(desc)
     e.add_field(name="Series code", value=f"`{series.code}`", inline=True)
     e.add_field(name="Status", value=("Opened" if pack.opened_at else "Unopened"), inline=True)
+    src = (pack.source or "").strip()
+    if src:
+        e.add_field(name="Source", value=src.replace("_", " "), inline=True)
     e.add_field(name="Obtained", value=_fmt_obtained(pack.obtained_at), inline=True)
     if pack.opened_at:
         e.add_field(name="Opened", value=_fmt_obtained(pack.opened_at), inline=True)
@@ -894,7 +890,7 @@ class _ScrapButton(discord.ui.Button):
         await self._opened_view._on_scrap(interaction)
 
 
-class OpenedPackFlipView(discord.ui.View):
+class OpenedPackFlipView(_CardIdReplyBinding, discord.ui.View):
     """Page through freshly opened cards; ◀ ▶ navigate, **Scrap** discards the current copy.
 
     Cards are saved to inventory **before** this view shows (eager save in
@@ -913,6 +909,7 @@ class OpenedPackFlipView(discord.ui.View):
             msg = "instance_ids must be non-empty"
             raise ValueError(msg)
         super().__init__(timeout=_OPEN_VIEW_TIMEOUT)
+        self._init_card_id_reply()
         self._cog = cog
         self._owner_id = owner_id
         self._ids = list(instance_ids)
@@ -996,6 +993,11 @@ class OpenedPackFlipView(discord.ui.View):
                 attachments=[],
                 view=self,
             )
+            if self._card_id_reply is not None:
+                try:
+                    await self._card_id_reply.delete()
+                except (discord.NotFound, discord.HTTPException):
+                    pass
             return
 
         await self._render_view(interaction)
@@ -1036,11 +1038,11 @@ class OpenedPackFlipView(discord.ui.View):
         )
         self._sync_nav()
         await interaction.response.edit_message(
-            content=_card_id_message_line(inst.public_id),
             embed=embed,
             attachments=[],
             view=self,
         )
+        await self._sync_card_id_reply(inst.public_id)
 
 
 class PacksCog(commands.Cog):
@@ -1200,13 +1202,23 @@ class PacksCog(commands.Cog):
             await interaction.response.defer()
         ds = DropService()
         ps = PackService()
+        pack_source = ""
         try:
             async with self.bot.async_session_factory() as session:
+                pack_row = await session.get(UserPackInstance, pack_instance_id)
+                if pack_row is not None:
+                    pack_source = str(pack_row.source or "")
+                open_guild = (
+                    interaction.guild.id
+                    if interaction.guild is not None
+                    else pack_row.guild_id if pack_row is not None else None
+                )
                 opened = await ps.open_pack(
                     session,
                     ds,
                     pack_instance_id=pack_instance_id,
                     owner_id=interaction.user.id,
+                    guild_id=open_guild,
                 )
                 await session.commit()
         except PackNotFoundError:
@@ -1240,6 +1252,15 @@ class PacksCog(commands.Cog):
             )
             return
 
+        if interaction.user is not None and pack_source:
+            from poke_pon_bot.services.tutorial import notify_pack_opened
+
+            await notify_pack_opened(
+                self.bot,
+                interaction.user.id,
+                pack_source=pack_source,
+            )
+
         instance_ids = [inst.id for inst, _ in all_pairs]
         view = OpenedPackFlipView(
             cog=self,
@@ -1268,7 +1289,7 @@ class PacksCog(commands.Cog):
             collection_owner_id=interaction.user.id,
             viewer_id=interaction.user.id,
         )
-        first_content = f"{intro}\n{_card_id_message_line(first_inst.public_id)}"
+        first_content = intro
 
         try:
             msg = await interaction.followup.send(
@@ -1282,19 +1303,14 @@ class PacksCog(commands.Cog):
             return
 
         view.message = msg
-
-        await _notify_pack_wishlisters(
-            self.bot.async_session_factory,
-            interaction,
-            pairs=all_pairs,
-            obtainer_id=interaction.user.id,
-        )
+        view.bind_card_id_reply(await _reply_card_id_below(msg, first_inst.public_id))
 
     # ----------------------------------------------------------------------- /packd
 
     @commands.hybrid_command(
         name="packd",
-        description="Pack drop: buy a random pack with Pokedollars, Crystals, or the pack SKU. Chat: packd",
+        aliases=[pp_alias("packd")],
+        description="Pack drop: buy a random pack with Pokedollars, Crystals, or the pack SKU. Chat: pppackd",
     )
     async def pack_drop_cmd(self, ctx: commands.Context) -> None:
         ephe = _hybrid_ephemeral(ctx)
@@ -1304,16 +1320,48 @@ class PacksCog(commands.Cog):
             f"• **{format_pokedollars(DEFAULT_RANDOM_PACK_PRICE)}** Pokedollars, or",
             f"• **{format_crystals(DEFAULT_RANDOM_PACK_CRYSTAL_PRICE)}** Crystals.",
         ]
-        if self.bot.settings.discord_pack_consumable_sku_id is not None:
-            desc.append("Or use the Discord SKU button below to buy a random pack.")
+        stripe_pack = (self.bot.settings.stripe_price_ids or {}).get(RANDOM_PACK_SKU_ID)
+        if stripe_pack:
+            desc.append(
+                f"Or buy with real money on the website shop: **{shop_page_url(self.bot.settings)}** (Perks)."
+            )
+        consumable_sku = await _packd_discord_sku_id(self.bot)
+        if consumable_sku is not None:
+            desc.append("Or use the Discord SKU button below to buy a random pack (legacy).")
         embed.description = "\n".join(desc)
         embed.set_footer(text="Use /packv to search and buy a specific series with Crystals (rarer packs cost more).")
         view = PackDropPurchaseView(
             cog=self,
             owner_id=ctx.author.id,
-            consumable_sku_id=self.bot.settings.discord_pack_consumable_sku_id,
+            consumable_sku_id=consumable_sku,
         )
-        msg = await ctx.send(embed=embed, view=view, ephemeral=ephe)
+        try:
+            msg = await ctx.send(embed=embed, view=view, ephemeral=ephe)
+        except discord.HTTPException as exc:
+            if consumable_sku is not None and exc.status == 400 and (
+                exc.code == 50035 or (exc.text and "sku" in exc.text.lower())
+            ):
+                _LOG.warning(
+                    "packd SKU button rejected (unpublished?): sku=%s %s",
+                    consumable_sku,
+                    exc.text,
+                )
+                view = PackDropPurchaseView(
+                    cog=self,
+                    owner_id=ctx.author.id,
+                    consumable_sku_id=None,
+                )
+                msg = await ctx.send(
+                    embed=embed,
+                    view=view,
+                    content=(
+                        "_Discord would not show the legacy pack SKU button (missing or unpublished). "
+                        "Use Pokedollars, Crystals, or the website shop._"
+                    ),
+                    ephemeral=ephe,
+                )
+            else:
+                raise
         view.message = msg
 
     # ----------------------------------------------------------------------- pack series helpers
@@ -1403,7 +1451,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packv",
-        aliases=["pv"],
+        aliases=[pp_alias("packv")],
         description="Search/view packs to buy, or view an owned pack by ID.",
     )
     @app_commands.describe(
@@ -1453,8 +1501,8 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packcolv",
-        aliases=["pcpolv"],
-        description="Flip through your unopened packs (◀▶) — chat: pcpolv (or packcolv)",
+        aliases=[pp_alias("packcolv")],
+        description="Flip through your unopened packs (◀▶) — chat: pppackcolv",
     )
     @app_commands.describe(series="Filter by series code (e.g. sv).")
     async def packcolv_cmd(
@@ -1481,7 +1529,10 @@ class PacksCog(commands.Cog):
             )
             if not packs:
                 await ctx.send(
-                    "You have no unopened packs.\nUse `/packv` to buy a specific pack, or `/packd` for a random drop.",
+                    "You have no unopened packs.\n"
+                    "Buy with `/packv` or `/packd`, or craft on the website (then run **`/packcolv`** again). "
+                    "Crafted packs do not appear in the `/packv` shop list — use **`/packcolv`** or "
+                    "`/packv card_ref:<Pack ID>`.",
                     ephemeral=ephe,
                 )
                 return
@@ -1518,6 +1569,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packcat",
+        aliases=[pp_alias("packcat")],
         description="Browse the pack catalog as a book-flip view of pack art.",
     )
     @app_commands.describe(
@@ -1580,7 +1632,9 @@ class PacksCog(commands.Cog):
 
         if not active:
             await ctx.send(
-                "No active pack series yet — sync the catalog (`python -m poke_pon_bot.scripts.sync_catalog`).",
+                "No pack series with booster art yet — sync the catalog "
+                "(`python -m poke_pon_bot.scripts.sync_catalog`) and check "
+                "`config/pack_series.v1.yaml` pack_art_overrides.",
                 ephemeral=ephe,
             )
             return

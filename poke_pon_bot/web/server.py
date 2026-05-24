@@ -7,7 +7,8 @@ Hosts (each only when its config is present):
 * ``GET  /auth/discord/callback``       — Finish OAuth, issue a session cookie.
 * ``POST /auth/logout``                 — Clear the session cookie.
 * ``GET  /api/me``                      — Current session payload (if any).
-* ``GET  /api/me/collection``           — Signed-in user's bot card collection.
+* ``GET  /api/me/collection``           — Signed-in user's bot card collection (summary rows).
+* ``GET  /api/me/collection/evolution-sections`` — Evolution-line matches for a search query.
 * ``GET  /api/me/cards/{public_id}``    — One owned card's detail.
 * ``POST /api/me/cards/{public_id}/sell`` — Sell to shop (same quote rules as ``/colv``).
 * ``GET  /api/me/balances``             — Signed-in user's Pokedollars and Crystals.
@@ -25,6 +26,14 @@ Hosts (each only when its config is present):
 * ``POST /api/me/trades/{id}/cancel``  — Cancel trade.
 * ``GET  /api/me/trades/pending-count``— Incoming invite count (badge).
 * ``GET  /api/me/trade-user-search``   — Autocomplete: Discord users in bot servers (``q``).
+* ``GET  /api/me/settings``            — Notification preferences.
+* ``PATCH /api/me/settings``           — Update notification preferences.
+* ``GET  /api/me/referrals``           — Referral dashboard (invited friends + progress).
+* ``GET  /api/leaderboards``           — Global rankings (strongest, tankiest, rarest, auctions).
+* ``GET  /api/events``                 — Upcoming Discord scheduled events (home page panel).
+* ``GET  /api/shop/catalog``           — Shop SKUs (currency, perks) + balances when signed in.
+* ``POST /api/shop/checkout``          — Start Stripe Checkout (session cookie).
+* ``POST /api/stripe/webhook``         — Stripe ``checkout.session.completed`` fulfillment.
 
 Everything runs in one ``aiohttp.web.Application`` so the bot needs only one
 listening port / one reverse proxy / one ngrok tunnel exposed to the internet.
@@ -76,7 +85,7 @@ def _cors_middleware(allowed_origins: tuple[str, ...]):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Vary"] = "Origin"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, OPTIONS"
             # `ngrok-skip-browser-warning` is allowed so the frontend can bypass
             # ngrok-free's HTML interstitial without that triggering a preflight
             # failure on non-CORS-safelisted headers.
@@ -107,6 +116,14 @@ async def start_web_server(bot: Any) -> WebServer | None:
 
         register_topgg_routes(app, bot=bot, settings=settings)
 
+    from poke_pon_bot.web.catalog_api import register_catalog_public_api
+    from poke_pon_bot.web.events_api import register_events_public_api
+    from poke_pon_bot.web.packs_api import register_packs_public_api
+
+    register_catalog_public_api(app, bot=bot)
+    register_packs_public_api(app, bot=bot)
+    register_events_public_api(app, bot=bot)
+
     if (
         settings.web_session_secret
         and settings.discord_oauth_client_id
@@ -114,18 +131,33 @@ async def start_web_server(bot: Any) -> WebServer | None:
     ):
         from poke_pon_bot.web.auction_api import register_auction_api
         from poke_pon_bot.web.collection_api import register_collection_api
+        from poke_pon_bot.web.assembly_api import register_assembly_api
+        from poke_pon_bot.web.craft_api import register_craft_api
         from poke_pon_bot.web.deck_api import register_deck_api
+        from poke_pon_bot.web.leaderboard_api import register_leaderboard_api
         from poke_pon_bot.web.oauth import register_oauth_routes
+        from poke_pon_bot.web.packs_api import register_packs_api
+        from poke_pon_bot.web.profile_api import register_profile_api
+        from poke_pon_bot.web.shop_api import register_shop_api
         from poke_pon_bot.web.trade_api import register_trade_api
 
         register_oauth_routes(
             app, settings=settings, secure_cookies=_secure_cookies(settings), bot=bot
         )
         register_collection_api(app, bot=bot, settings=settings)
+        register_craft_api(app, bot=bot, settings=settings)
+        register_assembly_api(app, bot=bot, settings=settings)
+        register_packs_api(app, bot=bot, settings=settings)
         register_deck_api(app, bot=bot, settings=settings)
         register_auction_api(app, bot=bot, settings=settings)
         register_trade_api(app, bot=bot, settings=settings)
-        _LOG.info("Discord OAuth + Collection / Deck / Auction / Trade API mounted.")
+        register_profile_api(app, bot=bot, settings=settings)
+        register_leaderboard_api(app, bot=bot, settings=settings)
+        register_shop_api(app, bot=bot, settings=settings)
+        _LOG.info(
+            "Discord OAuth + Collection / Deck / Auction / Trade / Profile / "
+            "Leaderboard / Shop API mounted."
+        )
 
     if not list(app.router.routes()):
         _LOG.info("Web server disabled: no routes were enabled by settings.")

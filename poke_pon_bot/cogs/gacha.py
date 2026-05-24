@@ -20,17 +20,34 @@ from poke_pon_bot.cogs.catalog import CatalogBrowseView, _catalog_view_embed, _s
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
+from poke_pon_bot.services.catalog_card_ref import looks_like_catalog_card_ref
 from poke_pon_bot.services.catalog_search import (
     CATALOG_BROWSE_PAGE_CAP,
     any_catalog_content_filter_set,
     any_catalog_filter_set,
     search_catalog,
 )
-from poke_pon_bot.services.collection_search import any_filter_set, search_collection
+from poke_pon_bot.services.collection_search import (
+    _COLV_FLIP_INSTANCE_CAP,
+    _CV_FLIP_INSTANCE_CAP,
+    any_filter_set,
+    list_collection_instance_ids,
+    search_collection,
+)
 from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
+from poke_pon_bot.services.cd_drop_themes import (
+    format_theme_status_line,
+    resolve_active_cd_drop_theme,
+)
+from poke_pon_bot.services.rarity_luck_boost import (
+    format_luck_boost_line,
+    get_luck_boost_row,
+    resolve_active_rarity_luck_boost,
+)
 from poke_pon_bot.services.drops import DropService
 from poke_pon_bot.config import Settings
 from poke_pon_bot.context_reply import reply_target_user_id, resolve_collection_display_target
+from poke_pon_bot.error_handlers import reply_command_failure
 from poke_pon_bot.services.instance_public_id import compact_public_id_for_line, normalize_public_id
 from poke_pon_bot.services.evolution import (
     EvolutionSuccess,
@@ -39,11 +56,17 @@ from poke_pon_bot.services.evolution import (
     run_collection_evolution,
 )
 from poke_pon_bot.services.pack_collage import render_pack_collage_png
+from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.services.referrals import notify_referral_reward, record_referral_cd_use
+from poke_pon_bot.services.missions import MissionService, PackMissionAlert
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
+from poke_pon_bot.services.collection_sell import collection_sell_block_reason
+from poke_pon_bot.services.instance_favorite import toggle_instance_favorite
 from poke_pon_bot.services.wishlist import (
     MAX_WISHLIST_ENTRIES,
     add_wishlist,
     is_wishlisted,
+    list_wishlist_card_ids,
     remove_wishlist,
     wishlist_user_ids_for_cards,
 )
@@ -59,7 +82,7 @@ _COLL_PAGE_CHAR_CAP = 1870
 _COLL_PAGE_LINE_CAP = 10
 
 # Public binder (search, sort, detail) — linked from ``/colv`` / ``/coll`` replies.
-COLLECTION_WEB_URL = "https://hamiebrooklyn.github.io/collection.html"
+COLLECTION_WEB_URL = "https://pokepon.org/collection/"
 
 
 def _collection_web_footer() -> str:
@@ -68,6 +91,93 @@ def _collection_web_footer() -> str:
         f"\n\n_Browse and search your full binder (filters, card details):_\n"
         f"<{COLLECTION_WEB_URL}>"
     )
+
+
+async def _edit_flip_message(
+    interaction: discord.Interaction,
+    *,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
+    files: list[discord.File] | None = None,
+) -> None:
+    """Edit the flip-browser message whether or not the interaction was deferred."""
+    kwargs: dict[str, object] = {"content": content, "embed": embed, "view": view}
+    if files:
+        kwargs["attachments"] = files
+    if interaction.response.is_done():
+        await interaction.edit_original_response(**kwargs)
+    else:
+        await interaction.response.edit_message(**kwargs)
+
+
+async def _graded_slab_files(
+    session: AsyncSession,
+    embed: discord.Embed,
+    inst: UserCardInstance,
+    card: Card,
+) -> list[discord.File]:
+    """Replace embed art with a PSA-style slab when this copy is graded."""
+    if getattr(inst, "grade", None) is None:
+        return []
+    from poke_pon_bot.services.grading import build_grade_preview
+    from poke_pon_bot.services.grade_slab import render_graded_slab_png
+
+    preview = await build_grade_preview(session, inst)
+    png = await render_graded_slab_png(
+        card,
+        grade=int(inst.grade),
+        copy_index=preview.copy_index.copy_index,
+        total_copies=preview.copy_index.total_copies,
+        cert_suffix=inst.public_id,
+    )
+    if png is None:
+        return []
+    embed.set_image(url="attachment://slab.png")
+    return [discord.File(png, filename="slab.png")]
+
+
+def _pack_cards_listing(cards: list[Card]) -> str:
+    """Plain-text list of slots with set names (shown on every drop)."""
+    if not cards:
+        return ""
+    lines = ["**Cards in this pack:**"]
+    for i, c in enumerate(cards):
+        set_label = (c.set_name or c.set_code or "?").strip()
+        num = (c.collector_number or "?").strip()
+        rarity = (c.tcg_rarity or "").strip()
+        rarity_part = f" · *{rarity}*" if rarity else ""
+        lines.append(
+            f"• **#{i + 1}** {c.name} — **{set_label}** · #{num}{rarity_part}"
+        )
+    return "\n".join(lines)
+
+
+def _pack_mission_block(
+    alerts: list[PackMissionAlert],
+    *,
+    guild: discord.Guild | None,
+    private_pack: bool,
+    viewer_id: int,
+) -> str:
+    if not alerts:
+        return ""
+    if private_pack:
+        for alert in alerts:
+            if alert.user_id == viewer_id:
+                return f"\n\n🎯 **On your mission:** {alert.text}"
+        return ""
+    if guild is None:
+        return ""
+    member_ids = {m.id for m in guild.members}
+    lines: list[str] = []
+    for alert in alerts:
+        if alert.user_id not in member_ids:
+            continue
+        lines.append(f"<@{alert.user_id}> {alert.text}")
+    if not lines:
+        return ""
+    return "\n\n🎯 **Mission match in this drop:**\n" + "\n".join(lines)
 
 
 async def _notify_wishlisters(
@@ -98,6 +208,20 @@ async def _notify_wishlisters(
         await interaction.followup.send(text)
     except Exception:
         _LOG.debug("wishlist notify failed for card_id=%s", card_id, exc_info=True)
+
+
+def _coerce_chat_catalog_name_filter(
+    ctx: commands.Context,
+    scope: str,
+    card_ref: str | None,
+    name: str | None,
+) -> tuple[str | None, str | None]:
+    """Chat ``ppcv g pikachu`` — third token is a name, not ``card_ref`` (catalog id)."""
+    if ctx.interaction is not None or scope != "g":
+        return card_ref, name
+    if card_ref and not name and not looks_like_catalog_card_ref(card_ref):
+        return None, card_ref.strip()
+    return card_ref, name
 
 
 def _hybrid_ephemeral(ctx: commands.Context) -> bool:
@@ -162,12 +286,68 @@ def _add_card_id_copy_field(embed: discord.Embed, public_id: str) -> None:
 
 
 def _card_id_message_line(public_id: str) -> str:
-    """Plain-text Card ID line emitted **outside** the embed.
-
-    Mobile clients let you long-press inline backtick text (`like this`) to copy — embed bodies
-    don't, so we surface the ID in `content=` for tap-to-copy.
-    """
+    """Plain-text Card ID for a **reply** under the embed (mobile: long-press `` `…` `` to copy)."""
     return f"**Card ID:** `{public_id}`"
+
+
+async def _reply_card_id_below(
+    parent: discord.Message,
+    public_id: str,
+) -> discord.Message:
+    """Discord cannot put message text below an embed; a reply sits under the card message."""
+    return await parent.reply(
+        _card_id_message_line(public_id),
+        mention_author=False,
+    )
+
+
+async def _edit_card_id_reply(reply: discord.Message | None, public_id: str) -> None:
+    if reply is None:
+        return
+    try:
+        await reply.edit(content=_card_id_message_line(public_id))
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+
+class _CardIdReplyBinding:
+    """Mixin for views that keep a copyable Card ID reply in sync when the card changes."""
+
+    _card_id_reply: discord.Message | None
+
+    def _init_card_id_reply(self) -> None:
+        self._card_id_reply = None
+
+    def bind_card_id_reply(self, msg: discord.Message) -> None:
+        self._card_id_reply = msg
+
+    async def _sync_card_id_reply(self, public_id: str) -> None:
+        await _edit_card_id_reply(self._card_id_reply, public_id)
+
+
+async def _send_collection_card(
+    ctx: commands.Context,
+    *,
+    embed: discord.Embed,
+    public_id: str,
+    view: discord.ui.View | None = None,
+    files: list[discord.File] | None = None,
+    content: str | None = None,
+    ephemeral: bool = False,
+) -> discord.Message:
+    """Send collection embed + buttons, then a copyable Card ID reply underneath."""
+    send_kw: dict[str, object] = {"embed": embed, "ephemeral": ephemeral}
+    if content:
+        send_kw["content"] = content
+    if view is not None:
+        send_kw["view"] = view
+    if files:
+        send_kw["files"] = files
+    msg = await ctx.send(**send_kw)
+    reply = await _reply_card_id_below(msg, public_id)
+    if view is not None and hasattr(view, "bind_card_id_reply"):
+        view.bind_card_id_reply(reply)
+    return msg
 
 
 def _coll_one_line(rank: int, inst: UserCardInstance, card: Card) -> str:
@@ -329,9 +509,32 @@ def _collection_view_embed(
             value=str(inst.evolution_stages),
             inline=True,
         )
+    if getattr(inst, "is_favorite", False):
+        e.add_field(
+            name="Favorite",
+            value="This copy is **favorited** — sell, trade, and auction are disabled until you unfavorite it.",
+            inline=False,
+        )
+    grade_val = getattr(inst, "grade", None)
+    if grade_val is not None:
+        from poke_pon_bot.services.grading import grade_label
 
-    # Card ID is intentionally **not** embedded — see _card_id_message_line. Callers attach it
-    # via `content=` so mobile users can long-press to copy the value.
+        e.add_field(
+            name="Grade",
+            value=f"**{grade_val}** — **{grade_label(int(grade_val))}**",
+            inline=True,
+        )
+
+    from poke_pon_bot.services.card_roles import format_craft_uses_discord
+
+    uses_dots = format_craft_uses_discord(inst, card)
+    if uses_dots:
+        e.add_field(
+            name="Craft uses",
+            value=uses_dots,
+            inline=False,
+        )
+
     e.set_footer(text=f"Catalog printing `{card.tcg_card_id}`")
     return e
 
@@ -487,7 +690,6 @@ class EvolutionConfirmView(discord.ui.View):
         )
         done = _collection_view_embed(su.inst, su.new_card, rank_note=line)
         await interaction.edit_original_response(
-            content=_card_id_message_line(su.inst.public_id),
             embed=done,
             view=None,
         )
@@ -665,7 +867,6 @@ class EvolutionBranchView(discord.ui.View):
         )
         done = _collection_view_embed(su.inst, su.new_card, rank_note=line)
         await interaction.edit_original_response(
-            content=_card_id_message_line(su.inst.public_id),
             embed=done,
             view=None,
         )
@@ -684,13 +885,11 @@ class EvolutionBranchView(discord.ui.View):
 class WishlistToggleButton(discord.ui.Button):
     """Star button that toggles the current card on/off the viewer's wishlist."""
 
-    _STAR_ON = "⭐"
-    _STAR_OFF = "☆"
+    _STAR = "⭐"
 
     def __init__(self, *, session_factory, card_id: int, viewer_id: int, wishlisted: bool, row: int = 0) -> None:
-        emoji = self._STAR_ON if wishlisted else self._STAR_OFF
         style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
-        super().__init__(emoji=emoji, style=style, row=row)
+        super().__init__(emoji=self._STAR, style=style, row=row)
         self._session_factory = session_factory
         self._card_id = card_id
         self._viewer_id = viewer_id
@@ -722,7 +921,7 @@ class WishlistToggleButton(discord.ui.Button):
             await interaction.response.send_message("Could not update wishlist. Try again.", ephemeral=True)
             return
 
-        self.emoji = self._STAR_ON if self._wishlisted else self._STAR_OFF
+        self.emoji = self._STAR
         self.style = discord.ButtonStyle.primary if self._wishlisted else discord.ButtonStyle.secondary
         await interaction.response.edit_message(view=self.view)
 
@@ -730,8 +929,170 @@ class WishlistToggleButton(discord.ui.Button):
         """Refresh the button state (e.g. after flipping to a new card)."""
         self._card_id = card_id
         self._wishlisted = wishlisted
-        self.emoji = self._STAR_ON if wishlisted else self._STAR_OFF
+        self.emoji = self._STAR
         self.style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
+
+
+class InstanceFavoriteToggleButton(discord.ui.Button):
+    """Favorite this owned copy (locks sell / trade / auction)."""
+
+    def __init__(
+        self,
+        *,
+        session_factory,
+        instance_id: int,
+        owner_id: int,
+        viewer_id: int,
+        favorited: bool,
+        row: int = 0,
+    ) -> None:
+        super().__init__(
+            emoji="💛" if favorited else "🖤",
+            style=discord.ButtonStyle.primary if favorited else discord.ButtonStyle.secondary,
+            row=row,
+        )
+        self._session_factory = session_factory
+        self._instance_id = instance_id
+        self._owner_id = owner_id
+        self._viewer_id = viewer_id
+        self._favorited = favorited
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._viewer_id or interaction.user.id != self._owner_id:
+            await interaction.response.send_message(
+                "Only the owner of this copy can favorite it.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            async with self._session_factory() as session:
+                new_state = await toggle_instance_favorite(
+                    session,
+                    discord_user_id=self._owner_id,
+                    instance_id=self._instance_id,
+                )
+                if new_state is None:
+                    await interaction.followup.send(
+                        "That copy is no longer in your collection.",
+                        ephemeral=True,
+                    )
+                    return
+                row = await _load_instance_and_card(session, self._instance_id, self._owner_id)
+                await session.commit()
+                if row is None:
+                    await interaction.followup.send(
+                        "That copy is no longer in your collection.",
+                        ephemeral=True,
+                    )
+                    return
+                inst, card = row
+        except SQLAlchemyError:
+            _LOG.exception(
+                "favorite toggle instance_id=%s user=%s",
+                self._instance_id,
+                self._viewer_id,
+            )
+            await interaction.followup.send("Could not update favorite. Try again.", ephemeral=True)
+            return
+
+        self._favorited = bool(new_state)
+        self.emoji = "💛" if self._favorited else "🖤"
+        self.style = discord.ButtonStyle.primary if self._favorited else discord.ButtonStyle.secondary
+        if isinstance(self.view, CollectionFlipView):
+            await self.view.refresh_after_favorite(interaction, inst, card)
+            return
+        if isinstance(self.view, CollectionCardActionsView):
+            await self.view.refresh_after_favorite(interaction, inst, card)
+            return
+        await interaction.response.edit_message(view=self.view)
+
+    def update(self, *, instance_id: int | None = None, favorited: bool | None = None) -> None:
+        if instance_id is not None:
+            self._instance_id = instance_id
+        if favorited is None:
+            return
+        self._favorited = favorited
+        self.emoji = "💛" if favorited else "🖤"
+        self.style = discord.ButtonStyle.primary if favorited else discord.ButtonStyle.secondary
+
+
+class CollectionCardActionsView(_CardIdReplyBinding, discord.ui.View):
+    """Wishlist (catalog) + optional favorite (owned copy) for a single card display."""
+
+    def __init__(
+        self,
+        *,
+        session_factory,
+        card_id: int,
+        viewer_id: int,
+        wishlisted: bool,
+        instance_id: int | None = None,
+        owner_id: int | None = None,
+        favorited: bool = False,
+        show_favorite: bool = False,
+        rank_note: str | None = None,
+        collection_owner_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=600.0)
+        self._init_card_id_reply()
+        self._session_factory = session_factory
+        self._rank_note = rank_note
+        self._collection_owner_id = collection_owner_id
+        self._viewer_id = viewer_id
+        self.add_item(WishlistToggleButton(
+            session_factory=session_factory,
+            card_id=card_id,
+            viewer_id=viewer_id,
+            wishlisted=wishlisted,
+            row=0,
+        ))
+        self._fav_btn: InstanceFavoriteToggleButton | None = None
+        if show_favorite and instance_id is not None and owner_id is not None:
+            self._fav_btn = InstanceFavoriteToggleButton(
+                session_factory=session_factory,
+                instance_id=instance_id,
+                owner_id=owner_id,
+                viewer_id=viewer_id,
+                favorited=favorited,
+                row=0,
+            )
+            self.add_item(self._fav_btn)
+
+    async def refresh_after_favorite(
+        self,
+        interaction: discord.Interaction,
+        inst: UserCardInstance,
+        card: Card,
+    ) -> None:
+        embed = _collection_view_embed(
+            inst,
+            card,
+            rank_note=self._rank_note,
+            collection_owner_id=self._collection_owner_id,
+            viewer_id=self._viewer_id,
+        )
+        if self._fav_btn is not None:
+            self._fav_btn.update(favorited=bool(getattr(inst, "is_favorite", False)))
+        async with self._session_factory() as session:
+            slab_files = await _graded_slab_files(session, embed, inst, card)
+        await _edit_flip_message(
+            interaction,
+            embed=embed,
+            view=self,
+            files=slab_files,
+        )
+        await self._sync_card_id_reply(inst.public_id)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        msg = getattr(self, "message", None)
+        if msg is not None:
+            try:
+                await msg.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
 
 class SingleCardWishlistView(discord.ui.View):
@@ -758,8 +1119,40 @@ class SingleCardWishlistView(discord.ui.View):
                 pass
 
 
-class CollectionFlipView(discord.ui.View):
-    """Browse owned cards with ◀ ▶ and ⭐ wishlist toggle."""
+def _single_card_actions_view(
+    *,
+    session_factory,
+    inst: UserCardInstance,
+    card: Card,
+    viewer_id: int,
+    owner_id: int,
+    wishlisted: bool,
+    rank_note: str | None = None,
+    collection_owner_id: int | None = None,
+) -> discord.ui.View:
+    if owner_id != viewer_id:
+        return SingleCardWishlistView(
+            session_factory=session_factory,
+            card_id=card.id,
+            viewer_id=viewer_id,
+            wishlisted=wishlisted,
+        )
+    return CollectionCardActionsView(
+        session_factory=session_factory,
+        card_id=card.id,
+        viewer_id=viewer_id,
+        wishlisted=wishlisted,
+        instance_id=inst.id,
+        owner_id=owner_id,
+        favorited=bool(inst.is_favorite),
+        show_favorite=True,
+        rank_note=rank_note,
+        collection_owner_id=collection_owner_id,
+    )
+
+
+class CollectionFlipView(_CardIdReplyBinding, discord.ui.View):
+    """Browse owned cards with ◀ ▶, catalog wishlist, and per-copy favorite."""
 
     def __init__(
         self,
@@ -770,11 +1163,14 @@ class CollectionFlipView(discord.ui.View):
         instance_ids: list[int],
         first_card_id: int = 0,
         first_wishlisted: bool = False,
+        first_favorited: bool = False,
+        show_favorite: bool = False,
     ) -> None:
         if not instance_ids:
             msg = "instance_ids must be non-empty"
             raise ValueError(msg)
         super().__init__(timeout=600.0)
+        self._init_card_id_reply()
         self._session_factory = session_factory
         self._owner_id = owner_id
         self._viewer_id = viewer_id
@@ -797,7 +1193,53 @@ class CollectionFlipView(discord.ui.View):
         )
         self.add_item(self._wish_btn)
 
+        self._fav_btn: InstanceFavoriteToggleButton | None = None
+        if show_favorite:
+            self._fav_btn = InstanceFavoriteToggleButton(
+                session_factory=session_factory,
+                instance_id=instance_ids[0],
+                owner_id=owner_id,
+                viewer_id=viewer_id,
+                favorited=first_favorited,
+                row=0,
+            )
+            self.add_item(self._fav_btn)
+
         self._sync_nav_buttons()
+
+    async def refresh_after_favorite(
+        self,
+        interaction: discord.Interaction,
+        inst: UserCardInstance,
+        card: Card,
+    ) -> None:
+        async with self._session_factory() as session:
+            wishlisted = await is_wishlisted(
+                session, discord_user_id=self._viewer_id, card_id=card.id,
+            )
+        self._wish_btn.update(card_id=card.id, wishlisted=wishlisted)
+        if self._fav_btn is not None:
+            self._fav_btn.update(
+                instance_id=inst.id,
+                favorited=bool(getattr(inst, "is_favorite", False)),
+            )
+        embed = _collection_view_embed(
+            inst,
+            card,
+            rank_note=self._rank_note(self._index, len(self._instance_ids)),
+            collection_owner_id=self._owner_id,
+            viewer_id=self._viewer_id,
+        )
+        self._sync_nav_buttons()
+        async with self._session_factory() as session:
+            slab_files = await _graded_slab_files(session, embed, inst, card)
+        await _edit_flip_message(
+            interaction,
+            embed=embed,
+            view=self,
+            files=slab_files,
+        )
+        await self._sync_card_id_reply(inst.public_id)
 
     def _sync_nav_buttons(self) -> None:
         n = len(self._instance_ids)
@@ -863,7 +1305,7 @@ class CollectionFlipView(discord.ui.View):
                     collection_owner_id=self._owner_id,
                     viewer_id=self._viewer_id,
                 )
-                content = _card_id_message_line(inst.public_id)
+                slab_files = await _graded_slab_files(session, embed, inst, card)
                 wishlisted = await is_wishlisted(
                     session, discord_user_id=self._viewer_id, card_id=card.id,
                 )
@@ -876,12 +1318,20 @@ class CollectionFlipView(discord.ui.View):
             return
 
         self._wish_btn.update(card_id=card.id, wishlisted=wishlisted)
+        if self._fav_btn is not None:
+            self._fav_btn.update(
+                instance_id=inst.id,
+                favorited=bool(getattr(inst, "is_favorite", False)),
+            )
         self._sync_nav_buttons()
-        await interaction.response.edit_message(content=content, embed=embed, view=self)
+        await _edit_flip_message(
+            interaction, embed=embed, view=self, files=slab_files,
+        )
+        await self._sync_card_id_reply(inst.public_id)
 
 
 class ClaimSlotButton(discord.ui.Button):
-    """Claim one revealed slot — first come per slot; each user may take at most one card."""
+    """Claim one revealed slot — first come per slot; per-user grab limit enforced by the view."""
 
     def __init__(self, *, pick_view: "PackPickView", idx: int, card_name: str, row: int) -> None:
         label = _truncate(f"#{idx + 1} · Take · {card_name}", 80)
@@ -895,7 +1345,7 @@ class ClaimSlotButton(discord.ui.Button):
 
 
 class PackPickView(discord.ui.View):
-    """Public pack fight: anyone can grab one unrevealed slot until the countdown expires."""
+    """Public pack fight: claim slots until the countdown expires (per-user grab cap configurable)."""
 
     def __init__(
         self,
@@ -906,123 +1356,337 @@ class PackPickView(discord.ui.View):
         cards: list[Card],
         deadline_unix: int,
         private_pack: bool,
+        mission_block: str = "",
+        max_grabs_per_user: int = 1,
+        claim_seconds: int = _PACK_CLAIM_SECONDS,
+        restored_slot_claimer: dict[int, int] | None = None,
+        restored_slot_pid: dict[int, str] | None = None,
     ) -> None:
-        super().__init__(timeout=float(_PACK_CLAIM_SECONDS))
+        claim_seconds = max(30, int(claim_seconds))
+        now = int(time.time())
+        remaining = max(30, int(deadline_unix) - now)
+        super().__init__(timeout=float(remaining))
         self._session_factory = session_factory
         self._issuer_id = issuer_id
         self._opener_mention = opener_mention
         self._cards = cards
         self._deadline_unix = deadline_unix
+        self._claim_seconds_total = claim_seconds
         self._private_pack = private_pack
+        self._mission_block = mission_block
+        self._max_grabs_per_user = max(1, min(int(max_grabs_per_user), len(cards)))
         self._lock = asyncio.Lock()
         # slot_index -> claimer user id
-        self._slot_claimer: dict[int, int] = {}
+        self._slot_claimer: dict[int, int] = dict(restored_slot_claimer or {})
         # slot_index -> per-claim Card ID (public_id) so we can echo it in plain text
         # outside the embed (mobile long-press copy).
-        self._slot_pid: dict[int, str] = {}
+        self._slot_pid: dict[int, str] = dict(restored_slot_pid or {})
         self._finished = False
+        self._drop_host: commands.Cog | None = None
+        self._channel_id: int | None = None
+        self._guild_id: int | None = None
+        self._content_prefix = ""
 
         for i, card in enumerate(cards):
             row = i // 5
             self.add_item(ClaimSlotButton(pick_view=self, idx=i, card_name=card.name, row=row))
+        self._apply_restored_slot_buttons()
+        if len(self._slot_pid) >= len(self._cards) and self._cards:
+            self._finished = True
+            for child in self.children:
+                child.disabled = True
+
+    def bind_drop_host(
+        self,
+        host: commands.Cog,
+        *,
+        channel_id: int,
+        guild_id: int | None,
+        content_prefix: str = "",
+    ) -> None:
+        self._drop_host = host
+        self._channel_id = int(channel_id)
+        self._guild_id = guild_id
+        self._content_prefix = content_prefix or ""
+
+    def _apply_restored_slot_buttons(self) -> None:
+        stale = [i for i in self._slot_claimer if i not in self._slot_pid]
+        for i in stale:
+            self._slot_claimer.pop(i, None)
+        for child in self.children:
+            if not isinstance(child, ClaimSlotButton):
+                continue
+            idx = child._idx
+            if idx not in self._slot_pid:
+                continue
+            card = self._cards[idx] if 0 <= idx < len(self._cards) else None
+            name = card.name if card is not None else "Card"
+            child.disabled = True
+            child.style = discord.ButtonStyle.success
+            child.label = _truncate(f"#{idx + 1} · Taken · {name}", 80)
+
+    def full_content(self, extra: str = "") -> str:
+        body = self.build_content() + (extra or "")
+        prefix = (self._content_prefix or "").strip()
+        if prefix:
+            return f"{prefix}\n\n{body}"
+        return body
+
+    def _schedule_persist(self) -> None:
+        host = self._drop_host
+        if host is None or self._private_pack or self.message is None:
+            return
+        host.schedule_drop_persist(self)
+
+    def _user_grab_count(self, user_id: int) -> int:
+        return sum(1 for uid in self._slot_claimer.values() if uid == user_id)
+
+    _DISCORD_CONTENT_LIMIT = 2000
+    _CONTENT_SAFETY_BUFFER = 60
+
+    def _compact_drop_summary(self) -> str:
+        """Short status once claims start — frees space for the full claim list.
+
+        Card names stay in the collage image; repeating all 25 lines in text
+        on every grab was blowing the 2000-char cap and hiding who claimed what.
+        """
+        n = len(self._cards)
+        claimed = len(self._slot_pid)
+        unclaimed = [i + 1 for i in range(n) if i not in self._slot_pid]
+        lines = [
+            f"**{n}** cards in this drop (see collage). "
+            f"**{claimed}** / **{n}** claimed."
+        ]
+        if unclaimed and not self._finished:
+            if len(unclaimed) <= 18:
+                open_slots = ", ".join(f"#{s}" for s in unclaimed)
+            else:
+                open_slots = f"{len(unclaimed)} slots"
+            lines.append(f"**Still open:** {open_slots}")
+        return "\n".join(lines)
 
     def build_content(self) -> str:
         expiry = f"**Expires** <t:{self._deadline_unix}:R>"
+        grab_rule = (
+            f"Each person may take up to **{self._max_grabs_per_user}** card(s)."
+            if self._max_grabs_per_user > 1
+            else "Each person may take **one** card."
+        )
         if self._private_pack:
             base = (
                 f"{self._opener_mention} opened a pack (**private** — only you see this).\n"
                 f"{expiry}\n"
-                "Tap **Take** on one slot to save it."
+                f"{grab_rule} Tap **Take** on a slot to save it."
             )
         else:
             base = (
                 f"{self._opener_mention} dropped cards, it's up for grabs!\n"
-                f"{expiry}"
+                f"{expiry}\n"
+                f"{grab_rule}"
             )
         if not self._slot_pid:
-            return base
-        # Plain text outside the embed so mobile clients can long-press the inline `code` to copy.
-        claimed_lines = ["", "**Claimed Card IDs** (long-press to copy):"]
-        for i in sorted(self._slot_pid):
-            uid = self._slot_claimer.get(i)
+            parts = [base, _pack_cards_listing(self._cards)]
+            if self._mission_block:
+                parts.append(self._mission_block.strip())
+            return "\n\n".join(parts)
+        parts = [base, self._compact_drop_summary()]
+        if self._mission_block:
+            parts.append(self._mission_block.strip())
+        return self._compose_with_claims(parts)
+
+    def _compose_with_claims(self, parts: list[str]) -> str:
+        """Append every claimed slot; trim only if still over Discord's 2000-char limit."""
+        header = "**Claimed** (long-press IDs to copy):"
+        ordered_slots = sorted(self._slot_pid)
+
+        def line_for(slot: int) -> str:
+            uid = self._slot_claimer.get(slot)
             who = f"<@{uid}>" if uid is not None else "?"
-            name = self._cards[i].name if 0 <= i < len(self._cards) else ""
-            name_part = f" {name} ·" if name else ""
-            claimed_lines.append(f"• #{i + 1} {who} ·{name_part} `{self._slot_pid[i]}`")
-        return base + "\n" + "\n".join(claimed_lines)
+            name = self._cards[slot].name if 0 <= slot < len(self._cards) else ""
+            name_part = f" · {name}" if name else ""
+            return f"• #{slot + 1} {who}{name_part} · `{self._slot_pid[slot]}`"
+
+        claim_lines = [line_for(s) for s in ordered_slots]
+        budget = self._DISCORD_CONTENT_LIMIT - self._CONTENT_SAFETY_BUFFER
+
+        def assemble(include_mission: bool, lines: list[str]) -> str:
+            body_parts = list(parts)
+            if not include_mission:
+                body_parts = [p for p in body_parts if p != (self._mission_block or "").strip()]
+            return "\n\n".join(body_parts + ["\n".join([header, *lines])])
+
+        candidate = assemble(True, claim_lines)
+        if len(candidate) > budget:
+            candidate = assemble(False, claim_lines)
+        if len(candidate) <= budget:
+            return candidate
+
+        head_text = assemble(False, []) + "\n"
+        remaining = budget - len(head_text)
+        kept_lines: list[str] = []
+        used = 0
+        hidden = 0
+        for slot in reversed(ordered_slots):
+            ln = line_for(slot)
+            cost = len(ln) + (1 if kept_lines else 0)
+            if used + cost <= remaining - 90:
+                kept_lines.append(ln)
+                used += cost
+            else:
+                hidden += 1
+        kept_lines.reverse()
+        if hidden:
+            note = (
+                f"_Showing the latest claims — **{hidden}** earlier hidden "
+                f"(**{len(ordered_slots)}** total). Discord 2000-char limit._"
+            )
+            kept_lines.insert(0, note)
+        return head_text + "\n".join(kept_lines)
+
+    async def _reply_ephemeral(self, interaction: discord.Interaction, text: str) -> None:
+        """Send a private notice using whichever response channel is still valid."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            _LOG.warning("Drop ephemeral reply failed for user=%s", interaction.user.id)
 
     async def try_claim(self, interaction: discord.Interaction, idx: int, button: discord.ui.Button) -> None:
+        uid = interaction.user.id
+        card = self._cards[idx] if 0 <= idx < len(self._cards) else None
+
+        # ---- Phase 1: validate + reserve the slot (under lock, no I/O). ----
         async with self._lock:
             if self._finished:
-                await interaction.response.send_message("This pack is already finished.", ephemeral=True)
+                await self._reply_ephemeral(interaction, "This pack is already finished.")
                 return
             now = int(time.time())
             if now >= self._deadline_unix:
-                await interaction.response.send_message("This pack has expired.", ephemeral=True)
+                await self._reply_ephemeral(interaction, "This pack has expired.")
                 return
-
-            uid = interaction.user.id
             if interaction.user.bot:
-                await interaction.response.send_message("Bots can’t claim cards.", ephemeral=True)
+                await self._reply_ephemeral(interaction, "Bots can’t claim cards.")
                 return
-            if uid in self._slot_claimer.values():
-                await interaction.response.send_message(
-                    "You already claimed **one** card from this pack.",
-                    ephemeral=True,
+            if card is None:
+                await self._reply_ephemeral(interaction, "That slot no longer exists.")
+                return
+            grabs = self._user_grab_count(uid)
+            if grabs >= self._max_grabs_per_user:
+                limit = self._max_grabs_per_user
+                msg = (
+                    "You already claimed **one** card from this pack."
+                    if limit == 1
+                    else f"You already claimed **{limit}** card(s) from this pack "
+                    "(your limit for this drop)."
                 )
+                await self._reply_ephemeral(interaction, msg)
                 return
             if idx in self._slot_claimer:
-                await interaction.response.send_message("That slot was already taken.", ephemeral=True)
+                await self._reply_ephemeral(interaction, "That slot was already taken.")
                 return
-
-            card = self._cards[idx]
-            drop = DropService()
-            try:
-                async with self._session_factory() as session:
-                    db_card = await session.get(Card, card.id)
-                    if db_card is None:
-                        await interaction.response.send_message(
-                            "That card no longer exists in the catalog.",
-                            ephemeral=True,
-                        )
-                        return
-                    drop_result = await drop.claim_card(
-                        session,
-                        discord_user_id=uid,
-                        card=db_card,
-                        source="drop",
-                    )
-                    await session.commit()
-            except SQLAlchemyError as exc:
-                await interaction.response.send_message(
-                    f"Could not save that card: {exc}",
-                    ephemeral=True,
-                )
-                return
-
+            # Tentative reservation — releases the lock immediately so the next
+            # clicker doesn't queue behind our DB write + Discord round-trip.
             self._slot_claimer[idx] = uid
+
+        # ---- Phase 2: DB work outside the lock. ----
+        drop_result = None
+        mission_notices: list = []
+        try:
+            async with self._session_factory() as session:
+                db_card = await session.get(Card, card.id)
+                if db_card is None:
+                    async with self._lock:
+                        if self._slot_claimer.get(idx) == uid:
+                            self._slot_claimer.pop(idx, None)
+                    await self._reply_ephemeral(
+                        interaction, "That card no longer exists in the catalog."
+                    )
+                    return
+                drop_result = await DropService().claim_card(
+                    session,
+                    discord_user_id=uid,
+                    card=db_card,
+                    source="drop",
+                )
+                try:
+                    mission_notices = await MissionService().record_drop_claim(
+                        session, uid, db_card,
+                    )
+                except Exception:
+                    _LOG.exception("mission record_drop_claim failed user=%s", uid)
+                    mission_notices = []
+                await session.commit()
+        except Exception:
+            _LOG.exception("drop claim db error user=%s card=%s", uid, card.id)
+            async with self._lock:
+                if self._slot_claimer.get(idx) == uid:
+                    self._slot_claimer.pop(idx, None)
+            await self._reply_ephemeral(
+                interaction, "Could not save that card — please try again."
+            )
+            return
+
+        # ---- Phase 3: finalize view + respond to the interaction. ----
+        async with self._lock:
             self._slot_pid[idx] = drop_result.public_id
             button.disabled = True
             button.style = discord.ButtonStyle.success
             button.label = _truncate(f"#{idx + 1} · Taken · {card.name}", 80)
-
             all_taken = len(self._slot_claimer) >= len(self._cards)
             if all_taken:
                 self._finished = True
                 for child in self.children:
                     child.disabled = True
                 self.stop()
-                extra = f"\n\n✅ **All {len(self._cards)} card(s) claimed.**"
-                await interaction.response.edit_message(
-                    content=self.build_content() + extra,
-                    view=self,
-                )
-            else:
-                await interaction.response.edit_message(
-                    content=self.build_content(),
-                    view=self,
-                )
+                msg_obj = getattr(self, "message", None)
+                if self._drop_host is not None and msg_obj is not None:
+                    asyncio.create_task(
+                        self._drop_host.clear_drop_persist(int(msg_obj.id), delete_row=True),
+                        name=f"drop-clear-{msg_obj.id}",
+                    )
+            extra = (
+                f"\n\n✅ **All {len(self._cards)} card(s) claimed.**" if all_taken else ""
+            )
+            new_content = self.full_content(extra)
 
+        # The interaction is still fresh because the lock only held in-memory state.
+        edited = False
+        try:
+            await interaction.response.edit_message(content=new_content, view=self)
+            edited = True
+        except discord.NotFound:
+            _LOG.warning(
+                "interaction token expired for user=%s claim; trying message.edit",
+                uid,
+            )
+        except discord.HTTPException:
+            _LOG.exception("response.edit_message failed for user=%s claim", uid)
+
+        if not edited:
+            msg_obj = getattr(self, "message", None) or interaction.message
+            if msg_obj is not None:
+                try:
+                    await msg_obj.edit(content=new_content, view=self)
+                except (discord.NotFound, discord.HTTPException):
+                    _LOG.exception(
+                        "message.edit fallback also failed for user=%s claim", uid
+                    )
+
+        # ---- Phase 4: post-claim hooks (must not break the claim). ----
+        if mission_notices:
+            mission_svc = MissionService()
+            for notice in mission_notices:
+                try:
+                    await interaction.followup.send(
+                        mission_svc.format_progress_notice(notice),
+                        ephemeral=False,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+
+        try:
             await _notify_wishlisters(
                 self._session_factory,
                 interaction,
@@ -1030,23 +1694,63 @@ class PackPickView(discord.ui.View):
                 card_name=card.name,
                 obtainer_id=uid,
             )
+        except Exception:
+            _LOG.exception("wishlist notify failed user=%s card=%s", uid, card.id)
+
+        if self._drop_host is not None:
+            try:
+                from poke_pon_bot.services.tutorial import notify_drop_claimed_for_tutorial
+
+                await notify_drop_claimed_for_tutorial(self._drop_host.bot, uid)
+            except Exception:
+                _LOG.exception("tutorial drop-claim hook failed user=%s", uid)
+
+        self._schedule_persist()
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        _LOG.exception(
+            "PackPickView item=%s raised for user=%s",
+            getattr(item, "label", item),
+            interaction.user.id,
+            exc_info=error,
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Something went wrong claiming that card — please try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "Something went wrong claiming that card — please try again.",
+                    ephemeral=True,
+                )
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     async def on_timeout(self) -> None:
         for child in self.children:
             child.disabled = True
         self._finished = True
         msg = getattr(self, "message", None)
-        if msg is None:
-            return
+        mid = int(msg.id) if msg is not None else None
+        host = self._drop_host
         extra = (
             "\n\n⏱ **Time's up** — unclaimed cards are gone.\n"
-            f"_Claimed **{len(self._slot_claimer)}** / **{len(self._cards)}**._"
+            f"_Claimed **{len(self._slot_pid)}** / **{len(self._cards)}**._"
         )
-        try:
-            base = self.build_content()
-            await msg.edit(content=base + extra, view=self)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        if msg is not None:
+            try:
+                await msg.edit(content=self.full_content(extra), view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        if host is not None and mid is not None:
+            await host.clear_drop_persist(mid, delete_row=True)
 
 
 _SCOPE = [
@@ -1056,14 +1760,134 @@ _SCOPE = [
 
 
 class GachaCog(commands.Cog):
-    """Weighted drops; chat commands (`pcd`, `cs`, `cv`, `pcolv`, `cevolve`) plus slash equivalents."""
+    """Weighted drops; chat commands (`ppcd`, `ppcs`, `ppcv`, `ppcolv`, `ppcevolve`) plus slash equivalents."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._wallet = WalletService()
         self._settings: Settings = bot.settings
-        self._drop_last_ts: dict[int, float] = {}
         self._drop_boost_cache: dict[int, tuple[bool, float]] = {}
+        self._active_drop_views: dict[int, PackPickView] = {}
+        self._drops_restored = False
+
+    def register_drop_view(self, view: PackPickView, *, message_id: int) -> None:
+        self._active_drop_views[int(message_id)] = view
+
+    def schedule_drop_persist(self, view: PackPickView) -> None:
+        asyncio.create_task(
+            self._persist_drop_view(view),
+            name=f"drop-persist-{getattr(view.message, 'id', '?')}",
+        )
+
+    async def _persist_drop_view(self, view: PackPickView) -> None:
+        from poke_pon_bot.services.drop_recovery import upsert_pending_drop
+
+        if view._private_pack or view.message is None or view._channel_id is None:
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                await upsert_pending_drop(
+                    session,
+                    view,
+                    channel_id=int(view._channel_id),
+                    guild_id=view._guild_id,
+                    content_prefix=view._content_prefix,
+                )
+                await session.commit()
+        except Exception:
+            _LOG.exception("persist channel drop failed msg=%s", getattr(view.message, "id", None))
+
+    async def clear_drop_persist(self, message_id: int, *, delete_row: bool = True) -> None:
+        from poke_pon_bot.services.drop_recovery import delete_pending_drop
+
+        self._active_drop_views.pop(int(message_id), None)
+        if not delete_row:
+            return
+        try:
+            async with self.bot.async_session_factory() as session:
+                await delete_pending_drop(session, int(message_id))
+                await session.commit()
+        except Exception:
+            _LOG.exception("clear pending drop failed msg=%s", message_id)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self._drops_restored:
+            return
+        self._drops_restored = True
+        await self.restore_channel_drops()
+
+    async def restore_channel_drops(self) -> None:
+        from poke_pon_bot.services.drop_recovery import (
+            _slot_maps_to_int,
+            finalize_expired_drop_row,
+            list_expired_pending_drops,
+            list_restorable_drops,
+            load_cards_for_drop,
+        )
+
+        restored = 0
+        expired = 0
+        async with self.bot.async_session_factory() as session:
+            for row in await list_expired_pending_drops(session):
+                await finalize_expired_drop_row(session, row, self.bot)
+                expired += 1
+            rows = await list_restorable_drops(session)
+            for row in rows:
+                remaining = int(row.deadline_unix) - int(time.time())
+                if remaining <= 0:
+                    await finalize_expired_drop_row(session, row, self.bot)
+                    expired += 1
+                    continue
+                cards = await load_cards_for_drop(session, list(row.card_ids))
+                if not cards:
+                    await finalize_expired_drop_row(session, row, self.bot)
+                    expired += 1
+                    continue
+                claimer, pids = _slot_maps_to_int(
+                    dict(row.slot_claimer or {}),
+                    dict(row.slot_public_ids or {}),
+                )
+                view = PackPickView(
+                    session_factory=self.bot.async_session_factory,
+                    issuer_id=int(row.issuer_id),
+                    opener_mention=str(row.opener_mention),
+                    cards=cards,
+                    deadline_unix=int(row.deadline_unix),
+                    private_pack=False,
+                    mission_block=str(row.mission_block or ""),
+                    max_grabs_per_user=int(row.max_grabs_per_user),
+                    claim_seconds=int(row.claim_seconds),
+                    restored_slot_claimer=claimer,
+                    restored_slot_pid=pids,
+                )
+                view.bind_drop_host(
+                    self,
+                    channel_id=int(row.channel_id),
+                    guild_id=row.guild_id,
+                    content_prefix=str(row.content_prefix or ""),
+                )
+                self.bot.add_view(view, message_id=int(row.message_id))
+                self.register_drop_view(view, message_id=int(row.message_id))
+                try:
+                    channel = self.bot.get_channel(int(row.channel_id))
+                    if channel is None:
+                        channel = await self.bot.fetch_channel(int(row.channel_id))
+                    if channel is not None:
+                        view.message = await channel.fetch_message(int(row.message_id))
+                except (discord.NotFound, discord.HTTPException):
+                    _LOG.warning(
+                        "Restored drop buttons for msg=%s but could not fetch message",
+                        row.message_id,
+                    )
+                restored += 1
+            await session.commit()
+        if restored or expired:
+            _LOG.info(
+                "Channel drop recovery: restored %s active drop(s), finalized %s expired.",
+                restored,
+                expired,
+            )
 
     def _invalidate_drop_boost_cache(self, user_id: int | None) -> None:
         if user_id is None:
@@ -1094,6 +1918,14 @@ class GachaCog(commands.Cog):
     async def _user_has_drop_boost(self, ctx: commands.Context, user_id: int) -> bool:
         if user_id in self._settings.drop_boost_test_user_ids:
             return True
+        try:
+            from poke_pon_bot.services.stripe_shop import user_has_stripe_drop_boost
+
+            async with self.bot.async_session_factory() as session:
+                if await user_has_stripe_drop_boost(session, discord_user_id=user_id):
+                    return True
+        except Exception:
+            _LOG.debug("stripe drop boost lookup failed user=%s", user_id, exc_info=True)
         sku = self._settings.discord_drop_boost_sku_id
         if sku is None:
             return False
@@ -1144,6 +1976,7 @@ class GachaCog(commands.Cog):
         rarity: str | None,
         pokedex: int | None,
         card_ref: str | None = None,
+        favorited_only: bool = False,
     ) -> None:
         """`cv c` after defer — optional **card_ref** = **Card ID** for ``owner_id``'s collection."""
         ephe = _hybrid_ephemeral(ctx)
@@ -1182,7 +2015,7 @@ class GachaCog(commands.Cog):
                         collection_owner_id=owner_id if peer else None,
                         viewer_id=viewer_id if peer else None,
                     )
-                    content = _card_id_message_line(inst.public_id)
+                    slab_files = await _graded_slab_files(session, embed, inst, card)
                     wishlisted = await is_wishlisted(
                         session, discord_user_id=viewer_id, card_id=card.id,
                     )
@@ -1193,13 +2026,24 @@ class GachaCog(commands.Cog):
                     ephemeral=ephe,
                 )
                 return
-            view = SingleCardWishlistView(
+            view = _single_card_actions_view(
                 session_factory=self.bot.async_session_factory,
-                card_id=card.id,
+                inst=inst,
+                card=card,
                 viewer_id=viewer_id,
+                owner_id=owner_id,
                 wishlisted=wishlisted,
+                rank_note="**cv c** by **card_ref** (Card ID).",
+                collection_owner_id=owner_id if peer else None,
             )
-            await ctx.send(content=content, embed=embed, view=view, ephemeral=ephe)
+            await _send_collection_card(
+                ctx,
+                embed=embed,
+                public_id=inst.public_id,
+                view=view,
+                files=slab_files,
+                ephemeral=ephe,
+            )
             return
 
         if not any_filter_set(
@@ -1208,9 +2052,10 @@ class GachaCog(commands.Cog):
             pokedex=pokedex,
             slot=slot,
             public_id=None,
+            favorited_only=favorited_only,
         ):
             await ctx.send(
-                f"Use **`slot`** (e.g. **1** for newest match), **`card_ref`** (**Card ID**), and/or "
+                f"Use **`slot`** (e.g. **1** for newest match), **`card_ref`** (**Card ID**), **`favorited`**, and/or "
                 f"**`name`** / **`rarity`** / **`pokedex`** (searching **{poss}** collection).",
                 ephemeral=ephe,
             )
@@ -1226,6 +2071,7 @@ class GachaCog(commands.Cog):
                     pokedex=pokedex,
                     slot=slot,
                     page_limit=1,
+                    favorited_only=favorited_only,
                 )
             else:
                 rows, total = await search_collection(
@@ -1236,6 +2082,7 @@ class GachaCog(commands.Cog):
                     pokedex=pokedex,
                     slot=None,
                     page_limit=2,
+                    favorited_only=favorited_only,
                 )
 
         if total == 0:
@@ -1277,31 +2124,95 @@ class GachaCog(commands.Cog):
             )
             async with self.bot.async_session_factory() as s2:
                 w = await is_wishlisted(s2, discord_user_id=viewer_id, card_id=card.id)
-            view = SingleCardWishlistView(
+                slab_files = await _graded_slab_files(s2, embed, inst, card)
+            view = _single_card_actions_view(
                 session_factory=self.bot.async_session_factory,
-                card_id=card.id,
+                inst=inst,
+                card=card,
                 viewer_id=viewer_id,
+                owner_id=owner_id,
                 wishlisted=w,
+                rank_note=note,
+                collection_owner_id=owner_id if peer else None,
             )
-            await ctx.send(
-                content=_card_id_message_line(inst.public_id),
+            await _send_collection_card(
+                ctx,
                 embed=embed,
+                public_id=inst.public_id,
                 view=view,
+                files=slab_files,
                 ephemeral=ephe,
             )
             return
 
-        if total > 1:
-            await ctx.send(
-                (
-                    f"{subj} has **{total}** cards matching those filters. Add **`slot`** "
-                    f"(**1**–**{total}**, **1** = newest) or **`card_ref`** / narrow filters. "
-                    "Use **`/cs c`** or **`cs c`** (reply or same filters) to list."
-                    if peer
-                    else f"You have **{total}** cards matching those filters. Add **`slot`** "
-                    f"(**1**–**{total}**, **1** = newest) or **`card_ref`** / narrow filters. "
-                    "Use **`/cs c`** or in chat **`cs c`** to list with the same filters."
-                ),
+        if total > 1 and slot is None:
+            try:
+                async with self.bot.async_session_factory() as session:
+                    ids, flip_total = await list_collection_instance_ids(
+                        session,
+                        discord_user_id=owner_id,
+                        name_contains=name,
+                        rarity_contains=rarity,
+                        pokedex=pokedex,
+                        favorited_only=favorited_only,
+                    )
+                    if not ids:
+                        await ctx.send(
+                            "Could not load matching cards. Try again.",
+                            ephemeral=ephe,
+                        )
+                        return
+                    row0 = await _load_instance_and_card(session, ids[0], owner_id)
+                    if row0 is None:
+                        await ctx.send(
+                            "Could not load that collection. Try again.",
+                            ephemeral=ephe,
+                        )
+                        return
+                    inst0, card0 = row0
+                    first_wishlisted = await is_wishlisted(
+                        session, discord_user_id=viewer_id, card_id=card0.id,
+                    )
+                    filt_note = " · **favorited**" if favorited_only else ""
+                    cap_note = ""
+                    if flip_total > len(ids):
+                        cap_note = (
+                            f" Showing **{len(ids)}** of **{flip_total}** matches"
+                            f" (cap **{_CV_FLIP_INSTANCE_CAP}**)."
+                        )
+                    rank_note = (
+                        f"**cv c** flip — **{len(ids)}** match(es){filt_note} (newest first).{cap_note}"
+                    )
+                    embed = _collection_view_embed(
+                        inst0,
+                        card0,
+                        rank_note=rank_note,
+                        collection_owner_id=owner_id,
+                        viewer_id=viewer_id,
+                    )
+                    slab_files = await _graded_slab_files(session, embed, inst0, card0)
+            except SQLAlchemyError:
+                _LOG.exception("cv c flip browse owner %s viewer %s", owner_id, viewer_id)
+                await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
+                return
+
+            view = CollectionFlipView(
+                session_factory=self.bot.async_session_factory,
+                owner_id=owner_id,
+                viewer_id=viewer_id,
+                instance_ids=ids,
+                first_card_id=card0.id,
+                first_wishlisted=first_wishlisted,
+                first_favorited=bool(inst0.is_favorite),
+                show_favorite=(owner_id == viewer_id),
+            )
+            await _send_collection_card(
+                ctx,
+                embed=embed,
+                public_id=inst0.public_id,
+                view=view,
+                files=slab_files,
+                content=_collection_web_footer().lstrip(),
                 ephemeral=ephe,
             )
             return
@@ -1327,22 +2238,34 @@ class GachaCog(commands.Cog):
         )
         async with self.bot.async_session_factory() as s2:
             w = await is_wishlisted(s2, discord_user_id=viewer_id, card_id=card.id)
-        view = SingleCardWishlistView(
+            slab_files = await _graded_slab_files(s2, embed, inst, card)
+        view = _single_card_actions_view(
             session_factory=self.bot.async_session_factory,
-            card_id=card.id,
+            inst=inst,
+            card=card,
             viewer_id=viewer_id,
+            owner_id=owner_id,
             wishlisted=w,
+            rank_note=(
+                "Only one card matched those filters."
+                if peer
+                else "Only one card matched your filters."
+            ),
+            collection_owner_id=owner_id if peer else None,
         )
-        await ctx.send(
-            content=_card_id_message_line(inst.public_id),
+        await _send_collection_card(
+            ctx,
             embed=embed,
+            public_id=inst.public_id,
             view=view,
+            files=slab_files,
             ephemeral=ephe,
         )
 
     @commands.hybrid_command(
         name="cs",
-        description="Search: global (g) or your collection (c) — chat: cs",
+        aliases=[pp_alias("cs")],
+        description="Search: global (g) or your collection (c) — chat: ppcs",
     )
     @app_commands.choices(scope=_SCOPE)
     @app_commands.describe(
@@ -1356,6 +2279,7 @@ class GachaCog(commands.Cog):
         supertype="**g** only: e.g. Pokémon, Trainer, Energy",
         rarity_tier="**g** only: drop tier (substring, e.g. ultra_rare)",
         slot="**c** only: **1** = newest among your matches; narrows the list to one row",
+        favorited="**c** only — limit list to copies you starred (💛)",
         limit="**g** / **c**: max rows in the list (for **c**, ignored when **slot** is set)",
     )
     async def cs(
@@ -1371,6 +2295,7 @@ class GachaCog(commands.Cog):
         supertype: str | None = None,
         rarity_tier: str | None = None,
         slot: app_commands.Range[int, 1, 10_000] | None = None,
+        favorited: bool | None = None,
         limit: app_commands.Range[int, 1, 25] = 15,
     ) -> None:
         if ctx.interaction:
@@ -1380,6 +2305,7 @@ class GachaCog(commands.Cog):
             return
         ephe = _hybrid_ephemeral(ctx)
         uid = ctx.author.id
+        card_ref, name = _coerce_chat_catalog_name_filter(ctx, scope, card_ref, name)
         tcg = card_ref if scope == "g" and card_ref and card_ref.strip() else None
         pub = card_ref if scope == "c" and card_ref and card_ref.strip() else None
         if scope == "g":
@@ -1437,15 +2363,17 @@ class GachaCog(commands.Cog):
             body = _truncate(header + "\n".join(lines) + extra, 2000)
             await ctx.send(body, ephemeral=ephe)
             return
+        fav_only = bool(favorited) if scope == "c" else False
         if not any_filter_set(
             name_contains=name,
             rarity_contains=rarity,
             pokedex=pokedex,
             slot=slot,
             public_id=pub,
+            favorited_only=fav_only,
         ):
             await ctx.send(
-                "Add at least one of **`name`**, **`rarity`**, **`pokedex`**, **`slot`**, or **`card_ref`** (Card ID).",
+                "Add at least one of **`name`**, **`rarity`**, **`pokedex`**, **`slot`**, **`favorited`**, or **`card_ref`** (Card ID).",
                 ephemeral=ephe,
             )
             return
@@ -1466,6 +2394,7 @@ class GachaCog(commands.Cog):
                     slot=slot,
                     public_id=pub,
                     page_limit=int(limit),
+                    favorited_only=fav_only,
                 )
         except SQLAlchemyError:
             _LOG.exception("cs c for user %s", uid)
@@ -1508,7 +2437,8 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="cv",
-        description="Card view (g) or your copy (c) — chat: cv",
+        aliases=[pp_alias("cv")],
+        description="Card view (g) or your copy (c) — chat: ppcv",
     )
     @app_commands.choices(scope=_SCOPE)
     @app_commands.describe(
@@ -1518,6 +2448,8 @@ class GachaCog(commands.Cog):
         name="**g** / **c**",
         rarity="**g** / **c**",
         pokedex="**g** / **c**",
+        favorited="**c** only — copies you starred (💛)",
+        wishlist="**g** only — catalog printings on your wishlist (⭐)",
         set_code="**g** only",
         set_name="**g** only",
         supertype="**g** only",
@@ -1532,6 +2464,8 @@ class GachaCog(commands.Cog):
         name: str | None = None,
         rarity: str | None = None,
         pokedex: int | None = None,
+        favorited: bool | None = None,
+        wishlist: bool | None = None,
         set_code: str | None = None,
         set_name: str | None = None,
         supertype: str | None = None,
@@ -1543,10 +2477,19 @@ class GachaCog(commands.Cog):
             await ctx.send("**scope** must be **g** or **c**.", ephemeral=False)
             return
         ephe = _hybrid_ephemeral(ctx)
+        card_ref, name = _coerce_chat_catalog_name_filter(ctx, scope, card_ref, name)
         viewer_id = ctx.author.id
         reply_owner = await reply_target_user_id(self.bot, ctx)
         owner_id = reply_owner if reply_owner is not None else viewer_id
+        fav_only = bool(favorited)
+        wl_only = bool(wishlist)
         if scope == "c":
+            if wl_only:
+                await ctx.send(
+                    "**Wishlist** is for **`cv g`** (catalog). Use **`favorited`** on **`cv c`** for copies you starred.",
+                    ephemeral=ephe,
+                )
+                return
             await self._collection_view_execute(
                 ctx,
                 owner_id=owner_id,
@@ -1556,9 +2499,71 @@ class GachaCog(commands.Cog):
                 rarity=rarity,
                 pokedex=pokedex,
                 card_ref=card_ref,
+                favorited_only=fav_only,
+            )
+            return
+        if fav_only:
+            await ctx.send(
+                "**Favorited** is for **`cv c`** (your copies). Use **`wishlist`** on **`cv g`** for catalog stars.",
+                ephemeral=ephe,
             )
             return
         tcg = card_ref.strip() if card_ref and card_ref.strip() else None
+        if wl_only:
+            try:
+                async with self.bot.async_session_factory() as session:
+                    card_ids, wl_total = await list_wishlist_card_ids(
+                        session, viewer_id, max_ids=CATALOG_BROWSE_PAGE_CAP,
+                    )
+            except SQLAlchemyError:
+                _LOG.exception("cv g wishlist for user %s", viewer_id)
+                await ctx.send("Could not load your wishlist. Try again later.", ephemeral=ephe)
+                return
+            if wl_total == 0:
+                await ctx.send(
+                    "Your **wishlist** is empty — star catalog cards with **⭐** on **`cv g`** views.",
+                    ephemeral=ephe,
+                )
+                return
+            if slot is not None and int(slot) > wl_total:
+                await ctx.send(
+                    f"Only **{wl_total}** wishlisted printing(s); **slot** must be **1**–**{wl_total}**.",
+                    ephemeral=ephe,
+                )
+                return
+            start_idx = 0 if slot is None else int(slot) - 1
+            if not (0 <= start_idx < len(card_ids)):
+                await ctx.send("Invalid **slot** for your wishlist.", ephemeral=ephe)
+                return
+            show_id = card_ids[start_idx]
+            try:
+                async with self.bot.async_session_factory() as session:
+                    card0 = await session.get(Card, show_id)
+                    if card0 is None:
+                        await ctx.send("That wishlisted card is no longer in the catalog.", ephemeral=ephe)
+                        return
+            except SQLAlchemyError:
+                _LOG.exception("cv g wishlist card load")
+                await ctx.send("Could not load that card. Try again later.", ephemeral=ephe)
+                return
+            view = CatalogBrowseView(
+                session_factory=self.bot.async_session_factory,
+                owner_id=viewer_id,
+                card_ids=card_ids,
+                search_total=wl_total,
+            )
+            view.set_index(start_idx)
+            note = (
+                f"Wishlist **#{start_idx + 1}** of **{len(card_ids)}** shown"
+                + (f" (**{wl_total}** total)" if wl_total > len(card_ids) else "")
+                + " — newest starred first."
+            )
+            await ctx.send(
+                embed=_catalog_view_embed(card0, rank_note=note),
+                view=view,
+                ephemeral=ephe,
+            )
+            return
         if not any_catalog_content_filter_set(
             name_contains=name,
             rarity_contains=rarity,
@@ -1644,92 +2649,104 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="colv",
-        aliases=["pcolv"],
-        description="Flip through your collection (◀▶) — chat: pcolv (or colv)",
+        aliases=[pp_alias("colv")],
+        description="Flip through your collection (◀▶) — chat: ppolv",
     )
     @app_commands.describe(
         member="Whose collection to browse — omit for yours",
-        limit="Cap cards to flip through, newest first (omit to flip through the whole collection)",
+        limit="Cap cards to flip through, newest first (default **500**, max **1000**)",
     )
     async def collection_flip(
         self,
         ctx: commands.Context,
         member: discord.Member | None = None,
-        # Omitting ``limit`` flips through the entire collection, newest → first claimed.
-        # Range cap is a sanity guard for the rare user who actually types a number — the
-        # uncapped path goes through `limit is None`.
         limit: app_commands.Range[int, 1, 1000] | None = None,
     ) -> None:
         if ctx.interaction:
             await ctx.defer(ephemeral=False)
         ephe = _hybrid_ephemeral(ctx)
-        viewer_id = ctx.author.id
-        target = await resolve_collection_display_target(self.bot, ctx, member_param=member)
-        if target.bot:
-            await ctx.send("Bots don’t have collections.", ephemeral=ephe)
-            return
-        owner_id = int(target.id)
-        lim = int(limit) if limit is not None else None
         try:
+            viewer_id = ctx.author.id
+            target = await resolve_collection_display_target(self.bot, ctx, member_param=member)
+            if target.bot:
+                await ctx.send("Bots don’t have collections.", ephemeral=ephe)
+                return
+            owner_id = int(target.id)
+            fetch_cap = (
+                min(int(limit), _COLV_FLIP_INSTANCE_CAP)
+                if limit is not None
+                else _CV_FLIP_INSTANCE_CAP
+            )
             async with self.bot.async_session_factory() as session:
-                stmt = (
-                    select(UserCardInstance.id)
-                    .where(
-                        UserCardInstance.discord_user_id == owner_id,
-                        user_instance_not_in_active_auction(),
-                    )
-                    .order_by(UserCardInstance.obtained_at.desc())
+                ids, coll_total = await list_collection_instance_ids(
+                    session,
+                    discord_user_id=owner_id,
+                    max_ids=fetch_cap,
                 )
-                if lim is not None:
-                    stmt = stmt.limit(lim)
-                res = await session.execute(stmt)
-                ids = [int(r[0]) for r in res.all()]
                 if not ids:
                     if owner_id != viewer_id:
-                        await ctx.send(f"<@{owner_id}> has an empty collection. **`pcd`**", ephemeral=ephe)
+                        await ctx.send(
+                            f"<@{owner_id}> has an empty collection. **`ppcd`**",
+                            ephemeral=ephe,
+                        )
                     else:
-                        await ctx.send("You have an empty collection. **`pcd`**", ephemeral=ephe)
+                        await ctx.send("You have an empty collection. **`ppcd`**", ephemeral=ephe)
                     return
                 row0 = await _load_instance_and_card(session, ids[0], owner_id)
                 if row0 is None:
                     await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
                     return
                 inst0, card0 = row0
+                rank_note = CollectionFlipView._rank_note(0, len(ids))
+                if coll_total > len(ids):
+                    rank_note += (
+                        f" · showing **{len(ids)}** of **{coll_total}**"
+                        f" (cap **{fetch_cap}**; use **`limit`** to raise)"
+                    )
                 embed = _collection_view_embed(
                     inst0,
                     card0,
-                    rank_note=CollectionFlipView._rank_note(0, len(ids)),
+                    rank_note=rank_note,
                     collection_owner_id=owner_id,
                     viewer_id=viewer_id,
                 )
-                first_pid = inst0.public_id
+                slab_files = await _graded_slab_files(session, embed, inst0, card0)
+                first_card_id = int(card0.id)
                 first_wishlisted = await is_wishlisted(
                     session, discord_user_id=viewer_id, card_id=card0.id,
                 )
-        except SQLAlchemyError:
-            _LOG.exception("colv for owner %s viewer %s", owner_id, viewer_id)
-            await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
-            return
+                first_favorited = bool(getattr(inst0, "is_favorite", False))
 
-        view = CollectionFlipView(
-            session_factory=self.bot.async_session_factory,
-            owner_id=owner_id,
-            viewer_id=viewer_id,
-            instance_ids=ids,
-            first_card_id=card0.id,
-            first_wishlisted=first_wishlisted,
-        )
-        await ctx.send(
-            content=_card_id_message_line(first_pid) + _collection_web_footer(),
-            embed=embed,
-            view=view,
-            ephemeral=ephe,
-        )
+            view = CollectionFlipView(
+                session_factory=self.bot.async_session_factory,
+                owner_id=owner_id,
+                viewer_id=viewer_id,
+                instance_ids=ids,
+                first_card_id=first_card_id,
+                first_wishlisted=first_wishlisted,
+                first_favorited=first_favorited,
+                show_favorite=(owner_id == viewer_id),
+            )
+            await _send_collection_card(
+                ctx,
+                embed=embed,
+                public_id=inst0.public_id,
+                view=view,
+                files=slab_files,
+                content=_collection_web_footer().lstrip(),
+                ephemeral=ephe,
+            )
+        except SQLAlchemyError:
+            _LOG.exception("colv database error for %s", ctx.author.id)
+            await ctx.send("Could not load that collection. Try again.", ephemeral=ephe)
+        except Exception:
+            _LOG.exception("colv failed for %s", ctx.author.id)
+            await reply_command_failure(ctx)
 
     @commands.hybrid_command(
         name="coll",
-        aliases=["pcoll"],
-        description="Collection text list (◀▶) — chat: pcoll (or coll)",
+        aliases=[pp_alias("coll")],
+        description="Collection text list (◀▶) — chat: ppcoll",
     )
     @app_commands.describe(
         member="Whose collection to list — omit for yours",
@@ -1772,9 +2789,9 @@ class GachaCog(commands.Cog):
 
         if not pairs:
             if owner_id != viewer_id:
-                await ctx.send(f"<@{owner_id}> has an empty collection. **`pcd`**", ephemeral=ephe)
+                await ctx.send(f"<@{owner_id}> has an empty collection. **`ppcd`**", ephemeral=ephe)
             else:
-                await ctx.send("You have an empty collection. **`pcd`**", ephemeral=ephe)
+                await ctx.send("You have an empty collection. **`ppcd`**", ephemeral=ephe)
             return
 
         header = ""
@@ -1789,6 +2806,7 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="cevolve",
+        aliases=[pp_alias("cevolve")],
         description="Evolve a saved copy (by Card ID) — chat: cevolve",
     )
     @app_commands.describe(
@@ -1824,6 +2842,12 @@ class GachaCog(commands.Cog):
                     )
                     return
                 inst, card = row
+                blocked = await collection_sell_block_reason(
+                    session, discord_user_id=uid, instance_id=inst.id,
+                )
+                if blocked:
+                    await ctx.send(blocked, ephemeral=ephe)
+                    return
                 targets = await resolve_evolution_targets(session, card)
                 if not targets:
                     await ctx.send(
@@ -1880,25 +2904,38 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="drop_boost",
-        description="Half drop cooldown — buy the durable SKU in Discord (optional)",
+        aliases=[pp_alias("drop_boost")],
+        description="Half drop cooldown — buy once on the website shop (or legacy Discord SKU)",
     )
     async def drop_boost_shop(self, ctx: commands.Context) -> None:
         if ctx.interaction:
             await ctx.defer(ephemeral=True)
-        sku = self._settings.discord_drop_boost_sku_id
-        if sku is None:
+        base = self._settings.drop_cooldown_base_seconds
+        prem = self._settings.drop_cooldown_premium_seconds
+        stripe_price = (self._settings.stripe_price_ids or {}).get("half_drop_cooldown")
+        if stripe_price:
+            from poke_pon_bot.web.frontend_urls import shop_page_url
+
             await ctx.send(
-                "Drop boost isn’t configured (`DISCORD_DROP_BOOST_SKU_ID`).",
+                "**Half drop cooldown** — one-time purchase: after checkout, your **`/cd`** / **`ppcd`** wait drops from "
+                f"{_fmt_cd_sentence(base)} to {_fmt_cd_sentence(prem)} permanently.\n"
+                f"Buy on the website: **{shop_page_url(self._settings)}** (Perks section).",
                 ephemeral=True,
             )
             return
-        base = self._settings.drop_cooldown_base_seconds
-        prem = self._settings.drop_cooldown_premium_seconds
+        sku = self._settings.discord_drop_boost_sku_id
+        if sku is None:
+            await ctx.send(
+                "Drop boost isn’t configured. Add **STRIPE_PRICE_HALF_DROP_COOLDOWN** on the bot "
+                "or **DISCORD_DROP_BOOST_SKU_ID** for the legacy Discord SKU.",
+                ephemeral=True,
+            )
+            return
         try:
             await ctx.send(
-                "**Half drop cooldown** — one-time purchase: after checkout, your **`/cd`** / **`pcd`** wait drops from "
+                "**Half drop cooldown** — one-time purchase: after checkout, your **`/cd`** / **`ppcd`** wait drops from "
                 f"{_fmt_cd_sentence(base)} to {_fmt_cd_sentence(prem)}.\n"
-                "Tap **Buy** below to open Discord’s purchase flow.",
+                "Tap **Buy** below to open Discord’s purchase flow (legacy).",
                 view=_DropBoostShopView(sku_id=sku),
                 ephemeral=True,
             )
@@ -1925,10 +2962,153 @@ class GachaCog(commands.Cog):
                 return
             raise
 
+    async def run_card_drop(
+        self,
+        ctx: commands.Context,
+        *,
+        is_private: bool,
+        skip_cooldown: bool = False,
+        card_count: int | None = None,
+        luck_percent: float = 0.0,
+        apply_drop_accounting: bool = True,
+        content_header: str = "",
+        max_grabs_per_user: int = 1,
+        claim_seconds: int | None = None,
+    ) -> None:
+        """Shared ``/cd`` pack flow (collage, claim buttons, missions, wishlist pings)."""
+        uid = ctx.author.id
+        if apply_drop_accounting and not skip_cooldown:
+            per = await self._effective_drop_cooldown_seconds(ctx, uid)
+            now = time.time()
+            async with self.bot.async_session_factory() as session:
+                last_dt = await self._wallet.get_last_drop_at(session, uid)
+                last = last_dt.timestamp() if last_dt is not None else 0.0
+                if last and now - last < per:
+                    msg = _drop_cooldown_message(per - (now - last), per_seconds=per)
+                    if ctx.interaction is not None and not ctx.interaction.response.is_done():
+                        await ctx.interaction.response.send_message(
+                            msg, ephemeral=_hybrid_ephemeral(ctx)
+                        )
+                    else:
+                        await ctx.send(msg, ephemeral=_hybrid_ephemeral(ctx))
+                    return
+                await self._wallet.record_drop(session, uid)
+                await MissionService().record_drop_use(session, uid)
+                await session.commit()
+
+            referral_notice = await record_referral_cd_use(self.bot.async_session_factory, uid)
+            if referral_notice is not None:
+                await notify_referral_reward(self.bot, referral_notice)
+
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer(ephemeral=is_private)
+
+        drop = DropService()
+        guild_id = ctx.guild.id if ctx.guild is not None else None
+        theme_line = ""
+        luck_line = ""
+        async with self.bot.async_session_factory() as session:
+            try:
+                theme = await resolve_active_cd_drop_theme(session, guild_id)
+                theme_line = format_theme_status_line(theme)
+                luck_row = None
+                if guild_id is not None:
+                    luck_row = await get_luck_boost_row(session, guild_id=guild_id)
+                if luck_row is None:
+                    luck_row = await get_luck_boost_row(session, guild_id=None)
+                scope = (
+                    f"server {guild_id}"
+                    if luck_row is not None and luck_row.guild_id is not None
+                    else "global"
+                )
+                luck_pct = await resolve_active_rarity_luck_boost(session, guild_id)
+                luck_line = format_luck_boost_line(luck_pct, scope_label=scope)
+                pack = await drop.roll_pack(
+                    session,
+                    drop_table_code="default",
+                    card_count=card_count,
+                    luck_percent=luck_percent,
+                    guild_id=guild_id,
+                )
+            except RuntimeError as exc:
+                await ctx.send(str(exc), ephemeral=False)
+                return
+            except LookupError as exc:
+                await ctx.send(str(exc), ephemeral=False)
+                return
+            except ValueError as exc:
+                await ctx.send(str(exc), ephemeral=False)
+                return
+
+        is_slash = ctx.interaction is not None
+        private_reply = is_slash and is_private
+        claim_secs = _PACK_CLAIM_SECONDS if claim_seconds is None else max(30, int(claim_seconds))
+        deadline_unix = int(time.time()) + claim_secs
+        mission_block = ""
+        try:
+            async with self.bot.async_session_factory() as session:
+                alerts = await MissionService().find_pack_mission_alerts(session, pack)
+            mission_block = _pack_mission_block(
+                alerts,
+                guild=ctx.guild,
+                private_pack=private_reply,
+                viewer_id=uid,
+            )
+        except SQLAlchemyError:
+            _LOG.exception("pack mission alerts for drop user=%s", uid)
+        view = PackPickView(
+            session_factory=self.bot.async_session_factory,
+            issuer_id=ctx.author.id,
+            opener_mention=ctx.author.mention,
+            cards=pack,
+            deadline_unix=deadline_unix,
+            private_pack=private_reply,
+            mission_block=mission_block,
+            max_grabs_per_user=max_grabs_per_user,
+            claim_seconds=claim_secs,
+        )
+        try:
+            png = await render_pack_collage_png(pack)
+        except (OSError, ValueError, httpx.HTTPError):
+            png = None
+        content = view.build_content()
+        header_parts = [
+            p for p in (theme_line.strip(), luck_line.strip(), content_header.strip()) if p
+        ]
+        if header_parts:
+            content = "\n\n".join(header_parts) + f"\n\n{content}"
+        if png is not None:
+            file = discord.File(png, filename="pack.png")
+            msg = await ctx.send(
+                content=content,
+                file=file,
+                ephemeral=private_reply,
+                view=view,
+            )
+            view.message = msg
+        else:
+            msg = await ctx.send(
+                content=content + "\n\n*(Could not build card collage.)*",
+                ephemeral=private_reply,
+                view=view,
+            )
+            view.message = msg
+
+        if not private_reply and msg.channel is not None:
+            prefix = "\n\n".join(header_parts) if header_parts else ""
+            view.bind_drop_host(
+                self,
+                channel_id=int(msg.channel.id),
+                guild_id=guild_id,
+                content_prefix=prefix,
+            )
+            self.register_drop_view(view, message_id=int(msg.id))
+            await self._persist_drop_view(view)
+
     @commands.hybrid_command(
         name="cd",
-        aliases=["pcd"],
-        description="Card drop (open a pack) — chat: pcd (or cd)",
+        aliases=[pp_alias("cd")],
+        description="Card drop (open a pack) — chat: ppcd",
     )
     @app_commands.describe(
         private="Pick this option (slash only) to make the pack visible to you only.",
@@ -1940,74 +3120,11 @@ class GachaCog(commands.Cog):
         # ephemeral mode without the True/False follow-up that bools force.
         private: Literal["yes"] | None = None,
     ) -> None:
-        is_private = private == "yes"
-        uid = ctx.author.id
-        per = await self._effective_drop_cooldown_seconds(ctx, uid)
-        now = time.time()
-        last = self._drop_last_ts.get(uid, 0.0)
-        if last and now - last < per:
-            msg = _drop_cooldown_message(per - (now - last), per_seconds=per)
-            if ctx.interaction is not None and not ctx.interaction.response.is_done():
-                await ctx.interaction.response.send_message(msg, ephemeral=_hybrid_ephemeral(ctx))
-            else:
-                await ctx.send(msg, ephemeral=_hybrid_ephemeral(ctx))
-            return
-        self._drop_last_ts[uid] = now
-
-        if ctx.interaction:
-            await ctx.defer(ephemeral=is_private)
-        drop = DropService()
-        async with self.bot.async_session_factory() as session:
-            try:
-                pack = await drop.roll_pack(session, drop_table_code="default")
-            except RuntimeError as exc:
-                await ctx.send(str(exc), ephemeral=False)
-                return
-            except LookupError as exc:
-                await ctx.send(str(exc), ephemeral=False)
-                return
-
-        is_slash = ctx.interaction is not None
-        private_reply = is_slash and is_private
-        deadline_unix = int(time.time()) + _PACK_CLAIM_SECONDS
-        view = PackPickView(
-            session_factory=self.bot.async_session_factory,
-            issuer_id=ctx.author.id,
-            opener_mention=ctx.author.mention,
-            cards=pack,
-            deadline_unix=deadline_unix,
-            private_pack=private_reply,
-        )
-        try:
-            png = await render_pack_collage_png(pack)
-        except (OSError, ValueError, httpx.HTTPError):
-            png = None
-        content = view.build_content()
-        if png is not None:
-            file = discord.File(png, filename="pack.png")
-            msg = await ctx.send(
-                content=content,
-                file=file,
-                ephemeral=private_reply,
-                view=view,
-            )
-            view.message = msg
-        else:
-            # No collage — append a plain-text card list so the message still shows what dropped.
-            fallback = "\n".join(
-                f"**#{i + 1}** {c.name} — *{c.tcg_rarity or '?'}* · {c.set_name} #{c.collector_number}"
-                for i, c in enumerate(pack)
-            )
-            msg = await ctx.send(
-                content=content + "\n*(Could not build card collage.)*\n" + fallback,
-                ephemeral=private_reply,
-                view=view,
-            )
-            view.message = msg
+        await self.run_card_drop(ctx, is_private=private == "yes")
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(GachaCog(bot))
     _LOG.info(
-        "Loaded gacha cog: `pcd`, `/drop_boost`, `/cd`, `/cs`, `/cv`, `/colv`, `/coll`, `/cevolve`."
+        "Loaded gacha cog: `ppcd`, `/drop_boost`, `/cd`, `/cs`, `/cv`, `/colv`, `/coll`, `/cevolve`."
     )
 

@@ -14,6 +14,7 @@ import discord
 from discord.errors import DiscordServerError, HTTPException, LoginFailure
 from discord.ext import commands
 
+from poke_pon_bot.chat_commands import chat_command_token_count, is_official_guild
 from poke_pon_bot.config import Settings, load_settings
 from poke_pon_bot.db.session import async_session_factory, create_engine_from_url
 
@@ -156,30 +157,21 @@ def _run_alembic_upgrade_head(database_url: str) -> None:
 
 
 async def _dynamic_prefix(bot: commands.Bot, message: discord.Message) -> list[str]:
-    """Allow chat commands to be invoked by **typing the command name directly**.
+    """Allow chat commands via **pp**-prefixed names (``ppcd``, ``ppdaily``, …).
 
-    Users can type ``cd``, ``coll``, ``packd``, ``trade``, … in chat — no extra ``c``
-    prefix required. We dynamically inject an empty-string prefix when the message's
-    first whitespace-separated token matches a registered (hybrid/prefix) command
-    name or alias. Bot mentions also work everywhere.
-
-    Returning an empty-string prefix only when the first word is known prevents the
-    bot from re-parsing every line of chat as a potential command (which would be
-    both noisy and a tiny perf hit).
+    In the official server (``TUTORIAL_GUILD_ID``), bare names like ``balance`` or
+    ``deck edit`` also work. Slash commands always use Discord's ``/`` menu.
+    Bot mentions also work everywhere.
     """
     base = commands.when_mentioned(bot, message)
     content = (message.content or "").lstrip()
     if not content:
         return base
-    first = content.split(None, 1)[0]
-    # Strip a leading slash so that someone copying ``/cd`` from Discord's slash
-    # command preview still triggers the same prefix command in chat.
-    if first.startswith("/"):
-        first = first[1:]
-    if not first:
-        return base
-    # ``case_insensitive=True`` on the Bot means lookups should ignore case.
-    if bot.get_command(first.lower()) is not None:
+    allow_bare = is_official_guild(
+        message.guild.id if message.guild is not None else None,
+        bot.settings.tutorial_guild_id,
+    )
+    if chat_command_token_count(bot, content, allow_bare_names=allow_bare) > 0:
         return [*base, ""]
     return base
 
@@ -195,9 +187,9 @@ class PokePonBot(commands.Bot):
             # **Message Content Intent** (not OAuth2 URL Generator scopes, not the invite permissions grid).
             intents.message_content = True
         super().__init__(
-            # Chat: **pc**-prefixed names (``pcd``, ``pcoll``, ``pcpd`` for /pd, ``packd``, …).
+            # Chat: **pp**-prefixed names (``ppcd``, ``ppcoll``, ``pppd`` for /pd, …).
             # Mentions also work. The dynamic prefix only treats the message as a
-            # command when its first token matches a registered command/alias.
+            # command when its first token(s) match a registered ``pp`` alias.
             command_prefix=_dynamic_prefix,
             case_insensitive=True,
             intents=intents,
@@ -213,12 +205,13 @@ class PokePonBot(commands.Bot):
         if not settings.discord_message_content_intent:
             _LOG.info(
                 "Message Content intent is off (DISCORD_MESSAGE_CONTENT_INTENT=0). Chat prefix commands "
-                "(pcd, pcoll, pcpd, …) will not run; use slash commands or set the intent back on in .env "
+                "(ppcd, ppcoll, pppd, …) will not run; use slash commands or set the intent back on in .env "
                 "and Developer Portal."
             )
         else:
             _LOG.info(
-                "Chat commands use the **pc**-style names, e.g. `pcd`, `pcoll`, `pcpd` (Poke-duel), `packd`. "
+                "Chat commands use **pp**-prefixed names, e.g. `ppcd`, `ppcoll`, `pppd` (Poke-duel). "
+                "In the official server, bare names like `cd` or `balance` also work. "
                 "Ensure Message Content Intent is enabled under Developer Portal → Bot → Privileged "
                 "Gateway Intents, or message bodies will stay empty."
             )
@@ -238,7 +231,10 @@ class PokePonBot(commands.Bot):
         except Exception:
             _LOG.exception(
                 "Alembic auto-upgrade failed — continuing with current schema. "
-                "Run `alembic upgrade head` manually if commands hit 'no such column'."
+                "Run `alembic upgrade head` manually. If the error is "
+                "'Can't locate revision', fix `alembic_version` in the DB: set it to the "
+                "newest revision id that still exists under alembic/versions/, then "
+                "upgrade again (or replace the DB). Otherwise you may see missing tables/columns."
             )
 
         # Reconcile pack series before cogs load — `/packv` reads these rows. Order:
@@ -249,13 +245,17 @@ class PokePonBot(commands.Bot):
         #      don't reference it) so old hand-rolled rows like "sv" / "swsh" disappear cleanly.
         try:
             from poke_pon_bot.services.pack_series_loader import (
+                cleanup_orphan_card_series_sets,
+                prune_logo_only_pack_series,
                 prune_orphan_series,
                 sync_pack_series_from_catalog,
                 upsert_pack_series,
             )
 
+            await cleanup_orphan_card_series_sets(self.async_session_factory)
             await upsert_pack_series(self.async_session_factory)
             await sync_pack_series_from_catalog(self.async_session_factory)
+            await prune_logo_only_pack_series(self.async_session_factory)
             await prune_orphan_series(self.async_session_factory)
         except (OSError, ValueError) as exc:
             _LOG.warning("Pack series sync skipped: %s", exc)
@@ -264,12 +264,27 @@ class PokePonBot(commands.Bot):
         await self.load_extension("poke_pon_bot.cogs.economy")
         await self.load_extension("poke_pon_bot.cogs.dev")
         await self.load_extension("poke_pon_bot.cogs.gacha")
+        await self.load_extension("poke_pon_bot.cogs.grading")
         await self.load_extension("poke_pon_bot.cogs.duel")
         await self.load_extension("poke_pon_bot.cogs.trade")
         await self.load_extension("poke_pon_bot.cogs.auction")
         await self.load_extension("poke_pon_bot.cogs.packs")
+        await self.load_extension("poke_pon_bot.cogs.crafting")
         await self.load_extension("poke_pon_bot.cogs.leaderboard")
-        await self.load_extension("poke_pon_bot.cogs.wishlist")
+        await self.load_extension("poke_pon_bot.cogs.missions")
+        await self.load_extension("poke_pon_bot.cogs.tutorial")
+
+        from poke_pon_bot.error_handlers import setup_error_handlers
+        from poke_pon_bot.referral_listener import setup_referral_listener
+        from poke_pon_bot.review_prompt_listener import setup_review_prompt_listener
+        from poke_pon_bot.tutorial_listener import setup_tutorial_listener
+        from poke_pon_bot.vote_claim_listener import setup_vote_claim_listener
+
+        setup_error_handlers(self)
+        setup_review_prompt_listener(self)
+        setup_referral_listener(self)
+        setup_vote_claim_listener(self)
+        setup_tutorial_listener(self)
 
         await self._maybe_sync_slash_commands()
 
@@ -343,12 +358,45 @@ class PokePonBot(commands.Bot):
         # Login + identify both succeeded. Anything we recorded earlier was clearly
         # transient — drop the local cooldown so a normal restart isn't blocked.
         _clear_login_throttle()
+        asyncio.create_task(self._sync_assembly_registry(), name="sync-assembly-registry")
+        asyncio.create_task(self._prefetch_discord_events_cache(), name="prefetch-discord-events")
+
+    async def _prefetch_discord_events_cache(self) -> None:
+        try:
+            from poke_pon_bot.services.discord_events import prefetch_discord_events_cache
+
+            await prefetch_discord_events_cache(self, self.settings)
+        except Exception:
+            _LOG.exception("Discord events cache prefetch failed on startup")
+
+    async def _sync_assembly_registry(self) -> None:
+        try:
+            from poke_pon_bot.services.assembly_catalog import sync_all_assemblies
+
+            async with self.async_session_factory() as session:
+                n = await sync_all_assemblies(session)
+                await session.commit()
+            if n:
+                _LOG.info("Assembly registry: %s group(s) synced on startup.", n)
+        except Exception:
+            _LOG.exception("Assembly registry sync failed on startup")
 
     async def close(self) -> None:
         srv = self._web_server
         self._web_server = None
         if srv is not None:
             await srv.stop()
+        cog = self.get_cog("GachaCog")
+        if cog is not None:
+            try:
+                from poke_pon_bot.services.drop_recovery import flush_active_channel_drops
+
+                await flush_active_channel_drops(
+                    self.async_session_factory,
+                    getattr(cog, "_active_drop_views", {}),
+                )
+            except Exception:
+                _LOG.exception("Failed to persist active channel drops on shutdown")
         await super().close()
         await self.engine.dispose()
 
@@ -394,6 +442,8 @@ async def _run_bot_async() -> None:
 def run_bot() -> None:
     try:
         asyncio.run(_run_bot_async())
+    except KeyboardInterrupt:
+        _LOG.info("Bot stopped (Ctrl+C).")
     except LoginFailure as exc:
         raise SystemExit(
             "Discord rejected the bot token (401 Unauthorized).\n"

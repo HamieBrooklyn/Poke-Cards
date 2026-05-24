@@ -1,0 +1,61 @@
+"""Slash/chat ``/tutorial`` — start or resume the one-time DM onboarding."""
+
+from __future__ import annotations
+
+import discord
+from discord.ext import commands
+
+from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.services.tutorial import (
+    is_tutorial_complete,
+    send_current_step_dm,
+    start_tutorial,
+    tutorial_enabled,
+)
+
+
+class TutorialCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    @commands.hybrid_command(
+        name="tutorial",
+        aliases=[pp_alias("tutorial")],
+        description="Start or resume the PokePon tutorial in your DMs (one time).",
+    )
+    async def tutorial_cmd(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await ctx.defer(ephemeral=True)
+        settings = self.bot.settings
+        if not tutorial_enabled(settings):
+            await ctx.send(
+                "The tutorial is not configured on this bot instance.",
+                ephemeral=True,
+            )
+            return
+        uid = ctx.author.id
+        if await is_tutorial_complete(self.bot.async_session_factory, uid):
+            await ctx.send(
+                "You have already completed the tutorial. Thanks!",
+                ephemeral=True,
+            )
+            return
+        guild_id = ctx.guild.id if ctx.guild is not None else settings.tutorial_guild_id
+        await start_tutorial(
+            self.bot.async_session_factory,
+            discord_user_id=uid,
+            guild_id=guild_id,
+        )
+        await send_current_step_dm(self.bot, uid)
+        await ctx.send(
+            "Check your **DMs** from me — the tutorial continues there. "
+            "Use **slash commands** (`/cd`, `/colv`, …) when Discord offers them; "
+            "without `/` use the **`pp`** prefix (e.g. `ppcd`, `ppcolv`).\n\n"
+            "If DMs are closed, enable messages from server members and run **`/tutorial`** again.",
+            ephemeral=True,
+        )
+
+
+async def setup(bot: commands.Bot) -> None:
+    if tutorial_enabled(bot.settings):
+        await bot.add_cog(TutorialCog(bot))
