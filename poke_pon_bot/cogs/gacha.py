@@ -1489,7 +1489,7 @@ class PackPickView(discord.ui.View):
             if self._mission_block:
                 parts.append(self._mission_block.strip())
             return "\n\n".join(parts)
-        parts = [base, self._compact_drop_summary()]
+        parts = [base, _pack_cards_listing(self._cards)]
         if self._mission_block:
             parts.append(self._mission_block.strip())
         return self._compose_with_claims(parts)
@@ -1509,19 +1509,36 @@ class PackPickView(discord.ui.View):
         claim_lines = [line_for(s) for s in ordered_slots]
         budget = self._DISCORD_CONTENT_LIMIT - self._CONTENT_SAFETY_BUFFER
 
-        def assemble(include_mission: bool, lines: list[str]) -> str:
+        def assemble(include_mission: bool, use_compact: bool, lines: list[str]) -> str:
             body_parts = list(parts)
             if not include_mission:
                 body_parts = [p for p in body_parts if p != (self._mission_block or "").strip()]
+            if use_compact:
+                # Replace full card listing with compact summary when needed
+                full_listing = _pack_cards_listing(self._cards)
+                body_parts = [
+                    self._compact_drop_summary() if p == full_listing else p
+                    for p in body_parts
+                ]
             return "\n\n".join(body_parts + ["\n".join([header, *lines])])
 
-        candidate = assemble(True, claim_lines)
-        if len(candidate) > budget:
-            candidate = assemble(False, claim_lines)
+        # Try with full card listing and mission block
+        candidate = assemble(True, False, claim_lines)
+        if len(candidate) <= budget:
+            return candidate
+        
+        # Try without mission block but keep full card listing
+        candidate = assemble(False, False, claim_lines)
+        if len(candidate) <= budget:
+            return candidate
+        
+        # Try with compact summary instead of full card listing
+        candidate = assemble(False, True, claim_lines)
         if len(candidate) <= budget:
             return candidate
 
-        head_text = assemble(False, []) + "\n"
+        # Last resort: compact summary + trim old claim lines
+        head_text = assemble(False, True, []) + "\n"
         remaining = budget - len(head_text)
         kept_lines: list[str] = []
         used = 0
