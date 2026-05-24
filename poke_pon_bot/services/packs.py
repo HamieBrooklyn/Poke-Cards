@@ -1,8 +1,9 @@
 """Booster pack lifecycle: purchase -> open -> scrap.
 
-Packs are owned :class:`UserPackInstance` rows. Opening rolls 10 + 1 :class:`UserCardInstance`
-rows scoped to the series's ``card_series_sets`` and credits 1 Crystal per code card. The
-flip view in :mod:`poke_pon_bot.cogs.packs` lets the user scrap unwanted instances.
+Packs are owned :class:`UserPackInstance` rows. Opening rolls ``cards_per_pack`` + ``code_cards_per_pack``
+:class:`UserCardInstance` rows scoped to the series's ``card_series_sets``. Regular slots avoid
+duplicate printings when the pool allows; the **code card** uses a rarer rarity mix. Opening credits
+1 Crystal per code card. The flip view in :mod:`poke_pon_bot.cogs.packs` lets the user scrap unwanted instances.
 """
 
 from __future__ import annotations
@@ -225,6 +226,23 @@ class PackService:
             guild_id=guild_id,
         )
 
+    async def grant_tutorial_pack(
+        self,
+        session: AsyncSession,
+        drop_service: DropService,
+        *,
+        discord_user_id: int,
+    ) -> UserPackInstance:
+        """Free pack for the one-time DM tutorial."""
+        series_id = await self._pick_random_active_series_id(session, drop_service)
+        return await self._new_pack_instance(
+            session,
+            discord_user_id=discord_user_id,
+            series_id=series_id,
+            source="tutorial",
+            guild_id=None,
+        )
+
     async def grant_dev_pack(
         self,
         session: AsyncSession,
@@ -258,6 +276,7 @@ class PackService:
         *,
         pack_instance_id: int,
         owner_id: int,
+        guild_id: int | None = None,
     ) -> OpenedPackResult:
         """Roll cards, eagerly persist them, mark the pack as opened, credit crystals.
 
@@ -283,11 +302,14 @@ class PackService:
                 "config/pack_series.v1.yaml and restart the bot."
             )
 
+        roll_guild = guild_id if guild_id is not None else pack.guild_id
         regular_cards, code_cards = await drop_service.roll_pack_for_series(
             session,
             set_codes=set_codes,
             cards_count=int(series.cards_per_pack),
             code_cards_count=int(series.code_cards_per_pack),
+            guild_id=roll_guild,
+            crystal_price=int(series.crystal_price),
         )
 
         regular_pairs: list[tuple[UserCardInstance, Card]] = []
@@ -334,6 +356,9 @@ class PackService:
                 card_id=card.id,
                 source=source,
             )
+            from poke_pon_bot.services.card_roles import apply_new_instance_craft_uses
+
+            apply_new_instance_craft_uses(inst, card)
             try:
                 async with session.begin_nested():
                     session.add(inst)
