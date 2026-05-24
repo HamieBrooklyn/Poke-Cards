@@ -245,19 +245,15 @@ class PokePonBot(commands.Bot):
         #      don't reference it) so old hand-rolled rows like "sv" / "swsh" disappear cleanly.
         try:
             from poke_pon_bot.services.pack_series_loader import (
-                cleanup_orphan_card_series_sets,
-                prune_logo_only_pack_series,
                 prune_orphan_series,
                 sync_pack_series_from_catalog,
                 upsert_pack_series,
             )
 
-            await cleanup_orphan_card_series_sets(self.async_session_factory)
             await upsert_pack_series(self.async_session_factory)
             await sync_pack_series_from_catalog(self.async_session_factory)
-            await prune_logo_only_pack_series(self.async_session_factory)
             await prune_orphan_series(self.async_session_factory)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ImportError) as exc:
             _LOG.warning("Pack series sync skipped: %s", exc)
 
         await self.load_extension("poke_pon_bot.cogs.general")
