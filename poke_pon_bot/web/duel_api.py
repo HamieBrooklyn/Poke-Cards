@@ -72,23 +72,23 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
 
     async def handle_user_search(request: web.Request) -> web.StreamResponse:
         sess = _require_session(request)
-        q = (request.query.get("q") or "").strip()
+        uid = int(sess.user_id)
+        q = (request.query.get("q") or "").strip().lstrip("@").strip()
         try:
             limit = int(request.query.get("limit") or 15)
         except ValueError:
             limit = 15
         try:
-            async with session_factory() as db:
-                users = await search_members_shared_with_bot(
-                    bot,
-                    session=db,
-                    query=q,
-                    requester_id=int(sess.user_id),
-                    limit=limit,
-                )
-        except SQLAlchemyError:
-            _LOG.exception("duel user search")
-            return web.json_response({"error": "database_error"}, status=500)
+            users = await search_members_shared_with_bot(
+                bot,
+                query=q,
+                requester_id=uid,
+                limit=limit,
+                session_factory=session_factory,
+            )
+        except Exception:
+            _LOG.exception("duel user search q=%r", q)
+            return web.json_response({"error": "search_failed"}, status=500)
         return web.json_response({"users": users})
 
     # POST /api/me/duels — create invite
