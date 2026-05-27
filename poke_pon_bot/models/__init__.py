@@ -6,6 +6,7 @@ from poke_pon_bot.models.card_series import CardSeries, CardSeriesSet
 from poke_pon_bot.models.combat_deck import UserCombatDeck
 from poke_pon_bot.models.crystals import UserCrystals
 from poke_pon_bot.models.drops import DropTable, DropWeight
+from poke_pon_bot.models.duel_session import DuelSession
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.pack_instance import UserPackInstance
 from poke_pon_bot.models.pending_trade import PendingTrade
@@ -24,6 +25,7 @@ __all__ = [
     "UserCrystals",
     "DropTable",
     "DropWeight",
+    "DuelSession",
     "RarityClass",
     "TcgRarityMapping",
     "UserCardInstance",

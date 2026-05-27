@@ -111,6 +111,15 @@ async def start_web_server(bot: Any) -> WebServer | None:
 
     app = web.Application(middlewares=[_cors_middleware(settings.web_allowed_origins)])
 
+    from pathlib import Path
+
+    manual_static = (
+        Path(__file__).resolve().parent.parent / "static" / "manual_cards"
+    )
+    if manual_static.is_dir():
+        app.router.add_static("/static/manual-cards", manual_static)
+        _LOG.info("Manual card images mounted at /static/manual-cards/")
+
     if settings.topgg_webhook_secret:
         from poke_pon_bot.web.topgg_webhook import register_topgg_routes
 
@@ -140,6 +149,8 @@ async def start_web_server(bot: Any) -> WebServer | None:
         from poke_pon_bot.web.profile_api import register_profile_api
         from poke_pon_bot.web.shop_api import register_shop_api
         from poke_pon_bot.web.trade_api import register_trade_api
+        from poke_pon_bot.web.duel_api import register_duel_api
+        from poke_pon_bot.web.duel_ws import register_duel_ws
 
         register_oauth_routes(
             app, settings=settings, secure_cookies=_secure_cookies(settings), bot=bot
@@ -151,12 +162,14 @@ async def start_web_server(bot: Any) -> WebServer | None:
         register_deck_api(app, bot=bot, settings=settings)
         register_auction_api(app, bot=bot, settings=settings)
         register_trade_api(app, bot=bot, settings=settings)
+        register_duel_api(app, bot=bot, settings=settings)
+        register_duel_ws(app, bot=bot, settings=settings)
         register_profile_api(app, bot=bot, settings=settings)
         register_leaderboard_api(app, bot=bot, settings=settings)
         register_shop_api(app, bot=bot, settings=settings)
         _LOG.info(
             "Discord OAuth + Collection / Deck / Auction / Trade / Profile / "
-            "Leaderboard / Shop API mounted."
+            "Duel / Leaderboard / Shop API mounted."
         )
 
     if not list(app.router.routes()):
