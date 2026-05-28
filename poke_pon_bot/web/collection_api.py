@@ -29,6 +29,7 @@ from poke_pon_bot.services.collection_sell import (
 )
 from poke_pon_bot.services.card_roles import craft_role_for_card, craft_uses_payload
 from poke_pon_bot.services.collection_evolution_search import build_evolution_line_sections
+from poke_pon_bot.services.collection_search import collection_text_search_clause
 from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
 from poke_pon_bot.services.evolution import (
     catalog_card_has_evolution_targets_expr,
@@ -347,7 +348,9 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         dex0.in_(dup_dex),
                     )
                 if q:
-                    count_stmt = count_stmt.where(func.lower(Card.name).like(f"%{q}%"))
+                    search_clause = collection_text_search_clause(q)
+                    if search_clause is not None:
+                        count_stmt = count_stmt.where(search_clause)
                 if supertype_filter:
                     count_stmt = count_stmt.where(Card.supertype == supertype_filter)
                 if favorited_only:
@@ -394,7 +397,9 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         dex0.in_(dup_dex),
                     )
                 if q:
-                    base = base.where(func.lower(Card.name).like(f"%{q}%"))
+                    search_clause = collection_text_search_clause(q)
+                    if search_clause is not None:
+                        base = base.where(search_clause)
                 if supertype_filter:
                     base = base.where(Card.supertype == supertype_filter)
                 if favorited_only:

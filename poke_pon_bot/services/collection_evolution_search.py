@@ -11,6 +11,10 @@ from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
 from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
+from poke_pon_bot.services.collection_search import (
+    collection_text_search_clause,
+    collection_text_search_negated_clause,
+)
 from poke_pon_bot.services.evolution import (
     resolve_evolution_targets,
     resolve_pre_evolution_sources,
@@ -76,7 +80,7 @@ async def _seed_cards_for_query(
         .where(
             UserCardInstance.discord_user_id == discord_user_id,
             user_instance_not_in_active_auction(),
-            func.lower(Card.name).like(f"%{q}%"),
+            collection_text_search_clause(q),
         )
         .order_by(desc(UserCardInstance.obtained_at))
     )
@@ -172,7 +176,9 @@ async def _owned_rows_for_species(
         )
     )
     if q:
-        stmt = stmt.where(~func.lower(Card.name).like(f"%{q}%"))
+        exclude_direct = collection_text_search_negated_clause(q)
+        if exclude_direct is not None:
+            stmt = stmt.where(exclude_direct)
     if favorited_only:
         stmt = stmt.where(UserCardInstance.is_favorite.is_(True))
     rows = list((await session.execute(stmt.limit(max(limit * 4, 120)))).all())
