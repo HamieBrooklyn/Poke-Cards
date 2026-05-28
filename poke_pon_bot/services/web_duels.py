@@ -170,6 +170,19 @@ async def surrender_duel(session: AsyncSession, *, duel_id: int, user_id: int) -
     winner = row.partner_id if user_id == row.initiator_id else row.initiator_id
     row.status = DUEL_STATUS_COMPLETED
     row.winner_id = winner
+    st = dict(row.state or {})
+    st["winner"] = int(winner)
+    log = list(st.get("log") or [])
+    log.append(
+        {
+            "type": "surrender",
+            "actor": int(user_id),
+            "winner": int(winner),
+        }
+    )
+    st["log"] = log
+    row.state = st
+    row.version = int(row.version or 0) + 1
     return None
 
 

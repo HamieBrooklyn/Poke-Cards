@@ -33,6 +33,7 @@ from poke_pon_bot.services.web_duels import (
     normalize_duel_currency,
     surrender_duel,
 )
+from poke_pon_bot.web.duel_ws import broadcast_duel_state
 from poke_pon_bot.web.sessions import read_session
 from poke_pon_bot.web.user_profiles import resolve_user_profiles
 
@@ -244,10 +245,17 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
                     ds.starting_player_id = int(init_state["turn"])
                     ds.version = int(ds.version or 0) + 1
                 await db.commit()
+                ds = await db.get(DuelSession, did)
+                if ds is None:
+                    return web.json_response({"error": "not_found"}, status=404)
+                await broadcast_duel_state(did, ds)
+                payload = await serialize_duel_session(
+                    db, ds, viewer_id=uid, bot=bot, include_state=True
+                )
         except SQLAlchemyError:
             _LOG.exception("duel accept did=%s", did)
             return web.json_response({"error": "database_error"}, status=500)
-        return web.json_response({"ok": True})
+        return web.json_response(payload)
 
     async def handle_decline(request: web.Request) -> web.StreamResponse:
         sess = _require_session(request)
@@ -299,15 +307,21 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
                     return web.json_response({"error": "duel_error", "message": err}, status=400)
                 ds = await db.get(DuelSession, did)
                 if ds and ds.winner_id:
-                    # payout stake to winner on surrender
                     from poke_pon_bot.services.web_duels import payout_escrow
 
                     await payout_escrow(db, ds, winner_id=int(ds.winner_id))
                 await db.commit()
+                ds = await db.get(DuelSession, did)
+                if ds is None:
+                    return web.json_response({"error": "not_found"}, status=404)
+                await broadcast_duel_state(did, ds)
+                payload = await serialize_duel_session(
+                    db, ds, viewer_id=uid, bot=bot, include_state=True
+                )
         except SQLAlchemyError:
             _LOG.exception("duel surrender did=%s", did)
             return web.json_response({"error": "database_error"}, status=500)
-        return web.json_response({"ok": True})
+        return web.json_response(payload)
 
     app.router.add_get("/api/me/duel-user-search", handle_user_search)
     app.router.add_post("/api/me/duels", handle_create)

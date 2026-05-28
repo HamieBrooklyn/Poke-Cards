@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from poke_pon_bot.models.duel_session import DUEL_STATUS_ACTIVE, DuelSession
 from poke_pon_bot.services.web_duels import normalize_duel_currency, payout_escrow
 from poke_pon_bot.services.web_duel_runtime import DuelRuntimeAdvanced
-from poke_pon_bot.web.sessions import read_session
+from poke_pon_bot.web.sessions import decode_session, read_session
 
 _LOG = logging.getLogger(__name__)
 
@@ -28,6 +28,32 @@ def _room_lock(duel_id: int) -> asyncio.Lock:
         lk = asyncio.Lock()
         _ROOM_LOCKS[duel_id] = lk
     return lk
+
+
+def duel_state_message(ds: DuelSession) -> dict[str, Any]:
+    """WebSocket payload for full duel snapshot (initial connect + HTTP-driven updates)."""
+    return {
+        "type": "state",
+        "duel": {
+            "id": int(ds.id),
+            "status": ds.status,
+            "bet": {
+                "currency": ds.bet_currency,
+                "amount": int(ds.bet_amount or 0),
+            },
+            "version": int(ds.version or 0),
+            "starting_player_id": int(ds.starting_player_id)
+            if ds.starting_player_id
+            else None,
+            "winner_id": int(ds.winner_id) if ds.winner_id else None,
+        },
+        "state": ds.state or {},
+    }
+
+
+async def broadcast_duel_state(duel_id: int, ds: DuelSession) -> None:
+    """Push latest DB row to every socket in the duel room."""
+    await _broadcast(int(duel_id), duel_state_message(ds))
 
 
 async def _broadcast(duel_id: int, payload: dict[str, Any]) -> None:
@@ -59,6 +85,10 @@ def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
     async def handle_ws(request: web.Request) -> web.StreamResponse:
         sess = read_session(request, session_secret, max_age=session_ttl)
         if sess is None:
+            raw_tok = (request.query.get("session") or "").strip()
+            if raw_tok:
+                sess = decode_session(session_secret, raw_tok, max_age=session_ttl)
+        if sess is None:
             raise web.HTTPUnauthorized(
                 text='{"error":"unauthenticated"}',
                 content_type="application/json",
@@ -83,20 +113,7 @@ def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
                 if ds is None or uid not in (ds.initiator_id, ds.partner_id):
                     await send({"type": "error", "message": "not_found"})
                     return ws
-                await send(
-                    {
-                        "type": "state",
-                        "duel": {
-                            "id": int(ds.id),
-                            "status": ds.status,
-                            "bet": {"currency": ds.bet_currency, "amount": int(ds.bet_amount or 0)},
-                            "version": int(ds.version or 0),
-                            "starting_player_id": int(ds.starting_player_id) if ds.starting_player_id else None,
-                            "winner_id": int(ds.winner_id) if ds.winner_id else None,
-                        },
-                        "state": ds.state or {},
-                    }
-                )
+                await send(duel_state_message(ds))
         except SQLAlchemyError:
             _LOG.exception("duel ws initial load duel_id=%s", duel_id)
             await send({"type": "error", "message": "database_error"})
@@ -188,17 +205,8 @@ def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
                             await payout_escrow(db, ds, winner_id=int(rt.winner_id))
                         await db.commit()
 
-                        payload = {
-                            "type": "state",
-                            "duel": {
-                                "id": int(ds.id),
-                                "status": ds.status,
-                                "version": int(ds.version or 0),
-                                "winner_id": int(ds.winner_id) if ds.winner_id else None,
-                            },
-                            "state": ds.state or {},
-                            "event": rt.last_event,
-                        }
+                        payload = duel_state_message(ds)
+                        payload["event"] = rt.last_event
                 except ValueError as e:
                     await send({"type": "error", "message": str(e)})
                     continue
