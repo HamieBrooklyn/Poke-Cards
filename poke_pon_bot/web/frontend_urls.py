@@ -33,3 +33,11 @@ def trades_page_url(settings: Any, *, trade_id: int | None = None) -> str:
     if trade_id is not None:
         url += f"?trade={int(trade_id)}"
     return url
+
+
+def duel_page_url(settings: Any, *, duel_id: int | None = None) -> str:
+    """Canonical duels UI on GitHub Pages (never under ``/shop/``)."""
+    url = f"{site_origin(settings).rstrip('/')}/duel/"
+    if duel_id is not None:
+        url += f"?duel={int(duel_id)}"
+    return url

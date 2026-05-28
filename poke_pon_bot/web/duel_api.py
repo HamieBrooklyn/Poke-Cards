@@ -34,6 +34,7 @@ from poke_pon_bot.services.web_duels import (
     surrender_duel,
 )
 from poke_pon_bot.web.duel_ws import broadcast_duel_state
+from poke_pon_bot.web.frontend_urls import duel_page_url
 from poke_pon_bot.web.sessions import read_session
 from poke_pon_bot.web.user_profiles import resolve_user_profiles
 
@@ -51,7 +52,6 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
     session_ttl = settings.web_session_ttl_seconds
     wallet = WalletService()
     crystals = CrystalsService()
-    public_url = (settings.web_frontend_url or "").rstrip("/")
 
     def _require_session(request: web.Request):
         sess = read_session(request, session_secret, max_age=session_ttl)
@@ -155,12 +155,12 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
             _LOG.exception("duel create uid=%s", uid)
             return web.json_response({"error": "database_error"}, status=500)
 
-        duel_link = f"{public_url}/duel/" if public_url else ""
+        duel_link = duel_page_url(settings, duel_id=int(result.id))
         init_name = sess.global_name or sess.username or str(uid)
         await _try_dm(
             partner_id,
             f"**{init_name}** wants to duel you on the website!"
-            + (f"\nOpen duels: {duel_link}" if duel_link else ""),
+            + f"\nOpen duel: {duel_link}",
         )
         return web.json_response(payload, status=201)
 
@@ -251,6 +251,17 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
                 await broadcast_duel_state(did, ds)
                 payload = await serialize_duel_session(
                     db, ds, viewer_id=uid, bot=bot, include_state=True
+                )
+                partner_profile = payload.get("partner") or {}
+                partner_name = (
+                    partner_profile.get("global_name")
+                    or partner_profile.get("username")
+                    or "Your opponent"
+                )
+                await _try_dm(
+                    ds.initiator_id,
+                    f"**{partner_name}** accepted your duel invite!"
+                    f"\nJoin the match: {duel_page_url(settings, duel_id=did)}",
                 )
         except SQLAlchemyError:
             _LOG.exception("duel accept did=%s", did)
@@ -360,6 +371,7 @@ async def serialize_duel_session(
         "expires_at": ds.expires_at.isoformat() if ds.expires_at else None,
         "updated_at": ds.updated_at.isoformat() if ds.updated_at else None,
         "viewer_id": int(viewer_id),
+        "viewer_role": "initiator" if int(viewer_id) == int(ds.initiator_id) else "partner",
     }
     if include_state:
         out["state"] = ds.state or {}
