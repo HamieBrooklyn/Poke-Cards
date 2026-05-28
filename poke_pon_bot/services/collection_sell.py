@@ -170,3 +170,175 @@ async def run_collection_sell(
         new_balance=new_bal,
         card_name=card.name,
     )
+
+
+@dataclass(frozen=True)
+class CollectionBulkSellOutcome:
+    ok: bool
+    error: str | None = None
+    payout: int = 0
+    new_balance: int = 0
+    sold_count: int = 0
+    blocked_instance_ids: tuple[int, ...] = ()
+    needs_confirm: bool = False
+
+
+async def quote_collection_bulk_sell(
+    session: AsyncSession,
+    *,
+    discord_user_id: int,
+    instance_ids: Iterable[int],
+) -> tuple[int, bool, dict[int, int], dict[int, str | None]]:
+    """Return (total_quote, needs_confirm, per_instance_quote, block_map).
+
+    - Missing/invalid/unauthorized instances are treated as blocked with a reason.
+    - Instances in active auctions or pending trades are blocked via the shared rules.
+    """
+    ids = [int(i) for i in instance_ids]
+    uniq: list[int] = list(dict.fromkeys(ids))
+    if not uniq:
+        return 0, False, {}, {}
+
+    block_map = await collection_sell_block_reasons_for_instances(
+        session,
+        discord_user_id=discord_user_id,
+        instance_ids=uniq,
+    )
+    # Mark "not owned / missing" as blocked too (the block fn only handles auction/trade).
+    owned_rows = (
+        await session.execute(
+            select(UserCardInstance.id, UserCardInstance.card_id)
+            .where(
+                UserCardInstance.id.in_(uniq),
+                UserCardInstance.discord_user_id == discord_user_id,
+            )
+        )
+    ).all()
+    owned_card_by_inst: dict[int, int] = {int(iid): int(cid) for iid, cid in owned_rows}
+    for iid in uniq:
+        if iid not in owned_card_by_inst and block_map.get(iid) is None:
+            block_map[iid] = "That card isn’t in your collection anymore."
+
+    card_ids = sorted(set(owned_card_by_inst.values()))
+    cards_by_id: dict[int, Card] = {}
+    rarities_by_id: dict[int, RarityClass] = {}
+    if card_ids:
+        c_rows = (
+            await session.execute(select(Card).where(Card.id.in_(card_ids)))
+        ).scalars()
+        cards_by_id = {int(c.id): c for c in c_rows if c.id is not None}
+        r_rows = (
+            await session.execute(
+                select(RarityClass).where(RarityClass.id.in_([c.rarity_class_id for c in cards_by_id.values()]))
+            )
+        ).scalars()
+        rarities_by_id = {int(r.id): r for r in r_rows if r.id is not None}
+
+    per_quote: dict[int, int] = {}
+    needs_confirm = False
+    total = 0
+    for iid in uniq:
+        if block_map.get(iid) is not None:
+            continue
+        card_id = owned_card_by_inst.get(iid)
+        if card_id is None:
+            continue
+        card = cards_by_id.get(card_id)
+        if card is None:
+            block_map[iid] = "Catalog data for that card is missing."
+            continue
+        rarity = rarities_by_id.get(int(card.rarity_class_id))
+        if rarity is None:
+            block_map[iid] = "Rarity data missing — try again after a sync."
+            continue
+        if collection_sell_needs_confirm(rarity):
+            needs_confirm = True
+        # Pull inst for evo stages / ownership-checked quote.
+        inst = await session.get(UserCardInstance, iid)
+        if inst is None or inst.discord_user_id != discord_user_id:
+            block_map[iid] = "That card isn’t in your collection anymore."
+            continue
+        q = quote_collection_sell_payout(card, rarity, inst)
+        per_quote[iid] = q
+        total += q
+
+    return total, needs_confirm, per_quote, block_map
+
+
+async def run_collection_bulk_sell(
+    session: AsyncSession,
+    wallet: WalletService,
+    *,
+    discord_user_id: int,
+    instance_ids: Iterable[int],
+    expected_payout: int | None = None,
+) -> CollectionBulkSellOutcome:
+    """Sell many owned instances in one atomic transaction.
+
+    This function:
+    - validates ownership and block rules for every instance
+    - computes the total quote
+    - strips sold instances from the user's duel deck
+    - deletes the instances
+    - credits the wallet once
+    - commits once
+    """
+    ids = [int(i) for i in instance_ids]
+    uniq: list[int] = list(dict.fromkeys(ids))
+    if not uniq:
+        return CollectionBulkSellOutcome(ok=False, error="Select at least one card to sell.")
+
+    total, needs_confirm, per_quote, block_map = await quote_collection_bulk_sell(
+        session,
+        discord_user_id=discord_user_id,
+        instance_ids=uniq,
+    )
+    blocked_ids = tuple(sorted(iid for iid, reason in block_map.items() if reason is not None))
+    if blocked_ids:
+        return CollectionBulkSellOutcome(
+            ok=False,
+            error="Some selected cards cannot be sold.",
+            blocked_instance_ids=blocked_ids,
+            needs_confirm=needs_confirm,
+        )
+    if expected_payout is not None and int(expected_payout) != int(total):
+        return CollectionBulkSellOutcome(
+            ok=False,
+            error="Sell quote changed — refresh and retry.",
+            payout=total,
+            needs_confirm=needs_confirm,
+        )
+
+    # Re-check instances exist right before delete (covers TOCTOU within one session).
+    inst_rows = (
+        await session.execute(
+            select(UserCardInstance.id)
+            .where(
+                UserCardInstance.id.in_(uniq),
+                UserCardInstance.discord_user_id == discord_user_id,
+            )
+        )
+    ).scalars().all()
+    inst_ids = {int(x) for x in inst_rows}
+    if len(inst_ids) != len(uniq):
+        return CollectionBulkSellOutcome(
+            ok=False,
+            error="That selection changed — refresh and retry.",
+            needs_confirm=needs_confirm,
+        )
+
+    await strip_instances_from_deck(session, discord_user_id, inst_ids)
+    for iid in inst_ids:
+        inst = await session.get(UserCardInstance, iid)
+        if inst is not None:
+            await session.delete(inst)
+
+    new_bal = await wallet.try_credit(session, discord_user_id, int(total))
+    await session.commit()
+    return CollectionBulkSellOutcome(
+        ok=True,
+        payout=int(total),
+        new_balance=int(new_bal),
+        sold_count=len(inst_ids),
+        needs_confirm=needs_confirm,
+    )
