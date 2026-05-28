@@ -60,6 +60,9 @@ _AUCT_BLOCK = (
 _TRADE_BLOCK = (
     "That copy is tied up in a **pending trade**. Finish or cancel the trade first."
 )
+_FAVORITE_BLOCK = (
+    "That copy is **favorited**. Unfavorite it before selling."
+)
 
 
 async def collection_sell_block_reasons_for_instances(
@@ -102,6 +105,19 @@ async def collection_sell_block_reasons_for_instances(
     for iid in trade_blocked:
         if out.get(iid) is None:
             out[iid] = _TRADE_BLOCK
+
+    fav_hits = (
+        await session.execute(
+            select(UserCardInstance.id).where(
+                UserCardInstance.id.in_(ids),
+                UserCardInstance.is_favorite.is_(True),
+            )
+        )
+    ).scalars()
+    for fid in fav_hits:
+        iid = int(fid)
+        if out.get(iid) is None:
+            out[iid] = _FAVORITE_BLOCK
 
     return out
 
