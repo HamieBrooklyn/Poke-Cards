@@ -118,6 +118,14 @@ The bot can also serve an HTTP API that powers `collection.html` on the [GitHub 
 
 It runs inside the bot process (one aiohttp app shared with the Top.gg webhook), so you only need to expose one port over HTTPS.
 
+### Collection API endpoints
+
+- `GET /api/me/collection`: paginated owned cards (includes per-copy sell quote and block reason)
+- `GET /api/me/cards/{public_id}`: focused detail for one owned copy
+- `POST /api/me/cards/{public_id}/sell`: sell one copy (requires `expected_payout`; may require `confirm_rare`)
+- `POST /api/me/collection/bulk-sell/quote`: quote + validate a list of `instance_ids` for bulk selling
+- `POST /api/me/collection/bulk-sell`: sell multiple copies in one transaction (requires `expected_payout`; may require `confirm_rare`)
+
 1. **Developer Portal → OAuth2 → General** — copy the **Client ID** (your application id) and click **Reset Secret** to copy the **Client Secret**. Add `https://<your-public-host>/auth/discord/callback` to **Redirects**.
 2. Generate a session secret:
 

@@ -24,7 +24,9 @@ from poke_pon_bot.services.collection_sell import (
     collection_sell_block_reason,
     collection_sell_block_reasons_for_instances,
     collection_sell_needs_confirm,
+    quote_collection_bulk_sell,
     quote_collection_sell_payout,
+    run_collection_bulk_sell,
     run_collection_sell,
 )
 from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
@@ -418,6 +420,147 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
             }
         )
 
+    async def handle_bulk_sell_quote(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        raw_ids = body.get("instance_ids")
+        if not isinstance(raw_ids, list):
+            return web.json_response({"error": "instance_ids must be a list"}, status=400)
+        try:
+            ids = [int(x) for x in raw_ids]
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "instance_ids must contain integers"}, status=400
+            )
+        # Reasonable cap so the API isn't abused; UI can page.
+        if len(ids) > 500:
+            return web.json_response({"error": "too_many_cards"}, status=400)
+
+        try:
+            async with session_factory() as db:
+                total, needs_confirm, per_quote, block_map = await quote_collection_bulk_sell(
+                    db,
+                    discord_user_id=sess.user_id,
+                    instance_ids=ids,
+                )
+        except SQLAlchemyError:
+            _LOG.exception("bulk_sell_quote user=%s n=%s", sess.user_id, len(ids))
+            return web.json_response({"error": "database error"}, status=500)
+
+        blocked = {
+            str(iid): reason
+            for iid, reason in block_map.items()
+            if reason is not None
+        }
+        return web.json_response(
+            {
+                "ok": True,
+                "total_quote_pokedollars": int(total),
+                "needs_confirm": bool(needs_confirm),
+                "per_instance_quote": {str(k): int(v) for k, v in per_quote.items()},
+                "blocked": blocked,
+            }
+        )
+
+    async def handle_bulk_sell(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        raw_ids = body.get("instance_ids")
+        if not isinstance(raw_ids, list):
+            return web.json_response({"error": "instance_ids must be a list"}, status=400)
+        try:
+            ids = [int(x) for x in raw_ids]
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "instance_ids must contain integers"}, status=400
+            )
+        if len(ids) > 500:
+            return web.json_response({"error": "too_many_cards"}, status=400)
+        try:
+            expected_int = int(body.get("expected_payout"))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "expected_payout must be an integer"}, status=400
+            )
+        confirm_rare = bool(body.get("confirm_rare"))
+
+        try:
+            async with session_factory() as db:
+                # Enforce confirm step if any selected copy is special_rare+.
+                total, needs_confirm, _, block_map = await quote_collection_bulk_sell(
+                    db,
+                    discord_user_id=sess.user_id,
+                    instance_ids=ids,
+                )
+                blocked = {
+                    str(iid): reason
+                    for iid, reason in block_map.items()
+                    if reason is not None
+                }
+                if blocked:
+                    return web.json_response(
+                        {"error": "cannot_sell", "blocked": blocked},
+                        status=400,
+                    )
+                if needs_confirm and not confirm_rare:
+                    return web.json_response(
+                        {
+                            "error": "confirm_required",
+                            "message": (
+                                "Some selected printings are high tier — pass confirm_rare: true "
+                                "after acknowledging the sale."
+                            ),
+                            "total_quote_pokedollars": int(total),
+                        },
+                        status=400,
+                    )
+                outcome = await run_collection_bulk_sell(
+                    db,
+                    wallet,
+                    discord_user_id=sess.user_id,
+                    instance_ids=ids,
+                    expected_payout=expected_int,
+                )
+        except SQLAlchemyError:
+            _LOG.exception("bulk_sell user=%s n=%s", sess.user_id, len(ids))
+            return web.json_response({"error": "database error"}, status=500)
+
+        if not outcome.ok:
+            # When quote mismatches, include the current quote.
+            if outcome.payout and outcome.error and "quote" in outcome.error.lower():
+                return web.json_response(
+                    {
+                        "error": "quote_mismatch",
+                        "message": outcome.error,
+                        "total_quote_pokedollars": int(outcome.payout),
+                    },
+                    status=409,
+                )
+            return web.json_response(
+                {
+                    "error": outcome.error or "sell failed",
+                    "blocked_instance_ids": [int(x) for x in outcome.blocked_instance_ids],
+                },
+                status=400,
+            )
+
+        return web.json_response(
+            {
+                "ok": True,
+                "sold_count": int(outcome.sold_count),
+                "payout_pokedollars": int(outcome.payout),
+                "new_balance_pokedollars": int(outcome.new_balance),
+            }
+        )
+
     app.router.add_get("/api/me/collection", handle_collection)
     app.router.add_get(r"/api/me/cards/{public_id}", handle_card_detail)
     app.router.add_post(r"/api/me/cards/{public_id}/sell", handle_sell_card)
+    app.router.add_post("/api/me/collection/bulk-sell/quote", handle_bulk_sell_quote)
+    app.router.add_post("/api/me/collection/bulk-sell", handle_bulk_sell)
