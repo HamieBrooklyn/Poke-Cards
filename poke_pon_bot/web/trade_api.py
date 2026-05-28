@@ -34,6 +34,7 @@ from poke_pon_bot.services.web_trades import (
     update_trade_side,
 )
 from poke_pon_bot.web.sessions import read_session
+from poke_pon_bot.web.trade_ws import notify_trade_room
 
 _LOG = logging.getLogger(__name__)
 
@@ -59,6 +60,9 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 content_type="application/json",
             )
         return sess
+
+    async def _push_trade(trade_id: int) -> None:
+        await notify_trade_room(session_factory, bot, int(trade_id))
 
     async def _try_dm(user_id: int, content: str) -> None:
         try:
@@ -202,6 +206,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 partner_name = sess.global_name or sess.username or str(uid)
                 if ts:
                     await _try_dm(ts.initiator_id, f"**{partner_name}** accepted your trade invite! Head to the website to start adding cards.")
+                await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade accept tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)
@@ -265,6 +270,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 if err:
                     return web.json_response({"error": "trade_error", "message": err}, status=400)
                 await db.commit()
+                await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade update tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)
@@ -296,6 +302,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                     p_label = part_name.global_name or part_name.username if part_name else str(ts.partner_id)
                     await _try_dm(ts.initiator_id, f"Trade with **{p_label}** completed! Check your collection.")
                     await _try_dm(ts.partner_id, f"Trade with **{i_label}** completed! Check your collection.")
+                await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade ready tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)
@@ -321,6 +328,7 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                     other_id = ts.partner_id if uid == ts.initiator_id else ts.initiator_id
                     canceller_name = sess.global_name or sess.username or str(uid)
                     await _try_dm(other_id, f"**{canceller_name}** cancelled the trade.")
+                await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade cancel tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)

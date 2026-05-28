@@ -149,6 +149,7 @@ async def start_web_server(bot: Any) -> WebServer | None:
         from poke_pon_bot.web.profile_api import register_profile_api
         from poke_pon_bot.web.shop_api import register_shop_api
         from poke_pon_bot.web.trade_api import register_trade_api
+        from poke_pon_bot.web.trade_ws import register_trade_ws
         from poke_pon_bot.web.duel_api import register_duel_api
         from poke_pon_bot.web.duel_ws import register_duel_ws
 
@@ -162,6 +163,7 @@ async def start_web_server(bot: Any) -> WebServer | None:
         register_deck_api(app, bot=bot, settings=settings)
         register_auction_api(app, bot=bot, settings=settings)
         register_trade_api(app, bot=bot, settings=settings)
+        register_trade_ws(app, bot=bot, settings=settings)
         register_duel_api(app, bot=bot, settings=settings)
         register_duel_ws(app, bot=bot, settings=settings)
         register_profile_api(app, bot=bot, settings=settings)
