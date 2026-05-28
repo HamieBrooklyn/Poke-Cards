@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aiohttp import web
-from sqlalchemy import Integer, String, desc, func, select
+from sqlalchemy import Integer, String, and_, desc, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.models.card import Card
@@ -31,6 +31,8 @@ from poke_pon_bot.services.card_roles import craft_role_for_card, craft_uses_pay
 from poke_pon_bot.services.collection_evolution_search import build_evolution_line_sections
 from poke_pon_bot.services.collection_visibility import user_instance_not_in_active_auction
 from poke_pon_bot.services.evolution import (
+    catalog_card_has_evolution_targets_expr,
+    catalog_card_lacks_evolution_targets_expr,
     quote_evolution,
     resolve_evolution_targets,
     run_collection_evolution,
@@ -294,6 +296,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
         supertype_filter = (request.query.get("supertype") or "").strip()
         favorited_only = request.query.get("favorited") in ("1", "true")
         evolvable_only = request.query.get("evolvable") in ("1", "true")
+        non_evolvable_only = request.query.get("non_evolvable") in ("1", "true")
         duplicates_only = request.query.get("duplicates") in ("1", "true")
         sort = (request.query.get("sort") or "newest").strip().lower()
         if sort not in _SORT_MODES:
@@ -314,7 +317,13 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     UserCardInstance.discord_user_id == session.user_id,
                     user_instance_not_in_active_auction(),
                 )
-                needs_card_join = bool(q or supertype_filter or evolvable_only or duplicates_only)
+                needs_card_join = bool(
+                    q
+                    or supertype_filter
+                    or evolvable_only
+                    or non_evolvable_only
+                    or duplicates_only
+                )
                 if needs_card_join:
                     count_stmt = count_stmt.join(
                         Card, Card.id == UserCardInstance.card_id
@@ -345,9 +354,11 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     count_stmt = count_stmt.where(UserCardInstance.is_favorite.is_(True))
                 if evolvable_only:
                     count_stmt = count_stmt.where(
-                        Card.evolves_to_names.isnot(None),
-                        func.cast(Card.evolves_to_names, String) != "null",
-                        func.cast(Card.evolves_to_names, String) != "[]",
+                        catalog_card_has_evolution_targets_expr()
+                    )
+                elif non_evolvable_only:
+                    count_stmt = count_stmt.where(
+                        catalog_card_lacks_evolution_targets_expr()
                     )
                 total = int((await db.execute(count_stmt)).scalar() or 0)
 
@@ -389,11 +400,9 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                 if favorited_only:
                     base = base.where(UserCardInstance.is_favorite.is_(True))
                 if evolvable_only:
-                    base = base.where(
-                        Card.evolves_to_names.isnot(None),
-                        func.cast(Card.evolves_to_names, String) != "null",
-                        func.cast(Card.evolves_to_names, String) != "[]",
-                    )
+                    base = base.where(catalog_card_has_evolution_targets_expr())
+                elif non_evolvable_only:
+                    base = base.where(catalog_card_lacks_evolution_targets_expr())
 
                 base = _apply_collection_sort(
                     base, sort=sort, duplicates_only=duplicates_only

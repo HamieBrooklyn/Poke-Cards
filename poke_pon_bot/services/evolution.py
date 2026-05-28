@@ -6,7 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, String, and_, exists, func, not_, or_, select
+from sqlalchemy.orm import aliased
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
@@ -68,6 +69,57 @@ def _evolves_from_matches_prey(evolved_from: str, prey_card_name: str) -> bool:
     return pn.startswith(ef + " ") or pn.startswith(ef + "-") or ef.startswith(pn + " ") or ef.startswith(pn + "-")
 
 
+def sql_evolves_from_refers_to_prey(evolved_from_col, prey_name_col) -> ColumnElement[bool]:
+    """SQL equivalent of ``_evolves_from_matches_prey`` for collection filters."""
+    ef = func.lower(func.trim(evolved_from_col))
+    pn = func.lower(func.trim(prey_name_col))
+    return and_(
+        evolved_from_col.isnot(None),
+        evolved_from_col != "",
+        prey_name_col.isnot(None),
+        prey_name_col != "",
+        or_(
+            ef == pn,
+            pn.like(ef + " %"),
+            pn.like(ef + "-%"),
+            ef.like(pn + " %"),
+            ef.like(pn + "-%"),
+        ),
+    )
+
+
+def catalog_card_has_evolution_targets_expr(card_cls: type[Card] = Card) -> ColumnElement[bool]:
+    """True when ``resolve_evolution_targets`` would return at least one target.
+
+    Matches API ``evolvesTo`` names, catalog ``evolves_to_card_id`` (sync backfill), and same-set
+    ``evolvesFrom`` on later printings — not merely an empty ``evolves_to_names`` column.
+    """
+    names_json = card_cls.evolves_to_names
+    names_str = func.cast(names_json, String)
+    has_api_names = and_(
+        names_json.isnot(None),
+        names_str.notin_(("null", "[]")),
+        func.length(names_str) > 2,
+    )
+    has_linked_target = card_cls.evolves_to_card_id.isnot(None)
+    stage_in_set = aliased(Card)
+    reverse_via_evolves_from = exists(
+        select(1)
+        .select_from(stage_in_set)
+        .where(
+            stage_in_set.set_code == card_cls.set_code,
+            stage_in_set.id != card_cls.id,
+            sql_evolves_from_refers_to_prey(stage_in_set.evolves_from, card_cls.name),
+        )
+        .correlate(card_cls)
+    )
+    return or_(has_api_names, has_linked_target, reverse_via_evolves_from)
+
+
+def catalog_card_lacks_evolution_targets_expr(card_cls: type[Card] = Card) -> ColumnElement[bool]:
+    return not_(catalog_card_has_evolution_targets_expr(card_cls))
+
+
 async def resolve_evolution_targets(session: "AsyncSession", card: Card) -> list[Card]:
     """Catalog cards this printing may evolve into.
 
@@ -127,6 +179,58 @@ async def resolve_evolution_targets(session: "AsyncSession", card: Card) -> list
             push(t)
 
     return targets
+
+
+async def resolve_pre_evolution_sources(session: "AsyncSession", card: Card) -> list[Card]:
+    """Catalog cards that evolve *into* this printing (reverse of ``resolve_evolution_targets``)."""
+    sources: list[Card] = []
+    seen: set[int] = set()
+
+    def push(c: Card) -> None:
+        if c.id == card.id or c.id in seen:
+            return
+        seen.add(c.id)
+        sources.append(c)
+
+    ef = (card.evolves_from or "").strip()
+    if ef:
+        match_name = or_(Card.name == ef, Card.name.startswith(f"{ef} "))
+        stmt = (
+            select(Card)
+            .where(Card.set_code == card.set_code, match_name)
+            .order_by(Card.collector_number.asc())
+        )
+        for row in (await session.execute(stmt)).scalars():
+            push(row)
+        if not sources:
+            stmt_any = select(Card).where(match_name)
+            pool = list((await session.execute(stmt_any)).scalars().all())
+            pool.sort(
+                key=lambda c: (_norm_set_rank_score(c.set_code), c.collector_number),
+                reverse=True,
+            )
+            if pool:
+                push(pool[0])
+
+    card_name = (card.name or "").strip()
+    if card_name:
+        stmt = (
+            select(Card)
+            .where(Card.set_code == card.set_code)
+            .order_by(Card.collector_number.asc())
+        )
+        for t in (await session.execute(stmt)).scalars():
+            if t.id == card.id:
+                continue
+            names = t.evolves_to_names
+            if not isinstance(names, list):
+                continue
+            for n in names:
+                if isinstance(n, str) and _evolves_from_matches_prey(card_name, n.strip()):
+                    push(t)
+                    break
+
+    return sources
 
 
 @dataclass(frozen=True)
