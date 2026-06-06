@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from poke_pon_bot.cogs.catalog import CatalogBrowseView, _catalog_view_embed, _search_kwargs
+from poke_pon_bot.ui.wishlist_toggle import WishlistToggleButton
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
@@ -56,9 +57,15 @@ from poke_pon_bot.services.evolution import (
     run_collection_evolution,
 )
 from poke_pon_bot.services.pack_collage import render_pack_collage_png
-from poke_pon_bot.chat_commands import pp_alias
-from poke_pon_bot.services.referrals import notify_referral_reward, record_referral_cd_use
+from poke_pon_bot.chat_commands import pp_alias, pp_chat_aliases
+from poke_pon_bot.services.referrals import (
+    notify_referral_first_pack,
+    notify_referral_reward,
+    record_referral_cd_use,
+)
 from poke_pon_bot.services.missions import MissionService, PackMissionAlert
+from poke_pon_bot.services.mission_notifications import schedule_mission_completion_dms
+from poke_pon_bot.services.engagement_reminders import clear_drop_reminder_after_drop
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
 from poke_pon_bot.services.collection_sell import collection_sell_block_reason
 from poke_pon_bot.services.instance_favorite import toggle_instance_favorite
@@ -137,19 +144,27 @@ async def _graded_slab_files(
     return [discord.File(png, filename="slab.png")]
 
 
-def _pack_cards_listing(cards: list[Card]) -> str:
+def _pack_cards_listing(
+    cards: list[Card],
+    *,
+    chase_slot_indices: frozenset[int] | None = None,
+) -> str:
     """Plain-text list of slots with set names (shown on every drop)."""
     if not cards:
         return ""
+    chase = chase_slot_indices or frozenset()
     lines = ["**Cards in this pack:**"]
     for i, c in enumerate(cards):
         set_label = (c.set_name or c.set_code or "?").strip()
         num = (c.collector_number or "?").strip()
         rarity = (c.tcg_rarity or "").strip()
         rarity_part = f" · *{rarity}*" if rarity else ""
+        chase_mark = " 🎯" if i in chase else ""
         lines.append(
-            f"• **#{i + 1}** {c.name} — **{set_label}** · #{num}{rarity_part}"
+            f"• **#{i + 1}**{chase_mark} {c.name} — **{set_label}** · #{num}{rarity_part}"
         )
+    if chase:
+        lines.append("_🎯 = rolled from the active **set chase** boost (counts toward the bar)._")
     return "\n".join(lines)
 
 
@@ -352,11 +367,14 @@ async def _send_collection_card(
 
 def _coll_one_line(rank: int, inst: UserCardInstance, card: Card) -> str:
     """Single compact row; Card ID in `` ` `` for tap-to-copy."""
+    from poke_pon_bot.services.grading import format_grade_slab_badge
+
     nm = _truncate(card.name, 22)
     sc = _truncate(card.set_code, 8)
     cn = _truncate(card.collector_number, 10)
     pid = compact_public_id_for_line(inst.public_id)
-    return f"`{rank}.` **{nm}** `{sc}` #{cn} `{pid}`"
+    grade = int(inst.grade) if getattr(inst, "grade", None) is not None else None
+    return f"`{rank}.` **{nm}** `{sc}` #{cn} `{pid}`{format_grade_slab_badge(grade)}"
 
 
 def _coll_pages(lines: list[str]) -> list[str]:
@@ -484,7 +502,10 @@ def _collection_view_embed(
         header_bits.append(rank_note)
     if header_bits:
         e.description = "\n\n".join(header_bits)
-    e.set_image(url=card.image_large_url or card.image_small_url)
+    from poke_pon_bot.services.card_images import card_image_urls
+
+    _small, _large = card_image_urls(card, web_public_url=None)
+    e.set_image(url=_large or _small)
 
     e.add_field(name="Set", value=f"{card.set_name}\n`{card.set_code}`", inline=True)
     e.add_field(name="Card #", value=f"`{card.collector_number}`", inline=True)
@@ -880,57 +901,6 @@ class EvolutionBranchView(discord.ui.View):
             description=f"You cancelled evolving **{self._card.name}**.",
         )
         await interaction.response.edit_message(embed=emb, view=None)
-
-
-class WishlistToggleButton(discord.ui.Button):
-    """Star button that toggles the current card on/off the viewer's wishlist."""
-
-    _STAR = "⭐"
-
-    def __init__(self, *, session_factory, card_id: int, viewer_id: int, wishlisted: bool, row: int = 0) -> None:
-        style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
-        super().__init__(emoji=self._STAR, style=style, row=row)
-        self._session_factory = session_factory
-        self._card_id = card_id
-        self._viewer_id = viewer_id
-        self._wishlisted = wishlisted
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._viewer_id:
-            await interaction.response.send_message(
-                "Only the person who opened this view can wishlist.",
-                ephemeral=True,
-            )
-            return
-        try:
-            async with self._session_factory() as session:
-                if self._wishlisted:
-                    await remove_wishlist(session, discord_user_id=self._viewer_id, card_id=self._card_id)
-                    self._wishlisted = False
-                else:
-                    added = await add_wishlist(session, discord_user_id=self._viewer_id, card_id=self._card_id)
-                    if not added:
-                        await interaction.response.send_message(
-                            f"Wishlist is full (max {MAX_WISHLIST_ENTRIES} cards) or already wishlisted.",
-                            ephemeral=True,
-                        )
-                        return
-                    self._wishlisted = True
-        except SQLAlchemyError:
-            _LOG.exception("wishlist toggle card_id=%s user=%s", self._card_id, self._viewer_id)
-            await interaction.response.send_message("Could not update wishlist. Try again.", ephemeral=True)
-            return
-
-        self.emoji = self._STAR
-        self.style = discord.ButtonStyle.primary if self._wishlisted else discord.ButtonStyle.secondary
-        await interaction.response.edit_message(view=self.view)
-
-    def update(self, *, card_id: int, wishlisted: bool) -> None:
-        """Refresh the button state (e.g. after flipping to a new card)."""
-        self._card_id = card_id
-        self._wishlisted = wishlisted
-        self.emoji = self._STAR
-        self.style = discord.ButtonStyle.primary if wishlisted else discord.ButtonStyle.secondary
 
 
 class InstanceFavoriteToggleButton(discord.ui.Button):
@@ -1330,6 +1300,46 @@ class CollectionFlipView(_CardIdReplyBinding, discord.ui.View):
         await self._sync_card_id_reply(inst.public_id)
 
 
+def _inline_reroll_button_row(card_count: int) -> int | None:
+    """Action row for the reroll button (to the right of the last claim button when possible)."""
+    if card_count < 1:
+        return None
+    if card_count >= 25 and card_count % 5 == 0:
+        return None
+    if card_count % 5 == 0:
+        return min(card_count // 5, 4)
+    return card_count // 5
+
+
+class CdRerollButton(discord.ui.Button):
+    """Issuer-only: reroll one random unclaimed slot (once per pack)."""
+
+    def __init__(self, *, pack_view: "PackPickView", row: int) -> None:
+        from poke_pon_bot.services.crystal_sinks import CD_REROLL_CRYSTAL_COST
+        from poke_pon_bot.services.crystals import format_crystals
+
+        super().__init__(
+            label=_truncate(f"Reroll {format_crystals(CD_REROLL_CRYSTAL_COST)}", 80),
+            style=discord.ButtonStyle.primary,
+            row=row,
+            disabled=pack_view._reroll_used,
+        )
+        self._pack_view = pack_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self._pack_view.handle_reroll_button(interaction)
+
+
+class IssuerCdRerollView(discord.ui.View):
+    """Fallback when the pack grid is full (25 claim rows): single reroll button, ephemeral."""
+
+    def __init__(self, *, pack_view: "PackPickView") -> None:
+        remaining = max(30, int(pack_view._deadline_unix) - int(time.time()))
+        super().__init__(timeout=float(min(remaining, 300.0)))
+        if not pack_view._reroll_used:
+            self.add_item(CdRerollButton(pack_view=pack_view, row=0))
+
+
 class ClaimSlotButton(discord.ui.Button):
     """Claim one revealed slot — first come per slot; per-user grab limit enforced by the view."""
 
@@ -1361,6 +1371,9 @@ class PackPickView(discord.ui.View):
         claim_seconds: int = _PACK_CLAIM_SECONDS,
         restored_slot_claimer: dict[int, int] | None = None,
         restored_slot_pid: dict[int, str] | None = None,
+        guild_id: int | None = None,
+        reroll_used: bool = False,
+        chase_slot_indices: frozenset[int] | None = None,
     ) -> None:
         claim_seconds = max(30, int(claim_seconds))
         now = int(time.time())
@@ -1382,19 +1395,28 @@ class PackPickView(discord.ui.View):
         # outside the embed (mobile long-press copy).
         self._slot_pid: dict[int, str] = dict(restored_slot_pid or {})
         self._finished = False
+        self._reroll_used = bool(reroll_used)
+        self._chase_slots: set[int] = set(chase_slot_indices or ())
         self._drop_host: commands.Cog | None = None
         self._channel_id: int | None = None
-        self._guild_id: int | None = None
+        self._guild_id = guild_id
         self._content_prefix = ""
 
         for i, card in enumerate(cards):
             row = i // 5
             self.add_item(ClaimSlotButton(pick_view=self, idx=i, card_name=card.name, row=row))
+        reroll_row = _inline_reroll_button_row(len(cards))
+        if reroll_row is not None:
+            self.add_item(CdRerollButton(pack_view=self, row=reroll_row))
         self._apply_restored_slot_buttons()
         if len(self._slot_pid) >= len(self._cards) and self._cards:
             self._finished = True
             for child in self.children:
                 child.disabled = True
+        elif self._reroll_used:
+            for child in self.children:
+                if isinstance(child, CdRerollButton):
+                    child.disabled = True
 
     def bind_drop_host(
         self,
@@ -1408,6 +1430,102 @@ class PackPickView(discord.ui.View):
         self._channel_id = int(channel_id)
         self._guild_id = guild_id
         self._content_prefix = content_prefix or ""
+
+    def _pick_reroll_slot(self) -> int | None:
+        import secrets
+
+        open_slots = [i for i in range(len(self._cards)) if i not in self._slot_pid]
+        if not open_slots:
+            return None
+        return secrets.choice(open_slots)
+
+    async def handle_reroll_button(self, interaction: discord.Interaction) -> None:
+        from poke_pon_bot.services.crystal_sinks import CD_REROLL_CRYSTAL_COST, reroll_cd_pack_slot
+        from poke_pon_bot.services.crystals import CrystalsService, format_crystals
+
+        if interaction.user.id != self._issuer_id:
+            await interaction.response.send_message(
+                "Only the player who opened this pack can reroll.",
+                ephemeral=True,
+            )
+            return
+        if self._reroll_used:
+            await interaction.response.send_message(
+                "You already used your reroll on this pack.",
+                ephemeral=True,
+            )
+            return
+        slot_idx = self._pick_reroll_slot()
+        if slot_idx is None:
+            await interaction.response.send_message(
+                "Every slot is already claimed — nothing left to reroll.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        from poke_pon_bot.services.crystals import InsufficientCrystalsError
+
+        crystals = CrystalsService()
+        try:
+            async with self._session_factory() as session:
+                try:
+                    await crystals.try_debit(session, int(self._issuer_id), CD_REROLL_CRYSTAL_COST)
+                except InsufficientCrystalsError:
+                    bal = await crystals.get_balance(session, int(self._issuer_id))
+                    await interaction.followup.send(
+                        f"Reroll costs {format_crystals(CD_REROLL_CRYSTAL_COST)} "
+                        f"(you have {format_crystals(bal)}).",
+                        ephemeral=True,
+                    )
+                    return
+                draw = await reroll_cd_pack_slot(session, guild_id=self._guild_id)
+                new_card = draw.card
+                self._cards[slot_idx] = new_card
+                if draw.from_set_chase:
+                    self._chase_slots.add(slot_idx)
+                else:
+                    self._chase_slots.discard(slot_idx)
+                self._reroll_used = True
+                for child in self.children:
+                    if isinstance(child, ClaimSlotButton) and child._idx == slot_idx:
+                        child.label = _truncate(
+                            f"#{slot_idx + 1} · Take · {new_card.name}", 80
+                        )
+                    if isinstance(child, CdRerollButton):
+                        child.disabled = True
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("cd reroll failed issuer=%s", self._issuer_id)
+            await interaction.followup.send("Could not reroll — try again.", ephemeral=True)
+            return
+
+        note = (
+            f"\n\n🔄 **{interaction.user.mention}** rerolled slot **#{slot_idx + 1}** "
+            f"→ **{new_card.name}** ({format_crystals(CD_REROLL_CRYSTAL_COST)})."
+        )
+        try:
+            png = await render_pack_collage_png(self._cards)
+        except (OSError, ValueError, httpx.HTTPError):
+            png = None
+        if self.message is not None:
+            try:
+                if png is not None:
+                    file = discord.File(png, filename="pack.png")
+                    await self.message.edit(
+                        content=self.full_content(note),
+                        attachments=[file],
+                        view=self,
+                    )
+                else:
+                    await self.message.edit(content=self.full_content(note), view=self)
+            except (discord.HTTPException, discord.NotFound):
+                _LOG.debug("Could not edit pack after reroll", exc_info=True)
+        self._schedule_persist()
+        await interaction.followup.send(
+            f"Rerolled **#{slot_idx + 1}** to **{new_card.name}**.",
+            ephemeral=True,
+        )
 
     def _apply_restored_slot_buttons(self) -> None:
         stale = [i for i in self._slot_claimer if i not in self._slot_pid]
@@ -1424,6 +1542,10 @@ class PackPickView(discord.ui.View):
             child.disabled = True
             child.style = discord.ButtonStyle.success
             child.label = _truncate(f"#{idx + 1} · Taken · {name}", 80)
+        if self._reroll_used or self._finished:
+            for child in self.children:
+                if isinstance(child, CdRerollButton):
+                    child.disabled = True
 
     def full_content(self, extra: str = "") -> str:
         body = self.build_content() + (extra or "")
@@ -1485,7 +1607,13 @@ class PackPickView(discord.ui.View):
                 f"{grab_rule}"
             )
         if not self._slot_pid:
-            parts = [base, _pack_cards_listing(self._cards)]
+            parts = [
+                base,
+                _pack_cards_listing(
+                    self._cards,
+                    chase_slot_indices=frozenset(self._chase_slots),
+                ),
+            ]
             if self._mission_block:
                 parts.append(self._mission_block.strip())
             return "\n\n".join(parts)
@@ -1634,6 +1762,12 @@ class PackPickView(discord.ui.View):
                 except Exception:
                     _LOG.exception("mission record_drop_claim failed user=%s", uid)
                     mission_notices = []
+                try:
+                    from poke_pon_bot.services.set_chase import record_set_chase_claim
+
+                    await record_set_chase_claim(session, discord_user_id=uid, card=db_card)
+                except Exception:
+                    _LOG.exception("set chase record failed user=%s", uid)
                 await session.commit()
         except Exception:
             _LOG.exception("drop claim db error user=%s card=%s", uid, card.id)
@@ -1694,6 +1828,9 @@ class PackPickView(discord.ui.View):
         # ---- Phase 4: post-claim hooks (must not break the claim). ----
         if mission_notices:
             mission_svc = MissionService()
+            schedule_mission_completion_dms(
+                interaction.client, user_id=uid, notices=mission_notices
+            )
             for notice in mission_notices:
                 try:
                     await interaction.followup.send(
@@ -1877,6 +2014,8 @@ class GachaCog(commands.Cog):
                     claim_seconds=int(row.claim_seconds),
                     restored_slot_claimer=claimer,
                     restored_slot_pid=pids,
+                    guild_id=row.guild_id,
+                    reroll_used=bool(getattr(row, "reroll_used", False)),
                 )
                 view.bind_drop_host(
                     self,
@@ -2568,8 +2707,9 @@ class GachaCog(commands.Cog):
                 owner_id=viewer_id,
                 card_ids=card_ids,
                 search_total=wl_total,
+                first_wishlisted=True,
             )
-            view.set_index(start_idx)
+            view.set_index(start_idx, wishlisted=True)
             note = (
                 f"Wishlist **#{start_idx + 1}** of **{len(card_ids)}** shown"
                 + (f" (**{wl_total}** total)" if wl_total > len(card_ids) else "")
@@ -2641,7 +2781,24 @@ class GachaCog(commands.Cog):
                 f"Catalog **#{slot}** of **{t2}** — **◀▶** only show the first **{CATALOG_BROWSE_PAGE_CAP}**; "
                 "narrow filters or use **slot** for any rank."
             )
-            await ctx.send(embed=_catalog_view_embed(card0, rank_note=note), ephemeral=ephe)
+            try:
+                async with self.bot.async_session_factory() as session:
+                    wishlisted = await is_wishlisted(
+                        session, discord_user_id=ctx.author.id, card_id=card0.id
+                    )
+            except SQLAlchemyError:
+                wishlisted = False
+            view = SingleCardWishlistView(
+                session_factory=self.bot.async_session_factory,
+                card_id=card0.id,
+                viewer_id=ctx.author.id,
+                wishlisted=wishlisted,
+            )
+            await ctx.send(
+                embed=_catalog_view_embed(card0, rank_note=note),
+                view=view,
+                ephemeral=ephe,
+            )
             return
         start_idx = 0 if slot is None else int(slot) - 1
         if not (0 <= start_idx < len(window_rows)):
@@ -2650,13 +2807,21 @@ class GachaCog(commands.Cog):
         card_ids = [c.id for c in window_rows]
         show_card = window_rows[start_idx]
         psize = len(card_ids)
+        try:
+            async with self.bot.async_session_factory() as session:
+                wishlisted = await is_wishlisted(
+                    session, discord_user_id=ctx.author.id, card_id=show_card.id
+                )
+        except SQLAlchemyError:
+            wishlisted = False
         view = CatalogBrowseView(
             session_factory=self.bot.async_session_factory,
             owner_id=ctx.author.id,
             card_ids=card_ids,
             search_total=total,
+            first_wishlisted=wishlisted,
         )
-        view.set_index(start_idx)
+        view.set_index(start_idx, wishlisted=wishlisted)
         note = CatalogBrowseView._note(view._index, psize, total)
         await ctx.send(
             embed=_catalog_view_embed(show_card, rank_note=note),
@@ -2823,7 +2988,7 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="cevolve",
-        aliases=[pp_alias("cevolve")],
+        aliases=[*pp_chat_aliases("cevolve", "evol", "ev")],
         description="Evolve a saved copy (by Card ID) — chat: cevolve",
     )
     @app_commands.describe(
@@ -2921,7 +3086,7 @@ class GachaCog(commands.Cog):
 
     @commands.hybrid_command(
         name="drop_boost",
-        aliases=[pp_alias("drop_boost")],
+        aliases=[*pp_chat_aliases("drop_boost", "dboost", "db")],
         description="Half drop cooldown — buy once on the website shop (or legacy Discord SKU)",
     )
     async def drop_boost_shop(self, ctx: commands.Context) -> None:
@@ -2979,6 +3144,38 @@ class GachaCog(commands.Cog):
                 return
             raise
 
+    async def _offer_cd_reroll(self, ctx: commands.Context, view: PackPickView) -> None:
+        """Ephemeral reroll only when the claim grid is full (25 slots) and inline button did not fit."""
+        if view._reroll_used or not view._cards:
+            return
+        if _inline_reroll_button_row(len(view._cards)) is not None:
+            return
+        open_slots = [i for i in range(len(view._cards)) if i not in view._slot_pid]
+        if not open_slots:
+            return
+        from poke_pon_bot.services.crystal_sinks import CD_REROLL_CRYSTAL_COST
+        from poke_pon_bot.services.crystals import format_crystals
+
+        reroll_view = IssuerCdRerollView(pack_view=view)
+        hint = (
+            f"Optional: tap **Reroll {format_crystals(CD_REROLL_CRYSTAL_COST)}** to replace one random "
+            "unclaimed card (same odds as this pack)."
+        )
+        try:
+            if ctx.interaction is not None:
+                if ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        hint, view=reroll_view, ephemeral=True
+                    )
+                else:
+                    await ctx.interaction.response.send_message(
+                        hint, view=reroll_view, ephemeral=True
+                    )
+            else:
+                await ctx.send(hint, view=reroll_view, ephemeral=True)
+        except (discord.HTTPException, discord.NotFound):
+            _LOG.debug("Could not send cd reroll offer", exc_info=True)
+
     async def run_card_drop(
         self,
         ctx: commands.Context,
@@ -3010,12 +3207,22 @@ class GachaCog(commands.Cog):
                         await ctx.send(msg, ephemeral=_hybrid_ephemeral(ctx))
                     return
                 await self._wallet.record_drop(session, uid)
-                await MissionService().record_drop_use(session, uid)
+                await clear_drop_reminder_after_drop(session, uid)
+                drop_use_notices = await MissionService().record_drop_use(session, uid)
                 await session.commit()
 
-            referral_notice = await record_referral_cd_use(self.bot.async_session_factory, uid)
-            if referral_notice is not None:
-                await notify_referral_reward(self.bot, referral_notice)
+            schedule_mission_completion_dms(
+                self.bot, user_id=uid, notices=drop_use_notices
+            )
+
+            referral_result = await record_referral_cd_use(
+                self.bot.async_session_factory, uid
+            )
+            if referral_result is not None:
+                if referral_result.first_pack is not None:
+                    await notify_referral_first_pack(self.bot, referral_result.first_pack)
+                if referral_result.threshold is not None:
+                    await notify_referral_reward(self.bot, referral_result.threshold)
 
         if ctx.interaction and not ctx.interaction.response.is_done():
             await ctx.defer(ephemeral=is_private)
@@ -3024,10 +3231,18 @@ class GachaCog(commands.Cog):
         guild_id = ctx.guild.id if ctx.guild is not None else None
         theme_line = ""
         luck_line = ""
-        async with self.bot.async_session_factory() as session:
-            try:
+        set_chase_line = ""
+        pack: list = []
+        chase_slots: frozenset[int] = frozenset()
+        chase_season = None
+        try:
+            async with self.bot.async_session_factory() as session:
                 theme = await resolve_active_cd_drop_theme(session, guild_id)
                 theme_line = format_theme_status_line(theme)
+                from poke_pon_bot.services.set_chase import build_status, format_set_chase_cd_header
+
+                chase_status = await build_status(session)
+                chase_season = chase_status.season if chase_status is not None else None
                 luck_row = None
                 if guild_id is not None:
                     luck_row = await get_luck_boost_row(session, guild_id=guild_id)
@@ -3040,22 +3255,39 @@ class GachaCog(commands.Cog):
                 )
                 luck_pct = await resolve_active_rarity_luck_boost(session, guild_id)
                 luck_line = format_luck_boost_line(luck_pct, scope_label=scope)
-                pack = await drop.roll_pack(
+                draws = await drop.roll_pack(
                     session,
                     drop_table_code="default",
                     card_count=card_count,
                     luck_percent=luck_percent,
                     guild_id=guild_id,
                 )
-            except RuntimeError as exc:
-                await ctx.send(str(exc), ephemeral=False)
-                return
-            except LookupError as exc:
-                await ctx.send(str(exc), ephemeral=False)
-                return
-            except ValueError as exc:
-                await ctx.send(str(exc), ephemeral=False)
-                return
+                pack = [d.card for d in draws]
+                chase_slots = frozenset(
+                    i for i, d in enumerate(draws) if d.from_set_chase
+                )
+                if chase_season is not None and chase_slots:
+                    set_chase_line = format_set_chase_cd_header(
+                        chase_season,
+                        chase_slot_indices=sorted(chase_slots),
+                        cards=pack,
+                    )
+        except RuntimeError as exc:
+            await ctx.send(str(exc), ephemeral=False)
+            return
+        except LookupError as exc:
+            await ctx.send(str(exc), ephemeral=False)
+            return
+        except ValueError as exc:
+            await ctx.send(str(exc), ephemeral=False)
+            return
+        except SQLAlchemyError:
+            _LOG.exception("run_card_drop failed user=%s", uid)
+            await ctx.send(
+                "Could not open your pack right now — try again in a moment.",
+                ephemeral=_hybrid_ephemeral(ctx),
+            )
+            return
 
         is_slash = ctx.interaction is not None
         private_reply = is_slash and is_private
@@ -3083,6 +3315,8 @@ class GachaCog(commands.Cog):
             mission_block=mission_block,
             max_grabs_per_user=max_grabs_per_user,
             claim_seconds=claim_secs,
+            guild_id=guild_id,
+            chase_slot_indices=chase_slots if chase_slots else None,
         )
         try:
             png = await render_pack_collage_png(pack)
@@ -3090,7 +3324,14 @@ class GachaCog(commands.Cog):
             png = None
         content = view.build_content()
         header_parts = [
-            p for p in (theme_line.strip(), luck_line.strip(), content_header.strip()) if p
+            p
+            for p in (
+                set_chase_line.strip(),
+                theme_line.strip(),
+                luck_line.strip(),
+                content_header.strip(),
+            )
+            if p
         ]
         if header_parts:
             content = "\n\n".join(header_parts) + f"\n\n{content}"
@@ -3110,6 +3351,33 @@ class GachaCog(commands.Cog):
                 view=view,
             )
             view.message = msg
+
+        await self._offer_cd_reroll(ctx, view)
+
+        if guild_id is not None:
+            try:
+                from poke_pon_bot.services.guild_milestones import (
+                    announce_milestone_tiers,
+                    record_pack_opened,
+                )
+
+                async with self.bot.async_session_factory() as session:
+                    crossed = await record_pack_opened(
+                        session,
+                        guild_id=int(guild_id),
+                        discord_user_id=int(uid),
+                    )
+                    await session.commit()
+                if crossed:
+                    asyncio.create_task(
+                        announce_milestone_tiers(
+                            self.bot,
+                            guild_id=int(guild_id),
+                            crossed_tiers=crossed,
+                        )
+                    )
+            except SQLAlchemyError:
+                _LOG.debug("guild pack milestone increment failed", exc_info=True)
 
         if not private_reply and msg.channel is not None:
             prefix = "\n\n".join(header_parts) if header_parts else ""

@@ -1,0 +1,64 @@
+# Ancient Mew promos — not in the Pokémon TCG API; imported via import_manual_cards.py
+# Card art is bundled under poke_pon_bot/static/manual_cards/ancient-mew/
+# (sourced from pkmncards.com miscellaneous.ancient-mew-1.jpg — do not use TCGplayer 42446).
+#
+# Rarity tiers reflect real-world print volume (not hype):
+#   - International / reprints: mass movie promos → uncommon–rare
+#   - JP cosmos: scarcer than intl in the west → rare holo
+#   - Speckle misprint: collectible but more common than corrected → ultra rare
+#   - Speckle corrected: shortest JP speckle run → ultra rare (not chase-tier in-game)
+
+cards:
+  - tcg_card_id: promo-ancientmew-2000-international
+    name: Ancient Mew
+    collector_number: P4
+    tcg_rarity: Promo
+    rarity_class: uncommon
+    image_art: cosmos
+    notes: >
+      Wizards international movie promo (2000). Millions distributed at theaters;
+      the most common Ancient Mew print.
+
+  - tcg_card_id: promo-ancientmew-2019-jp-reprint
+    name: Ancient Mew (2019 Reprint)
+    collector_number: P5
+    tcg_rarity: Promo
+    rarity_class: rare
+    image_art: speckle
+    notes: Japanese 2019 movie reprint (speckle holo).
+
+  - tcg_card_id: promo-ancientmew-2020-korean
+    name: Ancient Mew (2020 Korean)
+    collector_number: P6
+    tcg_rarity: Promo
+    rarity_class: rare
+    image_art: speckle
+    notes: Korean 2020 speckle promo.
+
+  - tcg_card_id: promo-ancientmew-1999-jp-cosmos
+    name: Ancient Mew (JP Cosmos)
+    collector_number: P3
+    tcg_rarity: Promo
+    rarity_class: rare_holo
+    image_art: cosmos
+    notes: Japanese Ancient Mew II (cosmos / galaxy holo).
+
+  - tcg_card_id: promo-ancientmew-1999-jp-speckle-nintedo
+    name: Ancient Mew (Nintedo Error)
+    collector_number: P1
+    tcg_rarity: Promo
+    rarity_class: ultra_rare
+    image_art: speckle
+    notes: >
+      Famous "Nintedo" copyright misprint. More copies than the corrected speckle
+      run but still a premium collectible.
+
+  - tcg_card_id: promo-ancientmew-1999-jp-speckle-corrected
+    name: Ancient Mew (JP Corrected)
+    collector_number: P2
+    tcg_rarity: Promo
+    rarity_class: ultra_rare
+    image_art: speckle
+    notes: >
+      Shortest-run Japanese speckle print after the error was fixed; scarcer than
+      the misprint in the wild.

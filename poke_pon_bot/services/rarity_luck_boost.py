@@ -13,6 +13,9 @@ from poke_pon_bot.services.rarity_luck import combine_luck_percent
 
 _LOG = logging.getLogger(__name__)
 
+# ``updated_by_discord_user_id`` for rows written by automated schedules (not /dev).
+SCHEDULED_LUCK_UPDATED_BY = 0
+
 
 async def get_luck_boost_row(
     session: AsyncSession,
@@ -81,6 +84,14 @@ async def clear_rarity_luck_boost(session: AsyncSession, *, guild_id: int | None
         delete(RarityLuckBoost).where(RarityLuckBoost.guild_id.is_(guild_id))
     )
     return (result.rowcount or 0) > 0
+
+
+async def clear_scheduled_global_luck_boost(session: AsyncSession) -> bool:
+    """Remove global boost only if the weekend scheduler owns it (leaves manual /dev rows)."""
+    row = await get_luck_boost_row(session, guild_id=None)
+    if row is None or row.updated_by_discord_user_id != SCHEDULED_LUCK_UPDATED_BY:
+        return False
+    return await clear_rarity_luck_boost(session, guild_id=None)
 
 
 def format_luck_boost_line(luck_percent: int, *, scope_label: str) -> str:

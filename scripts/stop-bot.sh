@@ -9,10 +9,18 @@ PORT="${POKEPON_WEB_PORT:-8080}"
 echo "Stopping launchd service (if loaded)..."
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
-echo "Stopping python -m poke_pon_bot processes..."
-pkill -f "[p]ython -m poke_pon_bot" 2>/dev/null || true
-sleep 2
-pkill -9 -f "[p]ython -m poke_pon_bot" 2>/dev/null || true
+echo "Stopping production run-bot.sh wrappers (if any)..."
+pkill -f "[s]cripts/run-bot.sh" 2>/dev/null || true
+
+if [[ -f "$ROOT/data/pokepon-bot.pid" ]]; then
+  old_pid="$(cat "$ROOT/data/pokepon-bot.pid" 2>/dev/null || true)"
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "Stopping production pid $old_pid"
+    kill "$old_pid" 2>/dev/null || true
+    sleep 2
+    kill -9 "$old_pid" 2>/dev/null || true
+  fi
+fi
 
 if command -v lsof >/dev/null 2>&1; then
   pids="$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)"

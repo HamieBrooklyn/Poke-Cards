@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -12,6 +13,8 @@ class Settings:
     discord_token: str | None
     """Optional guild ID for faster slash-command sync while developing."""
     dev_guild_id: int | None
+    """When True with ``dev_guild_id``, also sync slash commands globally (needed for DMs)."""
+    slash_sync_global: bool
     """Discord user IDs (snowflakes) allowed to use ``/dev`` commands; empty disables them."""
     developer_ids: frozenset[int]
     database_url: str
@@ -22,6 +25,8 @@ class Settings:
     # need this *and* the Developer Portal toggle. Default True; set
     # DISCORD_MESSAGE_CONTENT_INTENT=0 to opt out (slash-only).
     discord_message_content_intent: bool
+    # Server Members Intent — referrals, tutorial, member join events. Default on.
+    discord_guild_members_intent: bool
     """Discord monetization SKU id for “half drop cooldown” (durable one-time purchase)."""
     discord_drop_boost_sku_id: int | None
     """Discord monetization SKU id for the consumable "buy a random pack" purchase."""
@@ -107,6 +112,27 @@ class Settings:
     discord_events_guild_id: int | None
     """Vanity invite code for event links (``https://discord.gg/<code>?event=…``)."""
     discord_events_invite_code: str | None
+    """Auto-apply global rarity luck during the weekly weekend window (Fri 18:00 – Sun 20:00)."""
+    weekend_luck_enabled: bool
+    weekend_luck_percent: int
+    """IANA timezone for the weekend window (e.g. ``Europe/Stockholm``)."""
+    weekend_luck_timezone: str
+    """Seasonal featured-set chase (community progress bar + personal reward)."""
+    set_chase_enabled: bool
+    set_chase_set_code: str | None
+    set_chase_title: str | None
+    set_chase_starts_at: datetime | None
+    set_chase_ends_at: datetime | None
+    set_chase_global_target: int
+    set_chase_drop_boost_percent: int
+    set_chase_completion_threshold_pct: int
+    set_chase_reward_crystals: int
+    set_chase_reward_pokedollars: int
+    set_chase_community_reward_crystals: int
+    """``staging`` or ``production`` — from ``POKEPON_RUNTIME``."""
+    pokepon_runtime: str
+    """Inbox + notification hooks/API; on in staging, prod needs ``WEB_NOTIFICATIONS_ENABLED=1``."""
+    web_notifications_enabled: bool
 
 
 def _default_card_sets_path() -> Path:
@@ -161,6 +187,12 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         discord_message_content_intent = False
     else:
         discord_message_content_intent = True
+
+    raw_gmi = (os.environ.get("DISCORD_GUILD_MEMBERS_INTENT") or "").strip().lower()
+    if raw_gmi in ("0", "false", "no", "off"):
+        discord_guild_members_intent = False
+    else:
+        discord_guild_members_intent = True
 
     raw_sku = (os.environ.get("DISCORD_DROP_BOOST_SKU_ID") or "").strip()
     discord_drop_boost_sku_id: int | None
@@ -292,6 +324,9 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         slash_sync_mode = "never"
     else:
         raise SystemExit("SLASH_SYNC must be one of: auto, always, never.")
+
+    raw_slash_global = (os.environ.get("SLASH_SYNC_GLOBAL") or "").strip().lower()
+    slash_sync_global = raw_slash_global in ("1", "true", "yes", "on")
 
     web_host = (os.environ.get("WEB_HOST") or topgg_webhook_host or "0.0.0.0").strip() or "0.0.0.0"
     raw_web_port = (os.environ.get("WEB_PORT") or "").strip()
@@ -455,14 +490,71 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         (os.environ.get("DISCORD_EVENTS_INVITE_CODE") or "CgFRtYck").strip() or None
     )
 
+    raw_weekend_luck = (os.environ.get("WEEKEND_LUCK_ENABLED") or "1").strip().lower()
+    weekend_luck_enabled = raw_weekend_luck not in ("0", "false", "no", "off")
+    try:
+        weekend_luck_percent = int((os.environ.get("WEEKEND_LUCK_PERCENT") or "100").strip())
+    except ValueError as exc:
+        raise SystemExit("WEEKEND_LUCK_PERCENT must be an integer.") from exc
+    weekend_luck_timezone = (
+        (os.environ.get("WEEKEND_LUCK_TIMEZONE") or "Europe/Stockholm").strip()
+        or "Europe/Stockholm"
+    )
+
+    raw_set_chase = (os.environ.get("SET_CHASE_ENABLED") or "0").strip().lower()
+    set_chase_enabled = raw_set_chase in ("1", "true", "yes", "on")
+    set_chase_set_code = (os.environ.get("SET_CHASE_SET_CODE") or "").strip() or None
+    set_chase_title = (os.environ.get("SET_CHASE_TITLE") or "").strip() or None
+
+    def _parse_env_datetime(raw: str | None) -> datetime | None:
+        s = (raw or "").strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+
+    set_chase_starts_at = _parse_env_datetime(os.environ.get("SET_CHASE_START"))
+    set_chase_ends_at = _parse_env_datetime(os.environ.get("SET_CHASE_END"))
+
+    def _int_env(name: str, default: int) -> int:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise SystemExit(f"{name} must be an integer.") from exc
+
+    set_chase_global_target = _int_env("SET_CHASE_GLOBAL_TARGET", 5000)
+    set_chase_drop_boost_percent = _int_env("SET_CHASE_DROP_BOOST_PERCENT", 20)
+    set_chase_completion_threshold_pct = _int_env("SET_CHASE_COMPLETION_PERCENT", 80)
+    set_chase_reward_crystals = _int_env("SET_CHASE_REWARD_CRYSTALS", 50)
+    set_chase_reward_pokedollars = _int_env("SET_CHASE_REWARD_PD", 2500)
+    set_chase_community_reward_crystals = _int_env("SET_CHASE_COMMUNITY_REWARD_CRYSTALS", 15)
+
+    pokepon_runtime = (os.environ.get("POKEPON_RUNTIME") or "production").strip().lower()
+    raw_web_notify = (os.environ.get("WEB_NOTIFICATIONS_ENABLED") or "").strip().lower()
+    web_notifications_enabled = raw_web_notify in ("1", "true", "yes", "on") or (
+        pokepon_runtime == "staging"
+    )
+
     return Settings(
         discord_token=token,
         dev_guild_id=dev_guild_id,
+        slash_sync_global=slash_sync_global,
         developer_ids=frozenset(dev_ids),
         database_url=database_url,
         tcg_api_key=tcg_api_key,
         card_sets_config=card_sets_config,
         discord_message_content_intent=discord_message_content_intent,
+        discord_guild_members_intent=discord_guild_members_intent,
         discord_drop_boost_sku_id=discord_drop_boost_sku_id,
         discord_pack_consumable_sku_id=discord_pack_consumable_sku_id,
         drop_cooldown_base_seconds=drop_cooldown_base_seconds,
@@ -505,4 +597,20 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         referral_invite_channel_id=referral_invite_channel_id,
         discord_events_guild_id=discord_events_guild_id,
         discord_events_invite_code=discord_events_invite_code,
+        weekend_luck_enabled=weekend_luck_enabled,
+        weekend_luck_percent=weekend_luck_percent,
+        weekend_luck_timezone=weekend_luck_timezone,
+        set_chase_enabled=set_chase_enabled,
+        set_chase_set_code=set_chase_set_code,
+        set_chase_title=set_chase_title,
+        set_chase_starts_at=set_chase_starts_at,
+        set_chase_ends_at=set_chase_ends_at,
+        set_chase_global_target=set_chase_global_target,
+        set_chase_drop_boost_percent=set_chase_drop_boost_percent,
+        set_chase_completion_threshold_pct=set_chase_completion_threshold_pct,
+        set_chase_reward_crystals=set_chase_reward_crystals,
+        set_chase_reward_pokedollars=set_chase_reward_pokedollars,
+        set_chase_community_reward_crystals=set_chase_community_reward_crystals,
+        pokepon_runtime=pokepon_runtime,
+        web_notifications_enabled=web_notifications_enabled,
     )

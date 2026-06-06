@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -40,5 +40,10 @@ class UserCardInstance(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="drop")
     # Times this copy has been evolved (future costs scale with this).
     evolution_stages: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    is_favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    grade: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    craft_uses_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    auction_obtained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     card = relationship("Card", back_populates="instances")

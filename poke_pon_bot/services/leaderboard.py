@@ -11,15 +11,25 @@ from poke_pon_bot.models.auction import AUCTION_STATUS_ENDED_SOLD, CardAuction
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
+from poke_pon_bot.services.grading import grade_label, grading_fields_for_instance
+from poke_pon_bot.services.guild_milestones import (
+    GUILD_STAT_CATEGORIES,
+    GUILD_STAT_TITLES,
+    fetch_guild_stat_leaderboard,
+)
 
-LEADERBOARD_CATEGORIES = frozenset({"strongest", "tankiest", "rarest", "auction"})
+LEADERBOARD_CATEGORIES = frozenset({"strongest", "tankiest", "rarest", "auction", "graded"})
 
 LEADERBOARD_TITLES = {
     "strongest": "Strongest Cards",
     "tankiest": "Tankiest Cards",
     "rarest": "Rarest Cards",
     "auction": "Top Auction Sales",
+    "graded": "Top Graded Slabs",
+    **GUILD_STAT_TITLES,
 }
+
+SERVER_LEADERBOARD_CATEGORIES = LEADERBOARD_CATEGORIES | GUILD_STAT_CATEGORIES
 
 DISCORD_PER_PAGE = 10
 DISCORD_MAX_PAGES = 50
@@ -51,9 +61,14 @@ def max_attack_damage(attacks: Any) -> int:
 async def leaderboard_strongest(
     session: AsyncSession,
     member_ids: set[int] | None,
-) -> list[tuple[int, str, int]]:
+) -> list[tuple[int, str, int, int | None]]:
     stmt = (
-        select(UserCardInstance.discord_user_id, Card.name, Card.attacks)
+        select(
+            UserCardInstance.discord_user_id,
+            Card.name,
+            Card.attacks,
+            UserCardInstance.grade,
+        )
         .join(Card, Card.id == UserCardInstance.card_id)
         .where(Card.attacks.isnot(None))
     )
@@ -61,26 +76,31 @@ async def leaderboard_strongest(
         stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
     rows = (await session.execute(stmt.limit(FETCH_LIMIT))).all()
 
-    best: dict[int, tuple[str, int]] = {}
-    for uid, name, attacks in rows:
+    best: dict[int, tuple[str, int, int | None]] = {}
+    for uid, name, attacks, grade in rows:
         dmg = max_attack_damage(attacks)
         if dmg <= 0:
             continue
         prev = best.get(uid)
         if prev is None or dmg > prev[1]:
-            best[uid] = (name, dmg)
+            best[uid] = (name, dmg, int(grade) if grade is not None else None)
 
     ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:MAX_ENTRIES]
-    return [(uid, name, dmg) for uid, (name, dmg) in ranked]
+    return [(uid, name, dmg, grade) for uid, (name, dmg, grade) in ranked]
 
 
 async def leaderboard_tankiest(
     session: AsyncSession,
     member_ids: set[int] | None,
-) -> list[tuple[int, str, int]]:
+) -> list[tuple[int, str, int, int | None]]:
     hp_int = func.cast(func.coalesce(func.nullif(Card.hp, ""), "0"), Integer())
     stmt = (
-        select(UserCardInstance.discord_user_id, Card.name, hp_int.label("hp_val"))
+        select(
+            UserCardInstance.discord_user_id,
+            Card.name,
+            hp_int.label("hp_val"),
+            UserCardInstance.grade,
+        )
         .join(Card, Card.id == UserCardInstance.card_id)
         .where(Card.hp.isnot(None), Card.hp != "")
         .order_by(desc("hp_val"))
@@ -89,29 +109,30 @@ async def leaderboard_tankiest(
         stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
     rows = (await session.execute(stmt.limit(FETCH_LIMIT))).all()
 
-    best: dict[int, tuple[str, int]] = {}
-    for uid, name, hp_val in rows:
+    best: dict[int, tuple[str, int, int | None]] = {}
+    for uid, name, hp_val, grade in rows:
         hp = int(hp_val) if hp_val else 0
         if hp <= 0:
             continue
         prev = best.get(uid)
         if prev is None or hp > prev[1]:
-            best[uid] = (name, hp)
+            best[uid] = (name, hp, int(grade) if grade is not None else None)
 
     ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:MAX_ENTRIES]
-    return [(uid, name, hp) for uid, (name, hp) in ranked]
+    return [(uid, name, hp, grade) for uid, (name, hp, grade) in ranked]
 
 
 async def leaderboard_rarest(
     session: AsyncSession,
     member_ids: set[int] | None,
-) -> list[tuple[int, str, str, int]]:
+) -> list[tuple[int, str, str, int, int | None]]:
     stmt = (
         select(
             UserCardInstance.discord_user_id,
             Card.name,
             RarityClass.display_name,
             RarityClass.sort_order,
+            UserCardInstance.grade,
         )
         .join(Card, Card.id == UserCardInstance.card_id)
         .join(RarityClass, RarityClass.id == Card.rarity_class_id)
@@ -121,27 +142,33 @@ async def leaderboard_rarest(
         stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
     rows = (await session.execute(stmt.limit(FETCH_LIMIT))).all()
 
-    best: dict[int, tuple[str, str, int]] = {}
-    for uid, name, rarity_name, sort_order in rows:
+    best: dict[int, tuple[str, str, int, int | None]] = {}
+    for uid, name, rarity_name, sort_order, grade in rows:
         order = int(sort_order) if sort_order else 0
         prev = best.get(uid)
         if prev is None or order > prev[2]:
-            best[uid] = (name, rarity_name or "Unknown", order)
+            best[uid] = (
+                name,
+                rarity_name or "Unknown",
+                order,
+                int(grade) if grade is not None else None,
+            )
 
     ranked = sorted(best.items(), key=lambda x: x[1][2], reverse=True)[:MAX_ENTRIES]
-    return [(uid, name, rn, so) for uid, (name, rn, so) in ranked]
+    return [(uid, name, rn, so, grade) for uid, (name, rn, so, grade) in ranked]
 
 
 async def leaderboard_auction(
     session: AsyncSession,
     member_ids: set[int] | None,
     guild_id: int | None,
-) -> list[tuple[int, str, int]]:
+) -> list[tuple[int, str, int, int | None]]:
     stmt = (
         select(
             CardAuction.seller_discord_id,
             Card.name,
             CardAuction.high_bid_pokedollars,
+            UserCardInstance.grade,
         )
         .join(UserCardInstance, UserCardInstance.id == CardAuction.instance_id)
         .join(Card, Card.id == UserCardInstance.card_id)
@@ -154,7 +181,38 @@ async def leaderboard_auction(
         stmt = stmt.where(CardAuction.guild_id == guild_id)
 
     rows = (await session.execute(stmt.limit(MAX_ENTRIES))).all()
-    return [(uid, name, int(price)) for uid, name, price in rows]
+    return [
+        (uid, name, int(price), int(grade) if grade is not None else None)
+        for uid, name, price, grade in rows
+    ]
+
+
+async def leaderboard_graded(
+    session: AsyncSession,
+    member_ids: set[int] | None,
+) -> list[tuple[int, str, int, str]]:
+    stmt = (
+        select(
+            UserCardInstance.discord_user_id,
+            Card.name,
+            UserCardInstance.grade,
+        )
+        .join(Card, Card.id == UserCardInstance.card_id)
+        .where(UserCardInstance.grade.isnot(None))
+    )
+    if member_ids is not None:
+        stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
+    rows = (await session.execute(stmt.limit(FETCH_LIMIT))).all()
+
+    best: dict[int, tuple[str, int, str]] = {}
+    for uid, name, grade in rows:
+        g = int(grade)
+        prev = best.get(uid)
+        if prev is None or g > prev[1]:
+            best[uid] = (name, g, grade_label(g))
+
+    ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:MAX_ENTRIES]
+    return [(uid, name, g, lbl) for uid, (name, g, lbl) in ranked]
 
 
 async def fetch_leaderboard(
@@ -164,6 +222,12 @@ async def fetch_leaderboard(
     member_ids: set[int] | None = None,
     guild_id: int | None = None,
 ) -> list[tuple]:
+    if category in GUILD_STAT_CATEGORIES:
+        if guild_id is None or member_ids is None:
+            raise ValueError("guild stat leaderboards require server scope")
+        return await fetch_guild_stat_leaderboard(
+            session, category, guild_id=guild_id, member_ids=member_ids
+        )
     if category == "strongest":
         return await leaderboard_strongest(session, member_ids)
     if category == "tankiest":
@@ -172,6 +236,8 @@ async def fetch_leaderboard(
         return await leaderboard_rarest(session, member_ids)
     if category == "auction":
         return await leaderboard_auction(session, member_ids, guild_id)
+    if category == "graded":
+        return await leaderboard_graded(session, member_ids)
     raise ValueError(f"unknown leaderboard category: {category}")
 
 
@@ -202,6 +268,7 @@ def card_preview(
         "hp": card.hp,
         "tcg_rarity": card.tcg_rarity,
         "rarity_display": rarity_display,
+        **grading_fields_for_instance(inst),
     }
 
 
@@ -347,6 +414,12 @@ async def fetch_leaderboard_web(
     member_ids: set[int] | None = None,
     guild_id: int | None = None,
 ) -> list[tuple]:
+    if category in GUILD_STAT_CATEGORIES:
+        if guild_id is None or member_ids is None:
+            raise ValueError("guild stat leaderboards require server scope")
+        return await fetch_guild_stat_leaderboard(
+            session, category, guild_id=guild_id, member_ids=member_ids
+        )
     if category == "strongest":
         return await leaderboard_strongest_web(session, member_ids)
     if category == "tankiest":
@@ -355,4 +428,37 @@ async def fetch_leaderboard_web(
         return await leaderboard_rarest_web(session, member_ids)
     if category == "auction":
         return await leaderboard_auction_web(session, member_ids, guild_id)
+    if category == "graded":
+        return await leaderboard_graded_web(session, member_ids)
     raise ValueError(f"unknown leaderboard category: {category}")
+
+
+async def leaderboard_graded_web(
+    session: AsyncSession,
+    member_ids: set[int] | None,
+) -> list[tuple[int, str, int, str, dict[str, Any]]]:
+    stmt = (
+        select(UserCardInstance, Card, RarityClass.display_name)
+        .join(Card, Card.id == UserCardInstance.card_id)
+        .join(RarityClass, RarityClass.id == Card.rarity_class_id)
+        .where(UserCardInstance.grade.isnot(None))
+    )
+    if member_ids is not None:
+        stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
+    rows = (await session.execute(stmt.limit(FETCH_LIMIT))).all()
+
+    best: dict[int, tuple[str, int, str, dict[str, Any]]] = {}
+    for inst, card, rarity_name in rows:
+        uid = int(inst.discord_user_id)
+        g = int(inst.grade)
+        prev = best.get(uid)
+        if prev is None or g > prev[1]:
+            best[uid] = (
+                card.name,
+                g,
+                grade_label(g),
+                card_preview(card, inst, rarity_display=rarity_name),
+            )
+
+    ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:MAX_ENTRIES]
+    return [(uid, name, g, lbl, preview) for uid, (name, g, lbl, preview) in ranked]

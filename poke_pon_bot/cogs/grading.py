@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy.exc import SQLAlchemyError
 
-from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.cogs.gacha import (
     _CardIdReplyBinding,
     _collection_view_embed,
@@ -23,6 +23,7 @@ from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 from poke_pon_bot.services.grading import (
     GRADE_CRYSTAL_COST,
     build_grade_preview,
+    grade_sell_bonus_percent,
     remove_grade,
     roll_grade_for_instance,
 )
@@ -46,6 +47,10 @@ def _grading_embed_note(preview) -> str:
         )
     else:
         bits.insert(0, "**Not graded yet** — roll to seal this copy in a slab.")
+    if preview.has_grade and preview.grade is not None:
+        bonus = grade_sell_bonus_percent(preview.grade)
+        if bonus > 0:
+            bits.append(f"**Shop sell bonus:** +{bonus}% when you sell this copy.")
     return "\n".join(bits)
 
 
@@ -130,7 +135,10 @@ class GradeCardView(_CardIdReplyBinding, discord.ui.View):
                 embed.set_image(url="attachment://slab.png")
                 files.append(discord.File(png, filename="slab.png"))
             else:
-                embed.set_image(url=card.image_large_url or card.image_small_url)
+                from poke_pon_bot.services.card_images import card_image_urls
+
+                _small, _large = card_image_urls(card, web_public_url=None)
+                embed.set_image(url=_large or _small)
 
         await interaction.edit_original_response(
             embed=embed,
@@ -217,7 +225,7 @@ class GradingCog(commands.Cog):
 
     @commands.hybrid_command(
         name="grade",
-        aliases=[pp_alias("grade")],
+        aliases=[*pp_chat_aliases("grade", "gr")],
         description="View or roll a PSA-style grade for one of your copies",
     )
     @app_commands.describe(
@@ -287,7 +295,10 @@ class GradingCog(commands.Cog):
                 embed.set_image(url="attachment://slab.png")
                 files.append(discord.File(png, filename="slab.png"))
         else:
-            embed.set_image(url=card.image_large_url or card.image_small_url)
+            from poke_pon_bot.services.card_images import card_image_urls
+
+            _small, _large = card_image_urls(card, web_public_url=None)
+            embed.set_image(url=_large or _small)
 
         if files:
             msg = await ctx.send(embed=embed, view=view, files=files, ephemeral=ephe)

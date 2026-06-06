@@ -27,6 +27,7 @@ from poke_pon_bot.services.excluded_sets import (
     filter_excluded_set_codes,
 )
 from poke_pon_bot.services.instance_public_id import new_public_id
+from poke_pon_bot.services.set_chase import resolve_set_chase_drop_theme
 from poke_pon_bot.services.weighted_rng import weighted_choice
 
 # After the first two guaranteed rolls: probability of each next card appearing,
@@ -47,6 +48,14 @@ CODE_SLOT_LUCK_MULTIPLIER = 2.0
 
 # Pricier series add luck on top of the base (crystals above this baseline).
 PACK_PRICE_LUCK_BASE_CRYSTALS = 9
+
+
+@dataclass(frozen=True)
+class CdPackDraw:
+    """One ``/cd`` slot plus whether the set-chase theme won that roll."""
+
+    card: Card
+    from_set_chase: bool = False
 PACK_PRICE_LUCK_PER_CRYSTAL_ABOVE_BASE = 2.0
 
 # Bonus code card: bias rarity weights upward (same tiers, higher relative odds for holo+).
@@ -81,6 +90,114 @@ _CODE_SLOT_RARITY_WEIGHT_MULT: Mapping[int, float] = {
     9: 3.35,
     10: 4.0,
 }
+
+# Within a rarity tier, cards are weighted by their printed TCG rarity so that
+# rarer printings are harder to pull even when they share a tier classification.
+_TCG_RARITY_PULL_WEIGHT: dict[str, float] = {
+    "Common": 10.0,
+    "Uncommon": 7.0,
+    "LEGEND": 3.0,
+    "Rare": 4.5,
+    "Rare Secret": 1.5,
+    "Rare Shiny": 2.0,
+    "Rare BREAK": 3.0,
+    "Rare Prism Star": 2.5,
+    "Rare Prime": 2.5,
+    "Rare Shining": 1.8,
+    "Rare ACE": 2.0,
+    "MEGA_ATTACK_RARE": 2.0,
+    "Black White Rare": 3.0,
+    "Rare Holo": 3.0,
+    "Trainer Gallery Rare Holo": 2.0,
+    "Rare Holo LV.X": 1.5,
+    "Rare Holo Star": 1.0,
+    "Rare Ultra": 1.5,
+    "Ultra Rare": 1.5,
+    "Rare Holo EX": 1.5,
+    "Rare Holo V": 1.5,
+    "Rare Holo GX": 1.5,
+    "Rare Holo VMAX": 1.2,
+    "Rare Holo VSTAR": 1.2,
+    "Rare Shiny GX": 1.0,
+    "ACE SPEC Rare": 1.2,
+    "Shiny Ultra Rare": 0.8,
+    "Double Rare": 2.0,
+    "Radiant Rare": 1.2,
+    "Illustration Rare": 1.0,
+    "Shiny Rare": 2.0,
+    "Promo": 3.0,
+    "Special Illustration Rare": 0.5,
+    "Classic Collection": 1.5,
+    "Amazing Rare": 0.8,
+    "Hyper Rare": 0.3,
+    "Mega Hyper Rare": 0.2,
+    "Rare Rainbow": 0.2,
+}
+_DEFAULT_TCG_RARITY_WEIGHT = 2.0
+
+_INTRA_TIER_POOL_SIZE = 50
+
+# HP and damage scaling: cards with higher stats are treated as more valuable
+# and therefore harder to pull (lower weight). The base weight from tcg_rarity
+# is divided by a power factor derived from HP and damage.
+_HP_BASELINE = 60
+_DAMAGE_BASELINE = 30
+_STAT_SCALE_POWER = 0.35
+
+
+def _parse_card_hp(card: Card) -> int:
+    """Extract leading integer from HP string (e.g. '120', '120+')."""
+    hp = card.hp
+    if not hp:
+        return 0
+    digits: list[str] = []
+    for ch in str(hp).strip():
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    return int("".join(digits)) if digits else 0
+
+
+def _max_attack_damage_for_card(card: Card) -> int:
+    attacks = card.attacks
+    if not isinstance(attacks, list):
+        return 0
+    best = 0
+    for atk in attacks:
+        if not isinstance(atk, dict):
+            continue
+        raw = atk.get("damage")
+        if raw is None:
+            continue
+        digits: list[str] = []
+        for ch in str(raw):
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        if digits:
+            best = max(best, int("".join(digits)))
+    return best
+
+
+def card_pull_weight(card: Card) -> float:
+    """Pull weight for within-tier selection.
+
+    Combines the printed TCG rarity base weight with HP and max damage:
+    higher-stat cards get a lower weight (harder to pull).
+    """
+    tcg = (card.tcg_rarity or "").strip()
+    base = _TCG_RARITY_PULL_WEIGHT.get(tcg, _DEFAULT_TCG_RARITY_WEIGHT)
+
+    hp = _parse_card_hp(card)
+    dmg = _max_attack_damage_for_card(card)
+
+    hp_factor = max(hp, _HP_BASELINE) / _HP_BASELINE
+    dmg_factor = max(dmg, _DAMAGE_BASELINE) / _DAMAGE_BASELINE
+    stat_divisor = (hp_factor * dmg_factor) ** _STAT_SCALE_POWER
+
+    return base / stat_divisor
 
 
 @dataclass(frozen=True)
@@ -188,13 +305,13 @@ class DropService:
             if not exclude:
                 exclude = None
 
-        def _pick_stmt(with_exclude: bool):
+        def _pool_stmt(with_exclude: bool):
             s = (
                 select(Card)
                 .where(Card.rarity_class_id == rarity_class_id)
                 .where(excluded_set_clause(Card.set_code))
                 .order_by(func.random())
-                .limit(1)
+                .limit(_INTRA_TIER_POOL_SIZE)
             )
             if scoped_codes is not None:
                 s = s.where(Card.set_code.in_(scoped_codes))
@@ -204,11 +321,19 @@ class DropService:
                 s = s.where(Card.id.notin_(exclude))
             return s
 
-        card = await session.scalar(_pick_stmt(with_exclude=True))
-        if card is None and exclude:
-            card = await session.scalar(_pick_stmt(with_exclude=False))
-        if card is None:
+        pool = list((await session.execute(_pool_stmt(with_exclude=True))).scalars())
+        if not pool and exclude:
+            pool = list((await session.execute(_pool_stmt(with_exclude=False))).scalars())
+        if not pool:
             raise RuntimeError("Could not roll a card — catalog may be incomplete.")
+
+        if len(pool) == 1:
+            card = pool[0]
+        else:
+            card = weighted_choice(
+                self._rng,
+                [(c, card_pull_weight(c)) for c in pool],
+            )
 
         return card
 
@@ -282,23 +407,49 @@ class DropService:
         drop_table_code: str,
         luck_percent: float,
         theme: ResolvedCdDropTheme | None,
-    ) -> Card:
-        """One ``/cd`` slot, optionally forced to the active global/server theme."""
-        if theme is not None and theme_applies_for_slot(theme.chance_percent, self._rng):
-            try:
-                return await self.draw_single_card(
-                    session,
-                    drop_table_code=drop_table_code,
-                    set_codes=list(theme.set_codes) if theme.set_codes else None,
-                    name_contains=theme.name_contains,
-                    luck_percent=luck_percent,
-                )
-            except RuntimeError:
-                pass
-        return await self.draw_single_card(
+        set_chase_theme: ResolvedCdDropTheme | None = None,
+    ) -> CdPackDraw:
+        """One ``/cd`` slot — set chase, then global/server theme, then open pool."""
+        for scoped in (set_chase_theme, theme):
+            if scoped is not None and theme_applies_for_slot(scoped.chance_percent, self._rng):
+                try:
+                    card = await self.draw_single_card(
+                        session,
+                        drop_table_code=drop_table_code,
+                        set_codes=list(scoped.set_codes) if scoped.set_codes else None,
+                        name_contains=scoped.name_contains,
+                        luck_percent=luck_percent,
+                    )
+                    return CdPackDraw(
+                        card=card,
+                        from_set_chase=scoped is set_chase_theme,
+                    )
+                except RuntimeError:
+                    pass
+        card = await self.draw_single_card(
             session,
             drop_table_code=drop_table_code,
             luck_percent=luck_percent,
+        )
+        return CdPackDraw(card=card, from_set_chase=False)
+
+    async def reroll_cd_slot(
+        self,
+        session: AsyncSession,
+        *,
+        guild_id: int | None = None,
+        drop_table_code: str = "default",
+    ) -> CdPackDraw:
+        """One fresh ``/cd`` slot (same luck/theme/set-chase rules as a normal pack)."""
+        luck = await resolve_effective_rarity_luck(session, guild_id, extra_luck_percent=0.0)
+        theme = await resolve_active_cd_drop_theme(session, guild_id)
+        set_chase_theme = await resolve_set_chase_drop_theme(session)
+        return await self._draw_cd_slot(
+            session,
+            drop_table_code=drop_table_code,
+            luck_percent=luck,
+            theme=theme,
+            set_chase_theme=set_chase_theme,
         )
 
     async def roll_pack(
@@ -309,7 +460,7 @@ class DropService:
         card_count: int | None = None,
         luck_percent: float = 0.0,
         guild_id: int | None = None,
-    ) -> list[Card]:
+    ) -> list[CdPackDraw]:
         """Open a pack: default is 2 cards + optional extras; ``card_count`` fixes the size."""
         luck = await resolve_effective_rarity_luck(
             session,
@@ -317,6 +468,7 @@ class DropService:
             extra_luck_percent=luck_percent,
         )
         theme = await resolve_active_cd_drop_theme(session, guild_id)
+        set_chase_theme = await resolve_set_chase_drop_theme(session)
 
         if card_count is not None:
             n = max(2, min(int(card_count), _FIXED_PACK_SIZE_CAP))
@@ -326,16 +478,25 @@ class DropService:
                     drop_table_code=drop_table_code,
                     luck_percent=luck,
                     theme=theme,
+                    set_chase_theme=set_chase_theme,
                 )
                 for _ in range(n)
             ]
 
-        pack: list[Card] = [
+        pack: list[CdPackDraw] = [
             await self._draw_cd_slot(
-                session, drop_table_code=drop_table_code, luck_percent=luck, theme=theme
+                session,
+                drop_table_code=drop_table_code,
+                luck_percent=luck,
+                theme=theme,
+                set_chase_theme=set_chase_theme,
             ),
             await self._draw_cd_slot(
-                session, drop_table_code=drop_table_code, luck_percent=luck, theme=theme
+                session,
+                drop_table_code=drop_table_code,
+                luck_percent=luck,
+                theme=theme,
+                set_chase_theme=set_chase_theme,
             ),
         ]
 
@@ -349,6 +510,7 @@ class DropService:
                     drop_table_code=drop_table_code,
                     luck_percent=luck,
                     theme=theme,
+                    set_chase_theme=set_chase_theme,
                 )
             )
             extras += 1

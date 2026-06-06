@@ -148,6 +148,10 @@ It runs inside the bot process (one aiohttp app shared with the Top.gg webhook),
 
 If `WEB_*` / `DISCORD_OAUTH_*` are missing, the dashboard endpoints simply stay off and the bot keeps running as before.
 
+## Planning
+
+- **[Feature backlog](docs/FEATURE_BACKLOG.md)** — suggested bot/web features, status, and what to build next.
+
 ## References
 
 - [discord.py API / intro](https://discordpy.readthedocs.io/en/stable/discord.html)

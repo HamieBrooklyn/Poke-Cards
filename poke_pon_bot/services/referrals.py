@@ -1,4 +1,4 @@
-"""Automatic server-invite referrals: reward inviters when friends use ``cd`` enough times."""
+"""Automatic server-invite referrals: reward inviter and invitee when friends play."""
 
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from poke_pon_bot.models.guild_member_seen import GuildMemberSeen
 from poke_pon_bot.models.guild_referral import GuildReferral
 from poke_pon_bot.services.crystals import CrystalsService, format_crystals
+from poke_pon_bot.services.notification_delivery import PREF_REFERRALS, schedule_notification
 
 _LOG = logging.getLogger(__name__)
 
 REFERRAL_CD_USES_REQUIRED = 10
 REFERRAL_CRYSTAL_REWARD = 25
 REFERRAL_MAX_REWARDS_PER_INVITER = 3
+REFERRAL_FIRST_PACK_INVITEE_CRYSTALS = 15
+REFERRAL_FIRST_PACK_INVITER_CRYSTALS = 10
 # Inviters must have an established account (anti-throwaway-inviter farming).
 REFERRAL_MIN_INVITER_ACCOUNT_AGE_DAYS = 7
 
@@ -33,6 +36,20 @@ class ReferralRewardNotice:
     rewards_cap: int = REFERRAL_MAX_REWARDS_PER_INVITER
 
 
+@dataclass(frozen=True)
+class ReferralFirstPackNotice:
+    inviter_id: int
+    invitee_id: int
+    inviter_crystals: int
+    invitee_crystals: int
+
+
+@dataclass(frozen=True)
+class ReferralCdUseResult:
+    first_pack: ReferralFirstPackNotice | None = None
+    threshold: ReferralRewardNotice | None = None
+
+
 def referral_status_for_row(row: GuildReferral) -> str:
     """``in_progress`` | ``rewarded`` | ``completed`` (threshold met, no crystals)."""
     if row.completed_at is None:
@@ -40,6 +57,39 @@ def referral_status_for_row(row: GuildReferral) -> str:
     if int(row.crystals_awarded or 0) > 0:
         return "rewarded"
     return "completed"
+
+
+async def build_invitee_referral_status(
+    session: AsyncSession,
+    invitee_discord_id: int,
+    *,
+    inviter_profiles: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Progress view when the current user joined via someone else's invite."""
+    row = await session.get(GuildReferral, invitee_discord_id)
+    if row is None:
+        return None
+    inviter_id = int(row.inviter_discord_id)
+    profile = inviter_profiles.get(inviter_id) or {
+        "id": str(inviter_id),
+        "username": None,
+        "global_name": None,
+        "avatar_url": None,
+    }
+    display = profile.get("global_name") or profile.get("username")
+    cd_uses = int(row.cd_uses or 0)
+    first_pack_done = row.first_pack_rewarded_at is not None
+    return {
+        "inviter": profile,
+        "inviter_display_name": display or f"User {inviter_id}",
+        "joined_at": row.joined_at.isoformat() if row.joined_at else None,
+        "cd_uses": cd_uses,
+        "cd_uses_required": REFERRAL_CD_USES_REQUIRED,
+        "first_pack_rewarded": first_pack_done,
+        "invitee_crystals_awarded": int(row.invitee_crystals_awarded or 0),
+        "status": referral_status_for_row(row),
+        "guild_id": str(row.guild_id),
+    }
 
 
 async def build_referral_dashboard(
@@ -78,6 +128,8 @@ async def build_referral_dashboard(
                 "cd_uses_required": REFERRAL_CD_USES_REQUIRED,
                 "status": referral_status_for_row(row),
                 "crystals_awarded": int(row.crystals_awarded or 0),
+                "invitee_crystals_awarded": int(row.invitee_crystals_awarded or 0),
+                "first_pack_rewarded": row.first_pack_rewarded_at is not None,
                 "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                 "guild_id": str(row.guild_id),
             }
@@ -88,14 +140,18 @@ async def build_referral_dashboard(
         "rules": {
             "cd_uses_required": REFERRAL_CD_USES_REQUIRED,
             "crystal_reward": REFERRAL_CRYSTAL_REWARD,
+            "first_pack_invitee_crystals": REFERRAL_FIRST_PACK_INVITEE_CRYSTALS,
+            "first_pack_inviter_crystals": REFERRAL_FIRST_PACK_INVITER_CRYSTALS,
             "max_rewards": cap,
             "min_inviter_account_age_days": REFERRAL_MIN_INVITER_ACCOUNT_AGE_DAYS,
             "how_it_works": (
                 "Share your personal invite link below. When a friend joins for the "
-                "**first time** in the server (via your link) and uses "
-                f"**`/cd`** {REFERRAL_CD_USES_REQUIRED} times, you earn "
-                f"**{REFERRAL_CRYSTAL_REWARD}** Crystals (up to **{cap}** friends). "
-                f"Your own account must be at least {REFERRAL_MIN_INVITER_ACCOUNT_AGE_DAYS} days old."
+                "**first time** in the server (via your link) you both earn Crystals on "
+                f"their **first** **`/cd`** pack — **{REFERRAL_FIRST_PACK_INVITEE_CRYSTALS}** "
+                f"for them, **{REFERRAL_FIRST_PACK_INVITER_CRYSTALS}** for you. After they use "
+                f"**`/cd`** **{REFERRAL_CD_USES_REQUIRED}** times total, you earn "
+                f"**{REFERRAL_CRYSTAL_REWARD}** more Crystals (up to **{cap}** friends). "
+                f"Your account must be at least {REFERRAL_MIN_INVITER_ACCOUNT_AGE_DAYS} days old."
             ),
         },
         "summary": {
@@ -246,21 +302,44 @@ async def register_referral_join(
             guild_id=guild_id,
             cd_uses=0,
             crystals_awarded=0,
+            invitee_crystals_awarded=0,
         )
     )
     await session.flush()
     return True, "ok"
 
 
+async def _award_first_pack_rewards(
+    session: AsyncSession,
+    row: GuildReferral,
+) -> ReferralFirstPackNotice | None:
+    if row.first_pack_rewarded_at is not None:
+        return None
+    now = datetime.now(UTC)
+    crystals_svc = CrystalsService()
+    invitee_amount = REFERRAL_FIRST_PACK_INVITEE_CRYSTALS
+    inviter_amount = REFERRAL_FIRST_PACK_INVITER_CRYSTALS
+    await crystals_svc.try_credit(session, row.invitee_discord_id, invitee_amount)
+    await crystals_svc.try_credit(session, row.inviter_discord_id, inviter_amount)
+    row.invitee_crystals_awarded = int(row.invitee_crystals_awarded or 0) + invitee_amount
+    row.first_pack_rewarded_at = now
+    return ReferralFirstPackNotice(
+        inviter_id=int(row.inviter_discord_id),
+        invitee_id=int(row.invitee_discord_id),
+        inviter_crystals=inviter_amount,
+        invitee_crystals=invitee_amount,
+    )
+
+
 async def record_referral_cd_use(
     session_factory: async_sessionmaker[AsyncSession],
     invitee_discord_id: int,
-) -> ReferralRewardNotice | None:
+) -> ReferralCdUseResult | None:
     """
     Count one successful ``cd`` for a referred member.
 
-    When they reach the threshold, grant crystals to the inviter (up to the cap) and
-    return a notice for a DM, or ``None``.
+    On the first ``/cd``, grants Crystals to inviter and invitee. At the threshold,
+    grants the inviter completion reward (up to the cap). Returns notices for DMs.
     """
     async with session_factory() as session:
         row = await session.get(GuildReferral, invitee_discord_id)
@@ -268,9 +347,17 @@ async def record_referral_cd_use(
             return None
 
         row.cd_uses = int(row.cd_uses or 0) + 1
-        if row.cd_uses < REFERRAL_CD_USES_REQUIRED:
+        cd_uses = int(row.cd_uses)
+        result = ReferralCdUseResult()
+
+        if cd_uses == 1:
+            result = ReferralCdUseResult(
+                first_pack=await _award_first_pack_rewards(session, row),
+            )
+
+        if cd_uses < REFERRAL_CD_USES_REQUIRED:
             await session.commit()
-            return None
+            return result if (result.first_pack or result.threshold) else None
 
         now = datetime.now(UTC)
         row.completed_at = now
@@ -285,26 +372,76 @@ async def record_referral_cd_use(
 
         await session.commit()
 
-        if crystals <= 0:
-            return None
+        if crystals > 0:
+            result = ReferralCdUseResult(
+                first_pack=result.first_pack,
+                threshold=ReferralRewardNotice(
+                    inviter_id=row.inviter_discord_id,
+                    invitee_id=invitee_discord_id,
+                    crystals=crystals,
+                    rewards_used=rewards_so_far + 1,
+                ),
+            )
+        return result if (result.first_pack or result.threshold) else None
 
-        return ReferralRewardNotice(
-            inviter_id=row.inviter_discord_id,
-            invitee_id=invitee_discord_id,
-            crystals=crystals,
-            rewards_used=rewards_so_far + 1,
-        )
+
+async def notify_referral_first_pack(
+    bot: discord.Client,
+    notice: ReferralFirstPackNotice,
+) -> None:
+    inviter_msg = [
+        f"You earned **{format_crystals(notice.inviter_crystals)}**!",
+        (
+            "A friend you invited opened their **first** **`/cd`** pack. "
+            f"They also received **{format_crystals(notice.invitee_crystals)}**."
+        ),
+        (
+            f"Invite **{REFERRAL_CD_USES_REQUIRED - 1}** more packs from them and you can earn "
+            f"**{format_crystals(REFERRAL_CRYSTAL_REWARD)}** when they hit "
+            f"**{REFERRAL_CD_USES_REQUIRED}** total."
+        ),
+    ]
+    invitee_msg = [
+        f"You earned **{format_crystals(notice.invitee_crystals)}**!",
+        "Welcome bonus for your **first** **`/cd`** pack after joining via a friend's invite.",
+        (
+            f"Keep using **`/cd`** — your inviter earns "
+            f"**{format_crystals(REFERRAL_CRYSTAL_REWARD)}** when you reach "
+            f"**{REFERRAL_CD_USES_REQUIRED}** packs."
+        ),
+    ]
+    inviter_discord = "\n\n".join(inviter_msg)
+    schedule_notification(
+        bot,
+        user_id=int(notice.inviter_id),
+        kind="referral",
+        title="Referral reward",
+        body=f"Friend's first /cd pack — you earned {format_crystals(notice.inviter_crystals)}",
+        discord_pref=PREF_REFERRALS,
+        discord_body=inviter_discord,
+    )
+    invitee_msg = [
+        f"You earned **{format_crystals(notice.invitee_crystals)}**!",
+        "Welcome bonus for your **first** **`/cd`** pack after joining via a friend's invite.",
+        (
+            f"Keep using **`/cd`** — your inviter earns "
+            f"**{format_crystals(REFERRAL_CRYSTAL_REWARD)}** when you reach "
+            f"**{REFERRAL_CD_USES_REQUIRED}** packs."
+        ),
+    ]
+    try:
+        invitee = await bot.fetch_user(notice.invitee_id)
+        await invitee.send("\n\n".join(invitee_msg))
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+    except discord.HTTPException:
+        _LOG.exception("First-pack referral DM failed for invitee %s", notice.invitee_id)
 
 
 async def notify_referral_reward(
     bot: discord.Client,
     notice: ReferralRewardNotice,
 ) -> None:
-    try:
-        user = await bot.fetch_user(notice.inviter_id)
-    except (discord.NotFound, discord.HTTPException):
-        _LOG.warning("Could not fetch inviter %s for referral DM", notice.inviter_id)
-        return
     remaining = max(0, notice.rewards_cap - notice.rewards_used)
     lines = [
         f"You earned **{format_crystals(notice.crystals)}**!",
@@ -324,9 +461,12 @@ async def notify_referral_reward(
         )
     else:
         lines.append("You've reached the maximum referral rewards — thanks for spreading the word!")
-    try:
-        await user.send("\n\n".join(lines))
-    except discord.Forbidden:
-        _LOG.info("Referral reward DM blocked for user %s", notice.inviter_id)
-    except discord.HTTPException:
-        _LOG.exception("Referral reward DM failed for user %s", notice.inviter_id)
+    schedule_notification(
+        bot,
+        user_id=int(notice.inviter_id),
+        kind="referral",
+        title="Referral milestone",
+        body=f"You earned {format_crystals(notice.crystals)} from a referral milestone.",
+        discord_pref=PREF_REFERRALS,
+        discord_body="\n\n".join(lines),
+    )

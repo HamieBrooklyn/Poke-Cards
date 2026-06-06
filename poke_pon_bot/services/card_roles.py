@@ -190,6 +190,10 @@ def is_item_card(card: Card) -> bool:
 
         return True
 
+    if _has_subtype(card, "Pokémon Tool"):
+
+        return True
+
     for label in _CRAFT_TRAINER_SUBTYPES:
 
         if _has_subtype(card, label):

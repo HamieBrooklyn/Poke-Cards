@@ -15,6 +15,7 @@ from poke_pon_bot.models.pending_trade import PendingTrade
 from poke_pon_bot.models.rarity import RarityClass
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
 from poke_pon_bot.services.duel_engine import parse_hp
+from poke_pon_bot.services.grading import grade_sell_bonus_percent, grade_sell_multiplier
 from poke_pon_bot.services.wallet import WalletService
 
 # Printed tiers special_rare (8) and above need an explicit confirm step in Discord.
@@ -30,8 +31,8 @@ def collection_sell_needs_confirm(rarity: RarityClass) -> bool:
     return int(rarity.sort_order) >= SELL_CONFIRM_MIN_SORT_ORDER
 
 
-def quote_collection_sell_payout(card: Card, rarity: RarityClass, inst: UserCardInstance) -> int:
-    """Balanced payout: tier drives the floor; HP / attacks / evolution add more on high rarities."""
+def collection_sell_base_payout(card: Card, rarity: RarityClass, inst: UserCardInstance) -> int:
+    """Shop quote before graded sell bonus."""
     tier = max(1, min(10, int(rarity.sort_order)))
     # ~35 @ common → ~170 @ chase (was ~20–110).
     base = 20 + tier * 15
@@ -52,6 +53,16 @@ def quote_collection_sell_payout(card: Card, rarity: RarityClass, inst: UserCard
 
     total = base + stats_valued
     return max(_SELL_MIN_PAYOUT, min(int(total), _SELL_MAX_PAYOUT))
+
+
+def quote_collection_sell_payout(card: Card, rarity: RarityClass, inst: UserCardInstance) -> int:
+    """Balanced payout plus a small bonus for high grades (prestige loop)."""
+    base = collection_sell_base_payout(card, rarity, inst)
+    pct = grade_sell_bonus_percent(inst.grade)
+    if pct <= 0:
+        return base
+    boosted = int(round(base * grade_sell_multiplier(inst.grade)))
+    return max(_SELL_MIN_PAYOUT, min(boosted, _SELL_MAX_PAYOUT))
 
 
 _AUCT_BLOCK = (

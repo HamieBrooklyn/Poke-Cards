@@ -1,9 +1,9 @@
 # Pack series — only used to **override** auto-discovered sets.
 #
-# By default the bot generates one pack series **per imported TCG set** at boot, using the
-# set's official logo (https://images.pokemontcg.io/{set_code}/logo.png) as pack art. List
-# entries here only if you want a custom code, display name, price, or umbrella that bundles
-# multiple sets together.
+# By default the bot generates one pack series **per imported TCG set** at boot. Pack art is
+# imported from Scrydex sealed-product images when available; sets with only a TCG logo are
+# hidden from /packv and random /packd. List entries here to override code, name, price,
+# custom ``pack_art_url``, or umbrellas that bundle multiple sets.
 #
 # Schema (all optional except `code` and `sets`):
 #   - `code`: stable identifier; do NOT change after launch (used for pack lookup / SKU mapping).

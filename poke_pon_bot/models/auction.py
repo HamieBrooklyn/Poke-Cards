@@ -44,6 +44,7 @@ class CardAuction(Base):
     high_bidder_discord_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     high_bid_pokedollars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    spotlight_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

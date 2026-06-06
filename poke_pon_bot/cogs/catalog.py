@@ -9,6 +9,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from poke_pon_bot.models.card import Card
+from poke_pon_bot.services.wishlist import is_wishlisted
+from poke_pon_bot.ui.wishlist_toggle import WishlistToggleButton
 
 _LOG = logging.getLogger(__name__)
 
@@ -26,7 +28,10 @@ def _catalog_view_embed(
     e = discord.Embed(title=card.name)
     if rank_note:
         e.description = rank_note
-    e.set_image(url=card.image_large_url or card.image_small_url)
+    from poke_pon_bot.services.card_images import card_image_urls
+
+    _small, _large = card_image_urls(card, web_public_url=None)
+    e.set_image(url=_large or _small)
     e.add_field(
         name="Set",
         value=f"{card.set_name}\n`{card.set_code}`",
@@ -69,6 +74,7 @@ class CatalogBrowseView(discord.ui.View):
         owner_id: int,
         card_ids: list[int],
         search_total: int,
+        first_wishlisted: bool = False,
     ) -> None:
         if not card_ids:
             msg = "card_ids must be non-empty"
@@ -85,6 +91,14 @@ class CatalogBrowseView(discord.ui.View):
         self._next.callback = self._on_next
         self.add_item(self._prev)
         self.add_item(self._next)
+        self._wish_btn = WishlistToggleButton(
+            session_factory=session_factory,
+            card_id=int(card_ids[0]),
+            viewer_id=owner_id,
+            wishlisted=first_wishlisted,
+            row=0,
+        )
+        self.add_item(self._wish_btn)
         self._sync_nav()
 
     @staticmethod
@@ -100,8 +114,13 @@ class CatalogBrowseView(discord.ui.View):
             f"one card, no **◀▶**; narrow filters to browse (order: internal id)."
         )
 
-    def set_index(self, index: int) -> None:
+    def set_index(self, index: int, *, wishlisted: bool | None = None) -> None:
         self._index = max(0, min(index, len(self._card_ids) - 1))
+        if wishlisted is not None:
+            self._wish_btn.update(
+                card_id=int(self._card_ids[self._index]),
+                wishlisted=wishlisted,
+            )
         self._sync_nav()
 
     def _sync_nav(self) -> None:
@@ -116,9 +135,10 @@ class CatalogBrowseView(discord.ui.View):
     async def on_timeout(self) -> None:
         for c in self.children:
             c.disabled = True
-        if self.message is not None:
+        msg = getattr(self, "message", None)
+        if msg is not None:
             try:
-                await self.message.edit(view=self)
+                await msg.edit(view=self)
             except (discord.NotFound, discord.HTTPException):
                 pass
 
@@ -149,6 +169,15 @@ class CatalogBrowseView(discord.ui.View):
         try:
             async with self._session_factory() as session:
                 card = await _get_card(session, cid)
+                if card is None:
+                    await interaction.response.send_message(
+                        "That card is no longer in the catalog (try re-running sync).",
+                        ephemeral=True,
+                    )
+                    return
+                wishlisted = await is_wishlisted(
+                    session, discord_user_id=self._owner_id, card_id=card.id
+                )
         except SQLAlchemyError:
             _LOG.exception("catalog browse card %s", cid)
             await interaction.response.send_message(
@@ -156,13 +185,8 @@ class CatalogBrowseView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        if card is None:
-            await interaction.response.send_message(
-                "That card is no longer in the catalog (try re-running sync).",
-                ephemeral=True,
-            )
-            return
         note = self._note(self._index, len(self._card_ids), self._search_total)
+        self._wish_btn.update(card_id=card.id, wishlisted=wishlisted)
         self._sync_nav()
         await interaction.response.edit_message(
             embed=_catalog_view_embed(card, rank_note=note),

@@ -114,12 +114,28 @@ def clear_session_cookie(resp: web.StreamResponse, *, secure: bool) -> None:
     )
 
 
+def _bearer_token(request: web.Request) -> str | None:
+    auth = request.headers.get("Authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 def read_session(request: web.Request, secret: str, *, max_age: int) -> SessionUser | None:
-    raw = request.cookies.get(SESSION_COOKIE)
-    if not raw:
-        auth = request.headers.get("Authorization", "")
-        scheme, _, token = auth.partition(" ")
-        if scheme.lower() != "bearer" or not token.strip():
-            return None
-        raw = token.strip()
-    return decode_session(secret, raw, max_age=max_age)
+    """Resolve the signed-in user from cookie or Bearer token.
+
+    If a stale session cookie is present but invalid, fall back to Authorization
+    so GitHub Pages clients can use the fragment token in localStorage.
+    """
+    cookie_raw = request.cookies.get(SESSION_COOKIE)
+    if cookie_raw:
+        user = decode_session(secret, cookie_raw, max_age=max_age)
+        if user is not None:
+            return user
+    bearer = _bearer_token(request)
+    if bearer:
+        return decode_session(secret, bearer, max_age=max_age)
+    if cookie_raw:
+        return decode_session(secret, cookie_raw, max_age=max_age)
+    return None

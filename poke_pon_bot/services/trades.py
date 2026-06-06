@@ -153,6 +153,16 @@ async def execute_trade_accept(
     if recv_money:
         await wallet.try_credit(session, pt.initiator_id, recv_money)
 
+    if pt.guild_id is not None:
+        from poke_pon_bot.services.guild_milestones import record_trade_completed
+
+        await record_trade_completed(
+            session,
+            guild_id=int(pt.guild_id),
+            initiator_id=int(pt.initiator_id),
+            partner_id=int(pt.partner_id),
+        )
+
     await session.delete(pt)
     return None
 

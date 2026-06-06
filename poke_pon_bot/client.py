@@ -14,7 +14,11 @@ import discord
 from discord.errors import DiscordServerError, HTTPException, LoginFailure
 from discord.ext import commands
 
-from poke_pon_bot.chat_commands import chat_command_token_count, is_official_guild
+from poke_pon_bot.chat_commands import (
+    chat_command_token_count,
+    is_official_guild,
+    strip_pp_prefix,
+)
 from poke_pon_bot.config import Settings, load_settings
 from poke_pon_bot.db.session import async_session_factory, create_engine_from_url
 
@@ -193,7 +197,8 @@ class PokePonBot(commands.Bot):
 
     def __init__(self, *, settings: Settings) -> None:
         intents = discord.Intents.default()
-        intents.members = True
+        if settings.discord_guild_members_intent:
+            intents.members = True
         if settings.discord_message_content_intent:
             # Must match Developer Portal: **Bot** tab → **Privileged Gateway Intents** →
             # **Message Content Intent** (not OAuth2 URL Generator scopes, not the invite permissions grid).
@@ -230,6 +235,19 @@ class PokePonBot(commands.Bot):
 
     def attach_web_server(self, server: WebServer) -> None:
         self._web_server = server
+
+    async def process_commands(self, message: discord.Message, /) -> None:
+        """Rewrite ``ppcd`` → ``cd`` (etc.) so chat aliases match slash command names."""
+        content = (message.content or "").lstrip()
+        rewritten = strip_pp_prefix(content)
+        if rewritten is not None:
+            allow_bare = is_official_guild(
+                message.guild.id if message.guild is not None else None,
+                self.settings.tutorial_guild_id,
+            )
+            if chat_command_token_count(self, rewritten, allow_bare_names=allow_bare) > 0:
+                message.content = rewritten
+        await super().process_commands(message)
 
     async def setup_hook(self) -> None:
         # Apply any pending Alembic migrations **before** the first query so a freshly
@@ -286,9 +304,15 @@ class PokePonBot(commands.Bot):
         await self.load_extension("poke_pon_bot.cogs.duel")
         await self.load_extension("poke_pon_bot.cogs.trade")
         await self.load_extension("poke_pon_bot.cogs.auction")
+        await self.load_extension("poke_pon_bot.cogs.game_events")
+        if self.settings.web_notifications_enabled:
+            await self.load_extension("poke_pon_bot.cogs.engagement_notifications")
+        await self.load_extension("poke_pon_bot.cogs.set_chase")
         await self.load_extension("poke_pon_bot.cogs.packs")
         await self.load_extension("poke_pon_bot.cogs.crafting")
         await self.load_extension("poke_pon_bot.cogs.leaderboard")
+        await self.load_extension("poke_pon_bot.cogs.guild_milestones")
+        await self.load_extension("poke_pon_bot.cogs.referrals")
         await self.load_extension("poke_pon_bot.cogs.missions")
         await self.load_extension("poke_pon_bot.cogs.tutorial")
 
@@ -335,6 +359,7 @@ class PokePonBot(commands.Bot):
             )
             return
 
+        globals_cleared = True
         try:
             if self.dev_guild_id is not None:
                 # Mirror globals into the dev guild for instant updates while developing.
@@ -342,17 +367,38 @@ class PokePonBot(commands.Bot):
                 # dev-guild-only deployment) so Discord drops any stale global command
                 # ids from earlier versions. After that, re-syncing globals every restart
                 # would just burn the daily quota.
+                #
+                # ``SLASH_SYNC_GLOBAL=1`` (staging / DM tutorial) keeps global commands
+                # registered so ``/cd`` and friends work in bot DMs with autocomplete.
                 guild = discord.Object(id=self.dev_guild_id)
                 self.tree.copy_global_to(guild=guild)
-                self.tree.clear_commands(guild=None)
+                if not self.settings.slash_sync_global:
+                    self.tree.clear_commands(guild=None)
                 guild_cmds = await self.tree.sync(guild=guild)
-                if not state.get("globals_cleared"):
+                globals_cleared = bool(state.get("globals_cleared"))
+                if self.settings.slash_sync_global:
+                    global_cmds = await self.tree.sync(guild=None)
+                    globals_cleared = True
+                    _LOG.info(
+                        "Slash: guild %s has %s commands; global has %s (DMs).",
+                        self.dev_guild_id,
+                        len(guild_cmds),
+                        len(global_cmds),
+                    )
+                elif not globals_cleared:
                     await self.tree.sync(guild=None)
-                _LOG.info(
-                    "Slash: guild %s has %s commands.",
-                    self.dev_guild_id,
-                    len(guild_cmds),
-                )
+                    globals_cleared = True
+                    _LOG.info(
+                        "Slash: guild %s has %s commands.",
+                        self.dev_guild_id,
+                        len(guild_cmds),
+                    )
+                else:
+                    _LOG.info(
+                        "Slash: guild %s has %s commands.",
+                        self.dev_guild_id,
+                        len(guild_cmds),
+                    )
             else:
                 synced = await self.tree.sync()
                 _LOG.info("Slash commands synced globally (%s commands).", len(synced))
@@ -369,7 +415,7 @@ class PokePonBot(commands.Bot):
         _write_slash_sync_state(
             tree_hash=tree_hash,
             dev_guild_id=self.dev_guild_id,
-            globals_cleared=True,
+            globals_cleared=globals_cleared if self.dev_guild_id is not None else True,
         )
 
     async def on_ready(self) -> None:

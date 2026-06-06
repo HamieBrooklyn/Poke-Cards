@@ -76,6 +76,16 @@ class DevCog(commands.Cog):
         description="Global or server-wide rarity luck (/cd, packs, wild duels).",
         parent=dev,
     )
+    set_chase = app_commands.Group(
+        name="set_chase",
+        description="Test seasonal set chase community goal payout.",
+        parent=dev,
+    )
+    event = app_commands.Group(
+        name="event",
+        description="Schedule in-game promos (luck, double daily, spotlight) without redeploy.",
+        parent=dev,
+    )
 
     async def _dev_denied(self, interaction: discord.Interaction) -> bool:
         if not self._dev_ids:
@@ -417,6 +427,332 @@ class DevCog(commands.Cog):
             f"{global_line}\n"
             f"{server_line}\n\n"
             "_Server boost overrides global. Stacks with `/dev drop` luck on that command only._",
+            ephemeral=True,
+        )
+
+    @set_chase.command(
+        name="simulate",
+        description="Fill the community bar and pay all registered participants.",
+    )
+    @app_commands.describe(
+        user=(
+            "Also register this user as a participant before payout; "
+            "omit to only pay users who already claimed from the featured set."
+        ),
+        include_self="Register yourself as a participant before payout.",
+    )
+    async def set_chase_simulate(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User | None = None,
+        include_self: Literal["yes"] | None = None,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        register_id: int | None = None
+        if user is not None:
+            register_id = int(user.id)
+        elif include_self == "yes":
+            register_id = int(interaction.user.id)
+        from poke_pon_bot.services.set_chase import (
+            build_status,
+            dev_simulate_community_payout,
+        )
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                season, paid, err = await dev_simulate_community_payout(
+                    session,
+                    register_user_id=register_id,
+                )
+                if err:
+                    await interaction.response.send_message(err, ephemeral=True)
+                    return
+                assert season is not None
+                amount = max(0, int(season.community_participation_crystals or 0))
+                status = await build_status(
+                    session, discord_user_id=interaction.user.id
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev set_chase simulate failed")
+            await interaction.response.send_message(
+                "Could not simulate community payout. Try again.",
+                ephemeral=True,
+            )
+            return
+        lines = [
+            f"Simulated **{season.title}** community goal.",
+            f"Bar set to **{int(season.global_target):,} / {int(season.global_target):,}**.",
+            f"Paid **{paid}** participant(s) **{amount}** 💎 each.",
+        ]
+        if register_id is not None:
+            who = user.mention if user is not None else "You"
+            lines.append(f"Registered {who} as a participant before payout.")
+        if status is not None and status.user_community_reward_paid:
+            lines.append("✅ You received the community participation bonus.")
+        elif status is not None and status.user_participated:
+            lines.append("You were already registered and should have been paid.")
+        elif register_id != int(interaction.user.id):
+            lines.append(
+                "_You were not registered — use **include_self: yes** or claim from the featured set first._"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @set_chase.command(
+        name="reset",
+        description="Clear community payout state so you can simulate again.",
+    )
+    @app_commands.describe(
+        reset_claims="Also reset the community bar counter to 0.",
+    )
+    async def set_chase_reset(
+        self,
+        interaction: discord.Interaction,
+        reset_claims: Literal["yes"] | None = None,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.set_chase import dev_reset_community_payout
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                season, counts, err = await dev_reset_community_payout(
+                    session,
+                    reset_claims=reset_claims == "yes",
+                )
+                if err:
+                    await interaction.response.send_message(err, ephemeral=True)
+                    return
+                assert season is not None
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev set_chase reset failed")
+            await interaction.response.send_message(
+                "Could not reset community payout. Try again.",
+                ephemeral=True,
+            )
+            return
+        claims_note = (
+            f" Claims reset **{counts['claims_before']:,} → {counts['claims_after']:,}**."
+            if reset_claims == "yes"
+            else f" Bar left at **{counts['claims_after']:,} / {int(season.global_target):,}**."
+        )
+        await interaction.response.send_message(
+            f"Reset **{season.title}** community payout state — "
+            f"**{counts['participants_reset']}** participant payout flag(s) cleared.{claims_note} "
+            "Run `/dev set_chase simulate` to test again.",
+            ephemeral=True,
+        )
+
+    @set_chase.command(
+        name="status",
+        description="Show active set chase community bar and payout state.",
+    )
+    async def set_chase_status(self, interaction: discord.Interaction) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.set_chase import build_status, format_set_chase_embed
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                status = await build_status(
+                    session, discord_user_id=interaction.user.id
+                )
+        except SQLAlchemyError:
+            _LOG.exception("dev set_chase status failed")
+            await interaction.response.send_message(
+                "Could not load set chase status. Try again.",
+                ephemeral=True,
+            )
+            return
+        if status is None:
+            await interaction.response.send_message(
+                "There is no active set chase right now.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            format_set_chase_embed(status),
+            ephemeral=True,
+        )
+
+    @event.command(name="list", description="List scheduled game events.")
+    async def event_list(self, interaction: discord.Interaction) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.event_scheduler import event_status, fetch_enabled_events
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                rows = await fetch_enabled_events(session)
+        except SQLAlchemyError:
+            _LOG.exception("dev event list failed")
+            await interaction.response.send_message("Could not load events.", ephemeral=True)
+            return
+        if not rows:
+            await interaction.response.send_message("No scheduled game events.", ephemeral=True)
+            return
+        lines = []
+        for row in rows:
+            status = event_status(row)
+            window = ""
+            if row.recurrence:
+                window = f" · `{row.recurrence}`"
+            elif row.starts_at and row.ends_at:
+                window = f" · `{row.starts_at.isoformat()}` → `{row.ends_at.isoformat()}`"
+            lines.append(f"**#{row.id}** `{row.kind}` — **{row.title}** · *{status}*{window}")
+        await interaction.response.send_message("\n".join(lines[:20]), ephemeral=True)
+
+    @event.command(name="add", description="Create a one-shot scheduled game event.")
+    @app_commands.describe(
+        kind="Event type",
+        title="Display name",
+        starts="Start (ISO UTC, e.g. 2026-06-06T18:00:00+00:00)",
+        ends="End (ISO UTC)",
+        luck_percent="For luck_boost only",
+        set_code="For set_spotlight only (TCG set code, e.g. sv1)",
+        daily_multiplier="For double_daily (default 2)",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Rarity luck boost", value="luck_boost"),
+            app_commands.Choice(name="Double daily rewards", value="double_daily"),
+            app_commands.Choice(name="Free auction spotlight (fee holiday)", value="free_spotlight"),
+            app_commands.Choice(name="Free spotlight for one set", value="set_spotlight"),
+        ]
+    )
+    async def event_add(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        title: str,
+        starts: str,
+        ends: str,
+        luck_percent: app_commands.Range[int, -100, 500] | None = None,
+        set_code: str | None = None,
+        daily_multiplier: app_commands.Range[int, 2, 5] | None = None,
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.event_scheduler import create_event, parse_iso_datetime
+
+        config: dict[str, object] = {}
+        if kind == "luck_boost":
+            config["luck_percent"] = int(luck_percent or 100)
+        elif kind == "double_daily":
+            config["multiplier"] = int(daily_multiplier or 2)
+        elif kind == "set_spotlight":
+            code = (set_code or "").strip().lower()
+            if not code:
+                await interaction.response.send_message(
+                    "**set_code** is required for set_spotlight.",
+                    ephemeral=True,
+                )
+                return
+            config["set_code"] = code
+        try:
+            start_dt = parse_iso_datetime(starts)
+            end_dt = parse_iso_datetime(ends)
+            async with self.bot.async_session_factory() as session:
+                row = await create_event(
+                    session,
+                    kind=kind,
+                    title=title,
+                    created_by_discord_user_id=interaction.user.id,
+                    starts_at=start_dt,
+                    ends_at=end_dt,
+                    config=config,
+                )
+                await session.commit()
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except SQLAlchemyError:
+            _LOG.exception("dev event add failed")
+            await interaction.response.send_message("Could not save event.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Created game event **#{row.id}** `{row.kind}` — **{row.title}**.",
+            ephemeral=True,
+        )
+
+    @event.command(name="cancel", description="Disable a scheduled game event by id.")
+    @app_commands.describe(event_id="Event id from /dev event list")
+    async def event_cancel(
+        self,
+        interaction: discord.Interaction,
+        event_id: app_commands.Range[int, 1, 999_999],
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.services.event_scheduler import cancel_event
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                ok = await cancel_event(session, int(event_id))
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("dev event cancel failed")
+            await interaction.response.send_message("Could not cancel event.", ephemeral=True)
+            return
+        if not ok:
+            await interaction.response.send_message(
+                f"No event with id **{event_id}**.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"Event **#{event_id}** disabled.",
+            ephemeral=True,
+        )
+
+    @event.command(
+        name="template_weekend_luck",
+        description="Create a recurring weekly weekend luck event (replaces env-only schedule).",
+    )
+    @app_commands.describe(
+        luck_percent="Rarity luck percent during the window",
+        timezone="IANA timezone for Fri 18:00 – Sun 20:00 window",
+    )
+    async def event_template_weekend_luck(
+        self,
+        interaction: discord.Interaction,
+        luck_percent: app_commands.Range[int, 1, 500] = 100,
+        timezone: str = "Europe/Stockholm",
+    ) -> None:
+        if await self._dev_denied(interaction):
+            return
+        from poke_pon_bot.models.scheduled_game_event import EVENT_KIND_LUCK_BOOST
+        from poke_pon_bot.services.event_scheduler import (
+            RECURRENCE_WEEKLY,
+            create_event,
+            default_weekend_luck_config,
+        )
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                row = await create_event(
+                    session,
+                    kind=EVENT_KIND_LUCK_BOOST,
+                    title=f"Weekend luck (+{int(luck_percent)}%)",
+                    created_by_discord_user_id=interaction.user.id,
+                    recurrence=RECURRENCE_WEEKLY,
+                    config=default_weekend_luck_config(
+                        luck_percent=int(luck_percent),
+                        timezone=(timezone or "Europe/Stockholm").strip(),
+                    ),
+                )
+                await session.commit()
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except SQLAlchemyError:
+            _LOG.exception("dev event template_weekend_luck failed")
+            await interaction.response.send_message("Could not save event.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Created recurring weekend luck event **#{row.id}** (`{timezone}`).",
             ephemeral=True,
         )
 

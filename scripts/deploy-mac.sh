@@ -74,7 +74,10 @@ install_deps() {
 }
 
 run_migrations() {
-  log "alembic upgrade head"
+  log "alembic upgrade head (production database)"
+  # shellcheck disable=SC1091
+  source "$ROOT/scripts/lib/load-env.sh"
+  load_env_file "$ROOT/.env"
   "$ROOT/.venv/bin/alembic" upgrade head
 }
 
@@ -108,11 +111,28 @@ restart_bot() {
       kill -9 "$old_pid" 2>/dev/null || true
     fi
   fi
-  pkill -f "[p]ython -m poke_pon_bot" 2>/dev/null || true
-  sleep 2
+  PROD_PORT="${POKEPON_WEB_PORT:-8080}"
+  if [[ -f "$ROOT/.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$ROOT/scripts/lib/load-env.sh"
+    load_env_file "$ROOT/.env" 2>/dev/null || true
+    PROD_PORT="${WEB_PORT:-$PROD_PORT}"
+  fi
   nohup "$ROOT/scripts/run-bot.sh" >>"$LOG_DIR/bot.log" 2>&1 &
-  echo $! >"$ROOT/data/pokepon-bot.pid"
-  log "started bot pid $(cat "$ROOT/data/pokepon-bot.pid")"
+  wrapper_pid=$!
+  for _ in $(seq 1 90); do
+    if command -v lsof >/dev/null 2>&1; then
+      py_pid="$(lsof -ti "tcp:$PROD_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+      if [[ -n "$py_pid" ]]; then
+        echo "$py_pid" >"$ROOT/data/pokepon-bot.pid"
+        log "started bot pid $py_pid on :$PROD_PORT (wrapper $wrapper_pid)"
+        return
+      fi
+    fi
+    sleep 1
+  done
+  echo "$wrapper_pid" >"$ROOT/data/pokepon-bot.pid"
+  log "warn: python bot not seen after 90s; recorded wrapper pid $wrapper_pid"
 }
 
 main() {

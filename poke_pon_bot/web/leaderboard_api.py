@@ -9,9 +9,15 @@ from typing import Any
 from aiohttp import web
 from sqlalchemy.exc import SQLAlchemyError
 
+from poke_pon_bot.services.crystal_sinks import load_equipped_leaderboard_frames
+from poke_pon_bot.services.guild_milestones import (
+    GUILD_STAT_CATEGORIES,
+    resolve_guild_member_ids,
+)
 from poke_pon_bot.services.leaderboard import (
     LEADERBOARD_CATEGORIES,
     LEADERBOARD_TITLES,
+    SERVER_LEADERBOARD_CATEGORIES,
     fetch_leaderboard_web,
     viewer_rank,
 )
@@ -32,14 +38,21 @@ def _serialize_entry(
     rank: int,
     entry: tuple,
     profiles: dict[int, dict[str, Any]],
+    frames: dict[int, str | None] | None = None,
 ) -> dict[str, Any]:
     uid = int(entry[0])
-    user = profiles.get(uid) or {
-        "id": str(uid),
-        "username": None,
-        "global_name": None,
-        "avatar_url": None,
-    }
+    user = dict(
+        profiles.get(uid)
+        or {
+            "id": str(uid),
+            "username": None,
+            "global_name": None,
+            "avatar_url": None,
+        }
+    )
+    frame = (frames or {}).get(uid)
+    if frame:
+        user["leaderboard_frame"] = frame
     card_preview_data: dict[str, Any] | None = None
 
     if category == "strongest":
@@ -83,6 +96,54 @@ def _serialize_entry(
                 "label": format_pokedollars(price_int),
             },
         }
+    elif category == "graded":
+        _, card_name, grade_val, grade_lbl, card_preview_data = entry
+        payload = {
+            "rank": rank,
+            "user": user,
+            "card_name": card_name,
+            "stat": {
+                "kind": "grade",
+                "value": int(grade_val),
+                "label": f"{int(grade_val)} — {grade_lbl}",
+            },
+        }
+    elif category == "packs":
+        _, count = entry
+        payload = {
+            "rank": rank,
+            "user": user,
+            "card_name": "",
+            "stat": {
+                "kind": "count",
+                "value": int(count),
+                "label": f"{int(count):,} packs",
+            },
+        }
+    elif category == "traders":
+        _, count = entry
+        payload = {
+            "rank": rank,
+            "user": user,
+            "card_name": "",
+            "stat": {
+                "kind": "count",
+                "value": int(count),
+                "label": f"{int(count):,} trades",
+            },
+        }
+    elif category == "collectors":
+        _, count = entry
+        payload = {
+            "rank": rank,
+            "user": user,
+            "card_name": "",
+            "stat": {
+                "kind": "count",
+                "value": int(count),
+                "label": f"{int(count):,} unique cards",
+            },
+        }
     else:
         return {"rank": rank, "user": user, "card_name": "", "stat": {"kind": "unknown", "label": ""}}
 
@@ -102,7 +163,29 @@ def register_leaderboard_api(app: web.Application, *, bot: Any, settings: Any) -
 
     async def handle_leaderboards(request: web.Request) -> web.StreamResponse:
         category = (request.query.get("category") or "strongest").strip().lower()
-        if category not in LEADERBOARD_CATEGORIES:
+        scope = (request.query.get("scope") or "global").strip().lower()
+        guild_raw = (request.query.get("guild_id") or "").strip()
+        guild_id = int(guild_raw) if guild_raw.isdigit() else None
+
+        if scope not in ("global", "server"):
+            return web.json_response({"error": "invalid_scope"}, status=400)
+        if category in GUILD_STAT_CATEGORIES and scope != "server":
+            return web.json_response(
+                {"error": "server_scope_required", "category": category},
+                status=400,
+            )
+        if scope == "server":
+            if guild_id is None:
+                return web.json_response({"error": "guild_id_required"}, status=400)
+            if category not in SERVER_LEADERBOARD_CATEGORIES:
+                return web.json_response(
+                    {
+                        "error": "invalid_category",
+                        "allowed": sorted(SERVER_LEADERBOARD_CATEGORIES),
+                    },
+                    status=400,
+                )
+        elif category not in LEADERBOARD_CATEGORIES:
             return web.json_response(
                 {
                     "error": "invalid_category",
@@ -124,9 +207,31 @@ def register_leaderboard_api(app: web.Application, *, bot: Any, settings: Any) -
         sess = read_session(request, session_secret, max_age=session_ttl)
         viewer_id = int(sess.user_id) if sess is not None else None
 
+        member_ids: set[int] | None = None
+        members_unavailable = False
+        if scope == "server" and guild_id is not None:
+            guild = bot.get_guild(int(guild_id))
+            if guild is None:
+                return web.json_response(
+                    {
+                        "error": "guild_not_available",
+                        "message": "The bot is not in that server right now.",
+                    },
+                    status=404,
+                )
+            async with session_factory() as db:
+                member_ids = await resolve_guild_member_ids(bot, db, int(guild_id))
+            if not member_ids:
+                members_unavailable = True
+
         try:
             async with session_factory() as db:
-                entries = await fetch_leaderboard_web(db, category)
+                entries = await fetch_leaderboard_web(
+                    db,
+                    category,
+                    member_ids=member_ids,
+                    guild_id=guild_id if scope == "server" else None,
+                )
                 total = len(entries)
                 total_pages = max(1, math.ceil(total / limit)) if total else 1
                 page = min(page, total_pages)
@@ -136,9 +241,10 @@ def register_leaderboard_api(app: web.Application, *, bot: Any, settings: Any) -
 
                 uids = {int(e[0]) for e in page_entries}
                 profiles = await resolve_user_profiles(db, bot, uids)
+                frames = await load_equipped_leaderboard_frames(db, uids)
 
                 out_entries = [
-                    _serialize_entry(category, start + i + 1, entry, profiles)
+                    _serialize_entry(category, start + i + 1, entry, profiles, frames)
                     for i, entry in enumerate(page_entries)
                 ]
 
@@ -151,12 +257,20 @@ def register_leaderboard_api(app: web.Application, *, bot: Any, settings: Any) -
             _LOG.exception("leaderboard api category=%s", category)
             return web.json_response({"error": "database_error"}, status=500)
 
+        guild_name = None
+        if scope == "server" and guild_id is not None:
+            g = bot.get_guild(guild_id)
+            guild_name = g.name if g is not None else f"Server {guild_id}"
+
         return web.json_response(
             {
                 "category": category,
                 "title": LEADERBOARD_TITLES.get(category, category),
-                "scope": "global",
+                "scope": scope,
+                "guild_id": str(guild_id) if guild_id is not None else None,
+                "guild_name": guild_name,
                 "card_preview": category in _CARD_CATEGORIES,
+                "members_unavailable": members_unavailable,
                 "page": page,
                 "limit": limit,
                 "total": total,

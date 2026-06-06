@@ -28,6 +28,9 @@ PER_GUILD_QUERY_LIMIT = 15
 GUILD_QUERY_BATCH = 8
 # Fallback when member cache has no shared guilds (cold cache).
 FALLBACK_GUILD_PROBE = 6
+MAX_GUILD_LIST = 30
+GUILD_LIST_PROBE = 80
+GUILD_LIST_FETCH_BATCH = 10
 _SEARCH_CACHE_TTL_SEC = 50.0
 _search_cache: dict[tuple[int, str], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -66,6 +69,47 @@ def _guilds_shared_with_requester(bot: discord.Client, requester_id: int) -> lis
         if guild.get_member(requester_id) is not None:
             out.append(guild)
     return out[:MAX_SHARED_GUILDS]
+
+
+async def _user_in_guild(guild: discord.Guild, user_id: int) -> bool:
+    if guild.get_member(user_id) is not None:
+        return True
+    try:
+        await guild.fetch_member(user_id)
+        return True
+    except discord.NotFound:
+        return False
+    except (discord.Forbidden, discord.HTTPException, RuntimeError, OSError) as exc:
+        _LOG.debug("list_shared_guilds fetch_member guild %s: %s", guild.id, exc)
+        return False
+
+
+async def list_shared_guilds_for_user(
+    bot: discord.Client, user_id: int,
+) -> list[dict[str, Any]]:
+    """Servers the user shares with the bot (member cache + parallel ``fetch_member``)."""
+    seen: dict[int, discord.Guild] = {}
+    guilds = _guilds_for_search(bot)
+    for guild in guilds:
+        if guild.get_member(user_id) is not None:
+            seen[guild.id] = guild
+
+    remaining = [g for g in guilds if g.id not in seen]
+    if len(remaining) > GUILD_LIST_PROBE:
+        remaining = remaining[:GUILD_LIST_PROBE]
+
+    for i in range(0, len(remaining), GUILD_LIST_FETCH_BATCH):
+        batch = remaining[i : i + GUILD_LIST_FETCH_BATCH]
+        results = await asyncio.gather(
+            *[_user_in_guild(g, user_id) for g in batch],
+            return_exceptions=True,
+        )
+        for guild, ok in zip(batch, results):
+            if ok is True:
+                seen[guild.id] = guild
+
+    ordered = sorted(seen.values(), key=lambda g: (g.name or "").lower())
+    return [{"id": str(g.id), "name": g.name} for g in ordered[:MAX_GUILD_LIST]]
 
 
 async def _probe_shared_guilds(

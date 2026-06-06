@@ -134,6 +134,15 @@ class MissionService:
         drop_target = self._rng.randint(*DROP_USES_RANGE)
         duel_target = self._rng.randint(*DUEL_WINS_RANGE)
         set_code, set_name = await self._pick_random_set(session)
+        try:
+            from poke_pon_bot.services.set_chase import get_active_season
+
+            chase = await get_active_season(session)
+            if chase is not None:
+                set_code = str(chase.set_code)
+                set_name = str(chase.set_name or chase.set_code)
+        except ImportError:
+            pass
 
         missions = [
             UserMission(
@@ -384,6 +393,72 @@ class MissionService:
             name = m.card_name or "a rare card"
             return f"Claim **{name}** from a **`/cd`** drop {prog}"
         return f"Unknown mission {prog}"
+
+    def describe_mission_plain(self, m: UserMission) -> str:
+        prog = f"{min(m.progress, m.target)}/{m.target}"
+        if m.kind == "drop_uses":
+            return f"Use /cd (card drop) {prog} times"
+        if m.kind == "claim_set":
+            label = m.set_name or m.set_code or "a set"
+            return f"Claim a card from {label} via /cd drop {prog}"
+        if m.kind == "duel_wins":
+            return f"Win {m.target} duels (PvP or wild) {prog}"
+        if m.kind == "obtain_card":
+            name = m.card_name or "a rare card"
+            return f"Claim {name} from a /cd drop {prog}"
+        return f"Unknown mission {prog}"
+
+    def mission_status(self, m: UserMission) -> str:
+        if m.claimed_at is not None:
+            return "claimed"
+        if m.progress >= m.target:
+            return "ready"
+        return "in_progress"
+
+    def mission_to_public_json(self, m: UserMission) -> dict:
+        return {
+            "id": int(m.id),
+            "period_type": m.period_type,
+            "period_key": m.period_key,
+            "slot": int(m.slot),
+            "kind": m.kind,
+            "target": int(m.target),
+            "progress": int(min(m.progress, m.target)),
+            "reward_crystals": int(m.reward_crystals),
+            "description": self.describe_mission_plain(m),
+            "status": self.mission_status(m),
+            "set_code": m.set_code,
+            "set_name": m.set_name,
+            "card_name": m.card_name,
+        }
+
+    def missions_board_to_public_json(
+        self,
+        missions: list[UserMission],
+        *,
+        crystal_balance: int,
+    ) -> dict:
+        daily = [m for m in missions if m.period_type == "daily"]
+        weekly = [m for m in missions if m.period_type == "weekly"]
+        claimable = sum(
+            1
+            for m in missions
+            if m.claimed_at is None and m.progress >= m.target
+        )
+        return {
+            "crystal_balance": int(crystal_balance),
+            "claimable_count": claimable,
+            "daily_period_key": daily_period_key(),
+            "weekly_period_key": weekly_period_key(),
+            "daily": [
+                self.mission_to_public_json(m)
+                for m in sorted(daily, key=lambda x: x.slot)
+            ],
+            "weekly": [
+                self.mission_to_public_json(m)
+                for m in sorted(weekly, key=lambda x: x.slot)
+            ],
+        }
 
     def status_line(self, m: UserMission) -> str:
         if m.claimed_at is not None:

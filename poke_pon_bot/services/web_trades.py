@@ -24,6 +24,7 @@ from poke_pon_bot.models.trade_session import (
     TradeSession,
 )
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
+from poke_pon_bot.services.grading import grading_fields_for_instance
 from poke_pon_bot.services.crystals import CrystalsService
 from poke_pon_bot.services.trades import MAX_TRADE_CARDS_PER_SIDE, MAX_TRADE_CRYSTALS, MAX_TRADE_POKEDOLLARS
 from poke_pon_bot.services.wallet import WalletService
@@ -409,6 +410,7 @@ async def serialize_trade_session(
                 "public_id": inst.public_id,
                 "obtained_at": _utc_iso(inst.obtained_at),
                 "missing": False,
+                **grading_fields_for_instance(inst),
                 "card": {
                     "name": card.name,
                     "set_code": card.set_code,

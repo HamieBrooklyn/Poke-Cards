@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
-
 import discord
 from discord import app_commands
 from discord.ext import commands
-from sqlalchemy import Integer, desc, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from poke_pon_bot.models.auction import AUCTION_STATUS_ENDED_SOLD, CardAuction
-from poke_pon_bot.models.card import Card
-from poke_pon_bot.models.inventory import UserCardInstance
-from poke_pon_bot.models.rarity import RarityClass
+from poke_pon_bot.services.grading import format_grade_slab_badge
+from poke_pon_bot.services.guild_milestones import GUILD_STAT_CATEGORIES
+from poke_pon_bot.services.leaderboard import (
+    LEADERBOARD_TITLES,
+    SERVER_LEADERBOARD_CATEGORIES,
+    fetch_leaderboard,
+)
 from poke_pon_bot.services.wallet import format_pokedollars
 
 _LOG = logging.getLogger(__name__)
@@ -22,28 +20,6 @@ _LOG = logging.getLogger(__name__)
 _PER_PAGE = 10
 _MAX_PAGES = 50
 _MAX_ENTRIES = _PER_PAGE * _MAX_PAGES
-_FETCH_LIMIT = 50_000
-
-
-def _max_attack_damage(attacks: Any) -> int:
-    if not isinstance(attacks, list):
-        return 0
-    best = 0
-    for atk in attacks:
-        if not isinstance(atk, dict):
-            continue
-        raw = atk.get("damage")
-        if raw is None:
-            continue
-        digits: list[str] = []
-        for ch in str(raw):
-            if ch.isdigit():
-                digits.append(ch)
-            else:
-                break
-        if digits:
-            best = max(best, int("".join(digits)))
-    return best
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -63,143 +39,50 @@ def _guild_member_ids(guild: discord.Guild | None) -> set[int] | None:
 
 
 # ---------------------------------------------------------------------------
-# Query functions — return full ranked lists (capped at _MAX_ENTRIES)
-# ---------------------------------------------------------------------------
-
-async def _leaderboard_strongest(
-    session: AsyncSession,
-    member_ids: set[int] | None,
-) -> list[tuple[int, str, int]]:
-    stmt = (
-        select(UserCardInstance.discord_user_id, Card.name, Card.attacks)
-        .join(Card, Card.id == UserCardInstance.card_id)
-        .where(Card.attacks.isnot(None))
-    )
-    if member_ids is not None:
-        stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
-    rows = (await session.execute(stmt.limit(_FETCH_LIMIT))).all()
-
-    best: dict[int, tuple[str, int]] = {}
-    for uid, name, attacks in rows:
-        dmg = _max_attack_damage(attacks)
-        if dmg <= 0:
-            continue
-        prev = best.get(uid)
-        if prev is None or dmg > prev[1]:
-            best[uid] = (name, dmg)
-
-    ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:_MAX_ENTRIES]
-    return [(uid, name, dmg) for uid, (name, dmg) in ranked]
-
-
-async def _leaderboard_tankiest(
-    session: AsyncSession,
-    member_ids: set[int] | None,
-) -> list[tuple[int, str, int]]:
-    hp_int = func.cast(func.coalesce(func.nullif(Card.hp, ""), "0"), Integer())
-    stmt = (
-        select(UserCardInstance.discord_user_id, Card.name, hp_int.label("hp_val"))
-        .join(Card, Card.id == UserCardInstance.card_id)
-        .where(Card.hp.isnot(None), Card.hp != "")
-        .order_by(desc("hp_val"))
-    )
-    if member_ids is not None:
-        stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
-    rows = (await session.execute(stmt.limit(_FETCH_LIMIT))).all()
-
-    best: dict[int, tuple[str, int]] = {}
-    for uid, name, hp_val in rows:
-        hp = int(hp_val) if hp_val else 0
-        if hp <= 0:
-            continue
-        prev = best.get(uid)
-        if prev is None or hp > prev[1]:
-            best[uid] = (name, hp)
-
-    ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:_MAX_ENTRIES]
-    return [(uid, name, hp) for uid, (name, hp) in ranked]
-
-
-async def _leaderboard_rarest(
-    session: AsyncSession,
-    member_ids: set[int] | None,
-) -> list[tuple[int, str, str, int]]:
-    stmt = (
-        select(
-            UserCardInstance.discord_user_id,
-            Card.name,
-            RarityClass.display_name,
-            RarityClass.sort_order,
-        )
-        .join(Card, Card.id == UserCardInstance.card_id)
-        .join(RarityClass, RarityClass.id == Card.rarity_class_id)
-        .order_by(desc(RarityClass.sort_order), desc(UserCardInstance.obtained_at))
-    )
-    if member_ids is not None:
-        stmt = stmt.where(UserCardInstance.discord_user_id.in_(member_ids))
-    rows = (await session.execute(stmt.limit(_FETCH_LIMIT))).all()
-
-    best: dict[int, tuple[str, str, int]] = {}
-    for uid, name, rarity_name, sort_order in rows:
-        order = int(sort_order) if sort_order else 0
-        prev = best.get(uid)
-        if prev is None or order > prev[2]:
-            best[uid] = (name, rarity_name or "Unknown", order)
-
-    ranked = sorted(best.items(), key=lambda x: x[1][2], reverse=True)[:_MAX_ENTRIES]
-    return [(uid, name, rn, so) for uid, (name, rn, so) in ranked]
-
-
-async def _leaderboard_auction(
-    session: AsyncSession,
-    member_ids: set[int] | None,
-    guild_id: int | None,
-) -> list[tuple[int, str, int]]:
-    stmt = (
-        select(
-            CardAuction.seller_discord_id,
-            Card.name,
-            CardAuction.high_bid_pokedollars,
-        )
-        .join(UserCardInstance, UserCardInstance.id == CardAuction.instance_id)
-        .join(Card, Card.id == UserCardInstance.card_id)
-        .where(CardAuction.status == AUCTION_STATUS_ENDED_SOLD)
-        .order_by(desc(CardAuction.high_bid_pokedollars))
-    )
-    if member_ids is not None:
-        stmt = stmt.where(CardAuction.seller_discord_id.in_(member_ids))
-    if guild_id is not None:
-        stmt = stmt.where(CardAuction.guild_id == guild_id)
-
-    rows = (await session.execute(stmt.limit(_MAX_ENTRIES))).all()
-    return [(uid, name, int(price)) for uid, name, price in rows]
-
-
-# ---------------------------------------------------------------------------
 # Embed builder (generic, page-aware)
 # ---------------------------------------------------------------------------
-
-_TITLES = {
-    "strongest": "Strongest Cards",
-    "tankiest": "Tankiest Cards",
-    "rarest": "Rarest Cards",
-    "auction": "Top Auction Sales",
-}
 
 
 def _format_entry(category: str, rank: int, entry: tuple) -> str:
     if category == "strongest":
-        uid, name, dmg = entry
-        return f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ⚡ {dmg} damage"
-    elif category == "tankiest":
-        uid, name, hp = entry
-        return f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ❤ {hp} HP"
-    elif category == "rarest":
-        uid, name, rarity_name, _so = entry
-        return f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ✦ {rarity_name}"
-    elif category == "auction":
-        uid, name, price = entry
-        return f"**{rank}.** **{_truncate(name, 28)}** · sold for **{format_pokedollars(price)}** — by {_mention(uid)}"
+        uid, name, dmg, grade = entry
+        return (
+            f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ⚡ {dmg} damage"
+            f"{format_grade_slab_badge(grade)}"
+        )
+    if category == "tankiest":
+        uid, name, hp, grade = entry
+        return (
+            f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ❤ {hp} HP"
+            f"{format_grade_slab_badge(grade)}"
+        )
+    if category == "rarest":
+        uid, name, rarity_name, _so, grade = entry
+        return (
+            f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · ✦ {rarity_name}"
+            f"{format_grade_slab_badge(grade)}"
+        )
+    if category == "auction":
+        uid, name, price, grade = entry
+        return (
+            f"**{rank}.** **{_truncate(name, 28)}** · sold for **{format_pokedollars(price)}**"
+            f"{format_grade_slab_badge(grade)} — by {_mention(uid)}"
+        )
+    if category == "graded":
+        uid, name, grade_val, grade_lbl = entry
+        return (
+            f"**{rank}.** {_mention(uid)} — **{_truncate(name, 28)}** · "
+            f"🏆 **{grade_val}** {grade_lbl}"
+        )
+    if category == "packs":
+        uid, count = entry
+        return f"**{rank}.** {_mention(uid)} — **{int(count):,}** packs opened"
+    if category == "traders":
+        uid, count = entry
+        return f"**{rank}.** {_mention(uid)} — **{int(count):,}** trades completed"
+    if category == "collectors":
+        uid, count = entry
+        return f"**{rank}.** {_mention(uid)} — **{int(count):,}** unique cards"
     return ""
 
 
@@ -223,7 +106,7 @@ def _build_page_embed(
     empty_msg = "_No auction sales yet._" if category == "auction" else "_No data yet._"
     body = "\n".join(lines) or empty_msg
 
-    title = f"Leaderboard — {_TITLES.get(category, category)} ({scope_label})"
+    title = f"Leaderboard — {LEADERBOARD_TITLES.get(category, category)} ({scope_label})"
     embed = discord.Embed(title=title, description=body)
 
     invoker_rank: int | None = None
@@ -323,7 +206,7 @@ class LeaderboardCog(commands.Cog):
     @commands.hybrid_command(
         name="leaderboard",
         aliases=["pcleaderboard", "lb"],
-        description="View server or global leaderboards (strongest, tankiest, rarest, top auctions)",
+        description="View server or global leaderboards (strongest, tankiest, rarest, graded, top auctions)",
     )
     @app_commands.describe(
         category="What to rank by",
@@ -335,6 +218,10 @@ class LeaderboardCog(commands.Cog):
             app_commands.Choice(name="Tankiest cards", value="tankiest"),
             app_commands.Choice(name="Rarest cards", value="rarest"),
             app_commands.Choice(name="Top auction sales", value="auction"),
+            app_commands.Choice(name="Top graded slabs", value="graded"),
+            app_commands.Choice(name="Packs opened (server)", value="packs"),
+            app_commands.Choice(name="Top traders (server)", value="traders"),
+            app_commands.Choice(name="Top collectors (server)", value="collectors"),
         ],
         scope=[
             app_commands.Choice(name="Server", value="server"),
@@ -361,6 +248,14 @@ class LeaderboardCog(commands.Cog):
             )
             return
 
+        if category in GUILD_STAT_CATEGORIES and not is_server:
+            await ctx.send(
+                "**Packs opened**, **Top traders**, and **Top collectors** require "
+                "**Server** scope inside a Discord server.",
+                ephemeral=False,
+            )
+            return
+
         member_ids: set[int] | None = None
         guild_id: int | None = None
         scope_label = "Global"
@@ -378,25 +273,32 @@ class LeaderboardCog(commands.Cog):
 
         try:
             async with self.bot.async_session_factory() as session:
-                if category == "strongest":
-                    entries = await _leaderboard_strongest(session, member_ids)
-                elif category == "tankiest":
-                    entries = await _leaderboard_tankiest(session, member_ids)
-                elif category == "rarest":
-                    entries = await _leaderboard_rarest(session, member_ids)
-                elif category == "auction":
-                    entries = await _leaderboard_auction(session, member_ids, guild_id if is_server else None)
-                else:
+                if category not in SERVER_LEADERBOARD_CATEGORIES:
                     await ctx.send("Unknown category.", ephemeral=False)
                     return
+                entries = await fetch_leaderboard(
+                    session,
+                    category,
+                    member_ids=member_ids,
+                    guild_id=(
+                        guild_id
+                        if is_server and (category == "auction" or category in GUILD_STAT_CATEGORIES)
+                        else None
+                    ),
+                )
         except Exception:
             _LOG.exception("leaderboard query failed: category=%s scope=%s", category, scope)
             await ctx.send("Could not load the leaderboard. Try again.", ephemeral=False)
             return
 
         if not entries:
-            empty_msg = "_No auction sales yet._" if category == "auction" else "_No ranked players yet._"
-            title = f"Leaderboard — {_TITLES.get(category, category)} ({scope_label})"
+            if category == "auction":
+                empty_msg = "_No auction sales yet._"
+            elif category == "graded":
+                empty_msg = "_No graded slabs yet._"
+            else:
+                empty_msg = "_No ranked players yet._"
+            title = f"Leaderboard — {LEADERBOARD_TITLES.get(category, category)} ({scope_label})"
             embed = discord.Embed(title=title, description=empty_msg)
             await ctx.send(embed=embed, ephemeral=False)
             return

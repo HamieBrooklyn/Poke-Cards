@@ -1,4 +1,4 @@
-"""Interactive DM tutorial: step tracking, command checkpoints, Member role on completion."""
+"""Interactive DM tutorial: 5-step quest chain with crystal rewards."""
 
 from __future__ import annotations
 
@@ -14,39 +14,51 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from poke_pon_bot.chat_commands import pp_alias
 from poke_pon_bot.config import Settings
 from poke_pon_bot.models.user_tutorial import UserTutorial
-from poke_pon_bot.services.drops import DropService
-from poke_pon_bot.services.packs import PackService
+from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 
 _LOG = logging.getLogger(__name__)
 
-TUTORIAL_EVOLVE_STEP_REWARD = 2000
+STEP_WELCOME: Final = "welcome"
+STEP_BALANCE: Final = "balance"
+STEP_DAILY: Final = "daily"
+STEP_DROP: Final = "drop"
+STEP_COLLECTION: Final = "collection"
+STEP_BROWSE: Final = "browse"
+STEP_DONE: Final = "done"
+
+QUEST_STEPS: tuple[str, ...] = (
+    STEP_BALANCE,
+    STEP_DAILY,
+    STEP_DROP,
+    STEP_COLLECTION,
+    STEP_BROWSE,
+)
+
+ORDERED_STEPS: tuple[str, ...] = (STEP_WELCOME, *QUEST_STEPS, STEP_DONE)
+
+STEP_CRYSTAL_REWARDS: dict[str, int] = {
+    STEP_BALANCE: 5,
+    STEP_DAILY: 5,
+    STEP_DROP: 10,
+    STEP_COLLECTION: 10,
+    STEP_BROWSE: 10,
+}
+
+TOTAL_QUEST_CRYSTALS = sum(STEP_CRYSTAL_REWARDS.values())
+
 POKEPON_WEBSITE_URL = "https://pokepon.org"
 POKEPON_COLLECTION_URL = "https://pokepon.org/collection/"
 POKEPON_DECK_URL = "https://pokepon.org/deck/"
 
-STEP_WELCOME: Final = "welcome"
-STEP_DROP: Final = "drop"
-STEP_VIEW_GLOBAL: Final = "view_global"
-STEP_VIEW_COLLECTION: Final = "view_collection"
-STEP_DECK: Final = "deck"
-STEP_EVOLVE: Final = "evolve"
-STEP_PACK: Final = "pack"
-STEP_DAILY: Final = "daily"
-STEP_VOTE: Final = "vote"
-STEP_DONE: Final = "done"
-
-ORDERED_STEPS: tuple[str, ...] = (
-    STEP_WELCOME,
-    STEP_DROP,
-    STEP_VIEW_GLOBAL,
-    STEP_VIEW_COLLECTION,
-    STEP_DECK,
-    STEP_EVOLVE,
-    STEP_PACK,
-    STEP_DAILY,
-    STEP_VOTE,
-    STEP_DONE,
-)
+# Map legacy 8-step tutorial progress onto the new chain.
+_LEGACY_STEP_MAP: dict[str, str] = {
+    "view_global": STEP_COLLECTION,
+    "view_collection": STEP_COLLECTION,
+    "deck": STEP_BROWSE,
+    "evolve": STEP_BROWSE,
+    "pack": STEP_BROWSE,
+    "vote": STEP_BROWSE,
+}
 
 
 @dataclass(frozen=True)
@@ -54,8 +66,8 @@ class StepContent:
     title: str
     body: str
     try_hint: str
-    #: One-line chat command players can copy (``pp`` prefix works in every server).
     copy_example: str = ""
+    crystal_reward: int = 0
 
 
 def _pp_chat_display(slash_or_chat: str) -> str:
@@ -69,7 +81,6 @@ def _pp_chat_display(slash_or_chat: str) -> str:
 
 
 def _cmd_help(slash: str, *, chat: str | None = None, extra: str = "") -> str:
-    """Prefer slash (autocomplete); chat uses the ``pp`` prefix."""
     chat_display = _pp_chat_display(chat or slash)
     line = (
         f"Use **{slash}** — open Discord's **`/`** menu for autocomplete. "
@@ -78,105 +89,84 @@ def _cmd_help(slash: str, *, chat: str | None = None, extra: str = "") -> str:
     return f"{line}\n{extra}" if extra else line
 
 
+def _reward_line(crystals: int) -> str:
+    if crystals <= 0:
+        return ""
+    return f"\n\n**Reward:** {format_crystals(crystals)} when you complete this step."
+
+
 STEP_CONTENT: dict[str, StepContent] = {
     STEP_WELCOME: StepContent(
         title="Welcome to PokePon",
         body=(
-            "This short tutorial walks you through the basics in **your DMs** "
-            "while you try each feature yourself.\n\n"
-            "We recommend **slash commands** (`/…`) for autocomplete. In chat, use the **`pp`** "
-            "prefix (e.g. `ppcd`, `ppdaily`) — bare names like `cd` do not work.\n\n"
-            "Complete it once to unlock the server channels."
+            "Complete **5 quick quests** in your DMs to unlock the server and earn up to "
+            f"**{format_crystals(TOTAL_QUEST_CRYSTALS)}**.\n\n"
+            "Quest order: **balance** → **daily** → **card drop** → **collection** → "
+            "**auctions/trades**.\n\n"
+            "In this **DM**, use **`/cd`**, **`/balance`**, etc. from Discord's **`/`** menu, "
+            "or type **`ppcd`**, **`ppbalance`**, **`ppdaily`** (the **`pp`** prefix is required in DMs). "
+            "You can also run the same commands in the staging server."
         ),
         try_hint="Press **Start tutorial** below.",
     ),
-    STEP_DROP: StepContent(
-        title="Step 1 — Card drop",
+    STEP_BALANCE: StepContent(
+        title="Quest 1 of 5 — Check your balance",
         body=(
-            _cmd_help("/cd", chat="cd")
-            + "\n\nWorks here in DMs or in the server. You will see a pack collage — "
-            "**pick one card** to keep."
+            _cmd_help("/balance", chat="balance")
+            + "\n\nIn DMs: **`ppbal`** or **`ppbalance`** if slash autocomplete does not appear."
+            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_BALANCE])
         ),
-        try_hint="Run the command above and claim a card — I will continue automatically.",
-        copy_example=pp_alias("cd"),
-    ),
-    STEP_VIEW_GLOBAL: StepContent(
-        title="Step 2 — Browse the catalog",
-        body=(
-            _cmd_help(
-                "/cv",
-                extra="Slash: **scope** = **Global catalog (g)**, **name** = `Pikachu` (or any Pokémon).",
-            )
-            + "\n\nShows catalog art for matching printings."
-        ),
-        try_hint="Run the copy-paste line (or fill **/cv** the same way).",
-        copy_example=f"{pp_alias('cv')} g pikachu",
-    ),
-    STEP_VIEW_COLLECTION: StepContent(
-        title="Step 3 — Your collection",
-        body=(
-            _cmd_help("/colv", chat="colv")
-            + f"\n\nText list instead: `{pp_alias('coll')}`."
-            + f"\nOne owned copy with art: `{pp_alias('cv')} c` + your **Card ID** from **colv**."
-        ),
-        try_hint="Run **colv** (or **coll**) from the step above.",
-        copy_example=pp_alias("colv"),
-    ),
-    STEP_DECK: StepContent(
-        title="Step 4 — Duel deck",
-        body=(
-            _cmd_help("/deck edit", chat="deck edit")
-            + f"\n\nView saved bench: `{pp_alias('deck view')}`."
-        ),
-        try_hint="Run **deck edit**, pick a slot, then reply with a **Card ID** from your collection.",
-        copy_example=pp_alias("deck edit"),
-    ),
-    STEP_EVOLVE: StepContent(
-        title="Step 5 — Evolve a card",
-        body=(
-            _cmd_help("/cevolve", chat="cevolve")
-            + "\n\nReplace `YOUR-CARD-ID` in the copy-paste line with the id from **colv** / **cv c**. "
-            f"Reward when you finish: **₽2,000**.\n\n"
-            "No eligible card yet? Press **Skip**."
-        ),
-        try_hint="Paste your real Card ID, or press **Skip**.",
-        copy_example=f"{pp_alias('cevolve')} YOUR-CARD-ID",
-    ),
-    STEP_PACK: StepContent(
-        title="Step 6 — Open your free pack",
-        body=(
-            "I added a **free booster pack** to your account.\n\n"
-            + _cmd_help("/packcolv", chat="packcolv")
-            + "\n\nFind the tutorial pack and press **Open** on it."
-        ),
-        try_hint="Run **packcolv** and open the tutorial pack.",
-        copy_example=pp_alias("packcolv"),
+        try_hint="Run the command above (your own balance).",
+        copy_example="ppbal",
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_BALANCE],
     ),
     STEP_DAILY: StepContent(
-        title="Step 7 — Daily reward",
-        body=(
-            _cmd_help("/daily", chat="daily")
-            + "\n\nClaim free Pokedollars once per UTC day."
-        ),
+        title="Quest 2 of 5 — Daily reward",
+        body=_cmd_help("/daily", chat="daily")
+        + "\n\nClaim free Pokedollars once per UTC day."
+        + _reward_line(STEP_CRYSTAL_REWARDS[STEP_DAILY]),
         try_hint="Run **daily** once.",
         copy_example=pp_alias("daily"),
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_DAILY],
     ),
-    STEP_VOTE: StepContent(
-        title="Step 8 — Vote for the bot",
+    STEP_DROP: StepContent(
+        title="Quest 3 of 5 — Card drop",
         body=(
-            _cmd_help("/vote", chat="vote")
-            + "\n\nVote on Top.gg — rewards are granted automatically after you vote.\n\n"
-            "**Already voted for PokePon before?** Run **/vote** once — if your vote is "
-            "already on file, we'll skip this step and finish the tutorial."
+            _cmd_help("/cd", chat="cd")
+            + "\n\nWorks in DMs or the server. Pick **one card** from the pack to keep."
+            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_DROP])
         ),
-        try_hint="Run **vote** once.",
-        copy_example=pp_alias("vote"),
+        try_hint="Run **cd**, claim a card — I will continue automatically.",
+        copy_example=pp_alias("cd"),
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_DROP],
+    ),
+    STEP_COLLECTION: StepContent(
+        title="Quest 4 of 5 — Your collection",
+        body=(
+            _cmd_help("/colv", chat="colv")
+            + f"\n\nText list: `{pp_alias('coll')}`. "
+            f"One card with art: `{pp_alias('cv')} c` + your **Card ID** from **colv**."
+            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_COLLECTION])
+        ),
+        try_hint="Run **colv** or **coll** (or **cv c** with a Card ID).",
+        copy_example=pp_alias("colv"),
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_COLLECTION],
+    ),
+    STEP_BROWSE: StepContent(
+        title="Quest 5 of 5 — Browse trades & auctions",
+        body=(
+            _cmd_help("/auction search", chat="auction search")
+            + f"\n\nChat shortcuts: **`ppas`** (auction search), **`ppac`** (create), **`ppab`** (bid). "
+            f"Or **`{pp_alias('trade')}`** / **`/trade offer`** (chat: **`pp to`**)."
+            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_BROWSE])
+        ),
+        try_hint="Run **auction search** or **trade** once.",
+        copy_example="ppas",
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_BROWSE],
     ),
     STEP_DONE: StepContent(
         title="Tutorial complete",
-        body=(
-            "You are all set. Have fun collecting, trading, and dueling!"
-        ),
+        body="You are all set. Have fun collecting, trading, and dueling!",
         try_hint="",
     ),
 }
@@ -190,11 +180,34 @@ def is_main_tutorial_guild(guild_id: int | None, settings: Settings) -> bool:
     return guild_id is not None and settings.tutorial_guild_id == guild_id
 
 
+def normalize_tutorial_step(step: str) -> str:
+    if step in ORDERED_STEPS:
+        return step
+    if step == "drop":
+        return STEP_DROP
+    if step == "daily":
+        return STEP_DAILY
+    return _LEGACY_STEP_MAP.get(step, STEP_BALANCE)
+
+
+def quest_step_index(step: str) -> int | None:
+    if step not in QUEST_STEPS:
+        return None
+    return QUEST_STEPS.index(step) + 1
+
+
 async def get_tutorial_row(
     session: AsyncSession,
     discord_user_id: int,
 ) -> UserTutorial | None:
-    return await session.get(UserTutorial, discord_user_id)
+    row = await session.get(UserTutorial, discord_user_id)
+    if row is None:
+        return None
+    normalized = normalize_tutorial_step(row.current_step)
+    if normalized != row.current_step:
+        row.current_step = normalized
+        await session.flush()
+    return row
 
 
 async def is_tutorial_complete(
@@ -222,6 +235,7 @@ async def start_tutorial(
                 started_at=now,
                 completed_at=None,
                 guild_id=guild_id,
+                crystals_earned=0,
             )
             session.add(row)
         elif row.completed_at is not None:
@@ -252,7 +266,6 @@ def _command_name(ctx: commands.Context) -> str:
 
 
 def _command_aliases(ctx: commands.Context) -> set[str]:
-    """Names that may refer to the invoked command (incl. chat aliases)."""
     names: set[str] = set()
     cmd = _leaf_command(ctx)
     if cmd is not None:
@@ -294,34 +307,27 @@ def _arg_scope(ctx: commands.Context) -> str | None:
 def command_satisfies_step(step: str, ctx: commands.Context) -> bool:
     names = _command_aliases(ctx)
     qname = _command_name(ctx)
+    if step == STEP_BALANCE:
+        return bool(names & {"balance", "pcbal", pp_alias("balance")})
+    if step == STEP_DAILY:
+        return bool(names & {"daily", pp_alias("daily")})
     if step == STEP_DROP:
         return False
-    if step == STEP_VIEW_GLOBAL and "cv" in names and _arg_scope(ctx) == "g":
-        return True
-    if step == STEP_VIEW_COLLECTION:
+    if step == STEP_COLLECTION:
         if names & {"colv", pp_alias("colv"), "coll", pp_alias("coll")}:
             return True
         if "cv" in names and _arg_scope(ctx) == "c":
             return True
-    if step == STEP_DECK and (
-        qname == "deck"
-        or qname.startswith("deck ")
-        or qname == pp_alias("deck")
-        or qname.startswith(f"{pp_alias('deck')} ")
-    ):
-        return True
-    if step == STEP_EVOLVE and ("cevolve" in names or pp_alias("cevolve") in names):
-        return True
-    if step == STEP_PACK and names & {"packcolv", pp_alias("packcolv")}:
-        return True
-    if step == STEP_DAILY and names & {"daily", pp_alias("daily")}:
-        return True
-    if step == STEP_VOTE and names & {"vote", pp_alias("vote")}:
-        return True
+    if step == STEP_BROWSE:
+        if qname.startswith("auction") or "auction" in names:
+            return True
+        if qname.startswith("trade") or names & {"trade", pp_alias("trade")}:
+            return True
     return False
 
 
 def next_step(current: str) -> str | None:
+    current = normalize_tutorial_step(current)
     try:
         idx = ORDERED_STEPS.index(current)
     except ValueError:
@@ -331,100 +337,17 @@ def next_step(current: str) -> str | None:
     return ORDERED_STEPS[idx + 1]
 
 
-async def vote_step_already_satisfied(
+async def _grant_step_crystals(
     session: AsyncSession,
-    settings: Settings,
-    discord_user_id: int,
-) -> bool:
-    """True if the user has already voted and received (or is in) a rewarded vote window."""
-    from poke_pon_bot.services.topgg_vote import (
-        TopggAuthError,
-        TopggRateLimitError,
-        fetch_active_discord_vote,
-    )
-    from poke_pon_bot.services.wallet import WalletService, _same_topgg_vote_slice
-
-    wallet = WalletService()
-    row = await wallet._get_or_create(session, discord_user_id)
-    if row.last_vote_claim_at is not None:
-        return True
-    token = settings.topgg_api_token
-    if not token:
-        return False
-    try:
-        status = await fetch_active_discord_vote(token, discord_user_id)
-    except (TopggAuthError, TopggRateLimitError):
-        return False
-    except Exception:
-        _LOG.debug("Tutorial vote check failed for user %s", discord_user_id, exc_info=True)
-        return False
-    if status is None:
-        return False
-    return _same_topgg_vote_slice(row.last_rewarded_topgg_vote_at, status.created_at)
-
-
-async def try_complete_vote_step_if_eligible(
-    bot: commands.Bot | discord.Client,
-    discord_user_id: int,
-) -> bool:
-    """
-    Skip the vote tutorial step when the user already voted (reward claimed or active window paid).
-
-    Attempts a Top.gg auto-claim first so a fresh vote during the tutorial still counts.
-    """
-    settings: Settings = bot.settings  # type: ignore[attr-defined]
-    session_factory = bot.async_session_factory  # type: ignore[attr-defined]
-    async with session_factory() as session:
-        row = await get_tutorial_row(session, discord_user_id)
-        if row is None or row.completed_at is not None or row.current_step != STEP_VOTE:
-            return False
-
-    if settings.topgg_api_token:
-        from poke_pon_bot.services.topgg_auto_claim import claim_active_topgg_vote
-
-        await claim_active_topgg_vote(session_factory, settings, discord_user_id)
-
-    async with session_factory() as session:
-        if not await vote_step_already_satisfied(session, settings, discord_user_id):
-            return False
-
-    if await try_advance_step(
-        session_factory,
-        discord_user_id=discord_user_id,
-        force_from_step=STEP_VOTE,
-    ):
-        await _after_step_advanced(bot, discord_user_id)
-        return True
-    return False
-
-
-async def grant_tutorial_pack(
-    session_factory: async_sessionmaker[AsyncSession],
-    discord_user_id: int,
-) -> None:
-    drop = DropService()
-    packs = PackService()
-    async with session_factory() as session:
-        from poke_pon_bot.models.pack_instance import UserPackInstance
-        from sqlalchemy import select
-
-        existing = await session.execute(
-            select(UserPackInstance.id)
-            .where(
-                UserPackInstance.discord_user_id == discord_user_id,
-                UserPackInstance.source == "tutorial",
-            )
-            .limit(1)
-        )
-        if existing.scalar_one_or_none() is not None:
-            return
-        inst = await packs.grant_tutorial_pack(
-            session,
-            drop,
-            discord_user_id=discord_user_id,
-        )
-        await session.commit()
-        _LOG.info("Tutorial pack granted user=%s pack=%s", discord_user_id, inst.public_id)
+    row: UserTutorial,
+    completed_step: str,
+) -> int:
+    amount = STEP_CRYSTAL_REWARDS.get(completed_step, 0)
+    if amount <= 0:
+        return 0
+    await CrystalsService().try_credit(session, row.discord_user_id, amount)
+    row.crystals_earned = int(row.crystals_earned or 0) + amount
+    return amount
 
 
 async def try_advance_step(
@@ -438,38 +361,19 @@ async def try_advance_step(
         row = await get_tutorial_row(session, discord_user_id)
         if row is None or row.completed_at is not None:
             return False
-        if force_from_step is not None and row.current_step != force_from_step:
+        current = normalize_tutorial_step(row.current_step)
+        if force_from_step is not None and current != normalize_tutorial_step(force_from_step):
             return False
-        prev_step = row.current_step
+        prev_step = current
         nxt = next_step(prev_step)
         if nxt is None:
             return False
-        if prev_step == STEP_EVOLVE:
-            from poke_pon_bot.services.wallet import WalletService
-
-            await WalletService().try_credit(
-                session,
-                discord_user_id,
-                TUTORIAL_EVOLVE_STEP_REWARD,
-            )
+        await _grant_step_crystals(session, row, prev_step)
         row.current_step = nxt
         if nxt == STEP_DONE:
             row.completed_at = datetime.now(UTC)
         await session.commit()
-    if nxt == STEP_PACK:
-        await grant_tutorial_pack(session_factory, discord_user_id)
     return True
-
-
-async def skip_evolve_step(
-    session_factory: async_sessionmaker[AsyncSession],
-    discord_user_id: int,
-) -> bool:
-    async with session_factory() as session:
-        row = await get_tutorial_row(session, discord_user_id)
-        if row is None or row.completed_at is not None or row.current_step != STEP_EVOLVE:
-            return False
-    return await try_advance_step(session_factory, discord_user_id=discord_user_id)
 
 
 async def complete_tutorial(
@@ -482,6 +386,8 @@ async def complete_tutorial(
         if row is None:
             return None
         if row.completed_at is None:
+            if row.current_step == STEP_BROWSE:
+                await _grant_step_crystals(session, row, STEP_BROWSE)
             row.current_step = STEP_DONE
             row.completed_at = datetime.now(UTC)
             await session.commit()
@@ -493,7 +399,6 @@ def resolve_tutorial_guild_id(
     guild_id: int | None,
     settings: Settings,
 ) -> int | None:
-    """Guild to grant Member in — row value, else configured main server."""
     if guild_id is not None:
         return guild_id
     return settings.tutorial_guild_id
@@ -573,15 +478,12 @@ def _pre_member_channels_line(settings: Settings) -> str:
     return f"\n\nUntil you finish, you only have access to: {mentions}"
 
 
-def build_completion_embed(settings: Settings) -> discord.Embed:
-    """Final message after the last tutorial step (includes website)."""
+def build_completion_embed(settings: Settings, *, crystals_earned: int) -> discord.Embed:
     embed = discord.Embed(
         title="Tutorial complete — you're in!",
         description=(
             "You should now have the **Member** role and access to the full server.\n\n"
-            "For an easier time browsing your binder, trading, auctions, and editing your duel deck, "
-            f"check out the website:\n"
-            f"**{POKEPON_WEBSITE_URL}**"
+            f"You earned **{format_crystals(crystals_earned)}** from the quest chain."
         ),
         colour=discord.Colour.gold(),
     )
@@ -596,30 +498,6 @@ def build_completion_embed(settings: Settings) -> discord.Embed:
     )
     embed.set_footer(text="Thanks for playing PokePon!")
     return embed
-
-
-def build_pack_opened_embed() -> discord.Embed:
-    """Sent right after the tutorial pack is opened (before daily/vote steps)."""
-    return discord.Embed(
-        title="Pack opened — great job!",
-        description=(
-            "Your free tutorial pack is done. **Two quick steps left** (daily + vote), "
-            "then verification is complete.\n\n"
-            f"When you're fully done, visit **{POKEPON_WEBSITE_URL}** — "
-            "the collection and deck tools are often easier on the web."
-        ),
-        colour=discord.Colour.green(),
-    )
-
-
-async def send_pack_opened_milestone_dm(bot: commands.Bot, discord_user_id: int) -> None:
-    try:
-        user = await bot.fetch_user(discord_user_id)
-        await user.send(embed=build_pack_opened_embed())
-    except discord.Forbidden:
-        _LOG.info("Pack milestone DM blocked for user %s", discord_user_id)
-    except discord.HTTPException:
-        _LOG.exception("Pack milestone DM failed for user %s", discord_user_id)
 
 
 def build_step_embed(step: str, settings: Settings) -> discord.Embed:
@@ -640,12 +518,9 @@ def build_step_embed(step: str, settings: Settings) -> discord.Embed:
         )
     if content.try_hint:
         embed.add_field(name="Your turn", value=content.try_hint, inline=False)
-    if step == STEP_VOTE and settings.topgg_vote_url:
-        embed.add_field(
-            name="Vote link",
-            value=settings.topgg_vote_url,
-            inline=False,
-        )
+    idx = quest_step_index(step)
+    if idx is not None:
+        embed.set_footer(text=f"Quest {idx} of {len(QUEST_STEPS)} · up to {format_crystals(TOTAL_QUEST_CRYSTALS)} total")
     return embed
 
 
@@ -663,8 +538,6 @@ class TutorialNavView(discord.ui.View):
         self._step = step
         if step == STEP_WELCOME:
             self.add_item(TutorialStartButton(bot=bot, owner_id=owner_id))
-        elif step == STEP_EVOLVE:
-            self.add_item(TutorialSkipEvolveButton(bot=bot, owner_id=owner_id))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user is None or interaction.user.id != self._owner_id:
@@ -687,34 +560,17 @@ class TutorialStartButton(discord.ui.Button):
         await advance_and_notify(self._bot, self._owner_id)
 
 
-class TutorialSkipEvolveButton(discord.ui.Button):
-    def __init__(self, *, bot: commands.Bot, owner_id: int) -> None:
-        super().__init__(label="Skip evolve step", style=discord.ButtonStyle.secondary)
-        self._bot = bot
-        self._owner_id = owner_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
-        if await skip_evolve_step(self._bot.async_session_factory, self._owner_id):
-            await _after_step_advanced(self._bot, self._owner_id)
-
-
 async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
     settings: Settings = bot.settings
+    crystals_earned = 0
     async with bot.async_session_factory() as session:
         row = await get_tutorial_row(session, discord_user_id)
         if row is None:
             return
-        step = row.current_step
+        step = normalize_tutorial_step(row.current_step)
+        crystals_earned = int(row.crystals_earned or 0)
         if row.completed_at is not None:
             step = STEP_DONE
-
-    if step == STEP_VOTE:
-        if await try_complete_vote_step_if_eligible(bot, discord_user_id):
-            return
-
-    if step == STEP_PACK:
-        await grant_tutorial_pack(bot.async_session_factory, discord_user_id)
 
     try:
         user = await bot.fetch_user(discord_user_id)
@@ -722,9 +578,8 @@ async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
         return
 
     if step == STEP_DONE:
-        embed = build_completion_embed(settings)
+        embed = build_completion_embed(settings, crystals_earned=crystals_earned)
         view = None
-        row = None
         async with bot.async_session_factory() as session:
             row = await get_tutorial_row(session, discord_user_id)
         if row:
@@ -736,19 +591,11 @@ async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
             )
     else:
         embed = build_step_embed(step, settings)
-        if step == STEP_PACK:
-            from poke_pon_bot.services.wallet import format_pokedollars
-
-            embed.add_field(
-                name="Evolve step bonus",
-                value=f"You received **{format_pokedollars(TUTORIAL_EVOLVE_STEP_REWARD)}** "
-                "for completing the evolve step.",
-                inline=False,
-            )
-        view = TutorialNavView(bot=bot, owner_id=discord_user_id, step=step) if step in (
-            STEP_WELCOME,
-            STEP_EVOLVE,
-        ) else None
+        view = (
+            TutorialNavView(bot=bot, owner_id=discord_user_id, step=step)
+            if step == STEP_WELCOME
+            else None
+        )
 
     try:
         await user.send(embed=embed, view=view)
@@ -759,8 +606,6 @@ async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
 
 
 async def _after_step_advanced(bot: commands.Bot, discord_user_id: int) -> None:
-    if await try_complete_vote_step_if_eligible(bot, discord_user_id):
-        return
     settings: Settings = bot.settings
     async with bot.async_session_factory() as session:
         row = await get_tutorial_row(session, discord_user_id)
@@ -782,18 +627,6 @@ async def advance_and_notify(bot: commands.Bot, discord_user_id: int) -> None:
         await _after_step_advanced(bot, discord_user_id)
 
 
-async def notify_pack_opened(bot: commands.Bot, discord_user_id: int, *, pack_source: str) -> None:
-    if pack_source != "tutorial":
-        return
-    if await try_advance_step(
-        bot.async_session_factory,
-        discord_user_id=discord_user_id,
-        force_from_step=STEP_PACK,
-    ):
-        await send_pack_opened_milestone_dm(bot, discord_user_id)
-        await _after_step_advanced(bot, discord_user_id)
-
-
 async def handle_command_for_tutorial(bot: commands.Bot, ctx: commands.Context) -> None:
     if ctx.author.bot or ctx.command is None:
         return
@@ -805,23 +638,18 @@ async def handle_command_for_tutorial(bot: commands.Bot, ctx: commands.Context) 
         row = await get_tutorial_row(session, uid)
         if row is None or row.completed_at is not None:
             return
-        step = row.current_step
+        step = normalize_tutorial_step(row.current_step)
     if step == STEP_WELCOME:
         return
-    if step == STEP_VOTE:
-        if await try_complete_vote_step_if_eligible(bot, uid):
-            return
-    if not command_satisfies_step(step, ctx):
-        return
-    if step == STEP_PACK:
-        return
     if step == STEP_DROP:
+        return
+    if not command_satisfies_step(step, ctx):
         return
     await advance_and_notify(bot, uid)
 
 
 async def notify_drop_claimed_for_tutorial(bot: commands.Bot, discord_user_id: int) -> None:
-    """Advance the drop step only after the user claims a card from a /cd pack."""
+    """Advance the drop quest only after the user claims a card from a /cd pack."""
     if await try_advance_step(
         bot.async_session_factory,
         discord_user_id=discord_user_id,
@@ -837,7 +665,7 @@ async def reset_tutorial_for_testing(
     discord_user_id: int,
     remove_member_role: bool = False,
 ) -> dict[str, int]:
-    """Delete tutorial progress (and tutorial packs) so the user can run onboarding again."""
+    """Delete tutorial progress so the user can run onboarding again."""
     from poke_pon_bot.models.pack_instance import UserPackInstance
     from sqlalchemy import delete
 

@@ -2,8 +2,10 @@
 
 1. ``upsert_pack_series`` — applies hand-curated overrides from ``config/pack_series.v1.yaml``.
 2. ``sync_pack_series_from_catalog`` — for every imported TCG set in ``cards``, ensures a
-   series exists with pack art: **Scrydex** front-of-booster PNG when available
-   (``images.scrydex.com``), otherwise the official ``pokemontcg.io`` set logo. Probe
+   series exists. Pack art is resolved from Scrydex sealed-product images (scanning
+   ``{set}-s1`` … ``{set}-s25`` for the first non-placeholder booster/box render) when
+   available; otherwise the pokemontcg.io set logo. Series that only have logo art are
+   marked ``is_active=False`` so ``/packv`` and random ``/packd`` rolls skip them. Probe
    results are cached in ``data/.pack_art_url_cache.json`` so restarts stay fast.
 
 Together they keep ``card_series`` aligned with reality: YAML wins for codes it lists, every
@@ -36,12 +38,35 @@ def pokemontcg_logo_url(set_code: str) -> str:
 
 
 def scrydex_booster_pack_image_url(set_code: str) -> str:
-    """Front-of-pack art on Scrydex's public image CDN (see https://scrydex.com/docs/pokemon/sealed)."""
-    return f"https://images.scrydex.com/pokemon/{set_code}-s1/large"
+    """Default Scrydex sealed id guess (``{set}-s1``) — see ``scrydex_sealed_image_url``."""
+    return scrydex_sealed_image_url(f"{set_code}-s1")
+
+
+def scrydex_sealed_image_url(sealed_id: str) -> str:
+    """Front-of-sealed art on Scrydex's public CDN (see https://scrydex.com/docs/pokemon/sealed)."""
+    return f"https://images.scrydex.com/pokemon/{sealed_id}/large"
+
+
+def is_logo_pack_art_url(url: str | None) -> bool:
+    """True when art is the pokemontcg.io set logo fallback (not a booster render)."""
+    if not url:
+        return True
+    u = url.strip().lower()
+    return "images.pokemontcg.io/" in u and u.endswith("/logo.png")
+
+
+def has_real_pack_art_url(url: str | None) -> bool:
+    """True when ``pack_art_url`` points at a non-logo Scrydex (or other custom) image."""
+    if not url or not str(url).strip():
+        return False
+    return not is_logo_pack_art_url(url)
 
 
 # Scrydex serves this exact byte length for a generic placeholder when no real booster exists.
 _PLACEHOLDER_IMAGE_BYTES = 186316
+
+# Scan ``{set_code}-s1`` … ``{set_code}-sN`` — expansion_sort_order on Scrydex sealed products.
+_SCRYDEX_SEALED_SUFFIX_MAX = 25
 
 _PACK_ART_CACHE_PATH = Path("data/.pack_art_url_cache.json")
 
@@ -116,47 +141,48 @@ def _write_pack_art_cache(cache: dict[str, str]) -> None:
         _LOG.warning("Could not persist pack art cache to %s: %s", _PACK_ART_CACHE_PATH, exc)
 
 
+async def _scrydex_image_is_real(client: httpx.AsyncClient, url: str) -> bool:
+    """True when the Scrydex CDN returns a 200 body that is not the generic placeholder."""
+    try:
+        resp = await client.get(url, follow_redirects=True)
+    except httpx.RequestError:
+        return False
+    if resp.status_code != 200:
+        return False
+    return len(resp.content) != _PLACEHOLDER_IMAGE_BYTES
+
+
+async def _discover_scrydex_pack_art(
+    client: httpx.AsyncClient,
+    set_code: str,
+) -> str | None:
+    """First non-placeholder Scrydex sealed image for this set (lowest ``-sN`` suffix wins)."""
+    for i in range(1, _SCRYDEX_SEALED_SUFFIX_MAX + 1):
+        url = scrydex_sealed_image_url(f"{set_code}-s{i}")
+        if await _scrydex_image_is_real(client, url):
+            return url
+    return None
+
+
 async def _probe_scrydex_or_logo(client: httpx.AsyncClient, set_code: str) -> str:
-    """Return Scrydex pack art URL when it looks like a real booster; else the pokemontcg.io logo."""
-    scrydex_url = scrydex_booster_pack_image_url(set_code)
-    logo_url = pokemontcg_logo_url(set_code)
-    try:
-        head = await client.head(scrydex_url, follow_redirects=True)
-    except httpx.RequestError as exc:
-        _LOG.debug("Pack art HEAD failed for %s: %s — using logo", set_code, exc)
-        return logo_url
-    if head.status_code != 200:
-        return logo_url
-    cl_raw = head.headers.get("content-length")
-    if cl_raw is not None:
-        try:
-            cl_val = int(str(cl_raw).strip())
-        except ValueError:
-            cl_val = None
-        if cl_val == _PLACEHOLDER_IMAGE_BYTES:
-            return logo_url
-        if cl_val is not None and cl_val != _PLACEHOLDER_IMAGE_BYTES:
-            return scrydex_url
-    try:
-        get = await client.get(scrydex_url, follow_redirects=True)
-    except httpx.RequestError as exc:
-        _LOG.debug("Pack art GET fallback failed for %s: %s — using logo", set_code, exc)
-        return logo_url
-    if get.status_code != 200:
-        return logo_url
-    if len(get.content) == _PLACEHOLDER_IMAGE_BYTES:
-        return logo_url
-    return scrydex_url
+    """Return Scrydex sealed art when found; else the pokemontcg.io set logo."""
+    discovered = await _discover_scrydex_pack_art(client, set_code)
+    if discovered:
+        return discovered
+    return pokemontcg_logo_url(set_code)
 
 
 async def _resolve_pack_art_urls(set_codes: set[str]) -> dict[str, str]:
-    """Map each set code to a final ``pack_art_url``, updating the on-disk cache for new keys."""
+    """Map each set code to a final ``pack_art_url``, updating the on-disk cache."""
     cache = _read_pack_art_cache()
-    missing = sorted(s for s in set_codes if s not in cache)
-    if missing:
-        sem = asyncio.Semaphore(10)
+    missing = {s for s in set_codes if s not in cache}
+    # Re-probe sets still on logo — Scrydex may have added art or ``-s1`` was a placeholder.
+    stale_logo = {s for s in set_codes if s in cache and is_logo_pack_art_url(cache[s])}
+    to_probe = sorted(missing | stale_logo)
+    if to_probe:
+        sem = asyncio.Semaphore(8)
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0),
+            timeout=httpx.Timeout(30.0),
             headers={"User-Agent": "PokePonBot/1.0 (pack series sync)"},
         ) as client:
 
@@ -165,7 +191,7 @@ async def _resolve_pack_art_urls(set_codes: set[str]) -> dict[str, str]:
                     url = await _probe_scrydex_or_logo(client, code)
                 return code, url
 
-            resolved_pairs = await asyncio.gather(*(one(c) for c in missing))
+            resolved_pairs = await asyncio.gather(*(one(c) for c in to_probe))
         for code, url in resolved_pairs:
             cache[code] = url
         _write_pack_art_cache(cache)
@@ -320,6 +346,8 @@ async def sync_pack_series_from_catalog(
     created = 0
     upgraded_art = 0
     upgraded_price = 0
+    activated_art = 0
+    deactivated_logo = 0
     async with session_factory() as session:
         rows = await session.execute(
             select(Card.set_code, Card.set_name).distinct()
@@ -348,6 +376,7 @@ async def sync_pack_series_from_catalog(
             pack_art_url = pack_art_by_code[set_code]
             top_rarity = max_rarity_by_set.get(set_code)
             crystal_price = crystal_price_for_top_rarity(top_rarity)
+            want_active = has_real_pack_art_url(pack_art_url)
             if set_code not in existing_codes:
                 row = CardSeries(
                     code=set_code,
@@ -357,12 +386,14 @@ async def sync_pack_series_from_catalog(
                     pack_art_url=pack_art_url,
                     cards_per_pack=10,
                     code_cards_per_pack=1,
-                    is_active=True,
+                    is_active=want_active,
                 )
                 session.add(row)
                 await session.flush()
                 session.add(CardSeriesSet(series_id=row.id, set_code=set_code))
                 created += 1
+                if not want_active:
+                    deactivated_logo += 1
                 continue
 
             if set_code in yaml_codes:
@@ -372,15 +403,24 @@ async def sync_pack_series_from_catalog(
                 continue
             logo_url = pokemontcg_logo_url(set_code)
             cur = series_row.pack_art_url
-            if cur in (None, logo_url) and pack_art_url != cur:
+            if cur in (None, logo_url) or is_logo_pack_art_url(cur):
+                if pack_art_url != cur:
+                    series_row.pack_art_url = pack_art_url
+                    upgraded_art += 1
+            elif pack_art_url != cur:
                 series_row.pack_art_url = pack_art_url
                 upgraded_art += 1
-            # Price upgrade applies to catalog-managed rows only — YAML overrides win above.
+            if series_row.is_active != want_active:
+                series_row.is_active = want_active
+                if want_active:
+                    activated_art += 1
+                else:
+                    deactivated_logo += 1
             if series_row.crystal_price != crystal_price:
                 series_row.crystal_price = crystal_price
                 upgraded_price += 1
 
-        if created or upgraded_art or upgraded_price:
+        if created or upgraded_art or upgraded_price or activated_art or deactivated_logo:
             await session.commit()
 
     if created:
@@ -394,6 +434,16 @@ async def sync_pack_series_from_catalog(
         _LOG.info(
             "Pack series auto-sync: rebalanced crystal_price on %s catalog series (top-rarity tier).",
             upgraded_price,
+        )
+    if activated_art:
+        _LOG.info(
+            "Pack series auto-sync: re-enabled %s series with real booster art.",
+            activated_art,
+        )
+    if deactivated_logo:
+        _LOG.info(
+            "Pack series auto-sync: hid %s logo-only series from shop/random rolls.",
+            deactivated_logo,
         )
     return created
 

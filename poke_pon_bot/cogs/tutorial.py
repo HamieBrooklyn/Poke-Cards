@@ -5,7 +5,7 @@ from __future__ import annotations
 import discord
 from discord.ext import commands
 
-from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.services.tutorial import (
     is_tutorial_complete,
     send_current_step_dm,
@@ -20,8 +20,8 @@ class TutorialCog(commands.Cog):
 
     @commands.hybrid_command(
         name="tutorial",
-        aliases=[pp_alias("tutorial")],
-        description="Start or resume the PokePon tutorial in your DMs (one time).",
+        aliases=[*pp_chat_aliases("tutorial", "tut")],
+        description="Start or resume the 5-step PokePon quest chain in your DMs (Crystals + Member role).",
     )
     async def tutorial_cmd(self, ctx: commands.Context) -> None:
         if ctx.interaction:

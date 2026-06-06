@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
+from poke_pon_bot.services.card_images import card_image_urls
 from poke_pon_bot.services.catalog_search import browse_catalog, catalog_facets
 from poke_pon_bot.services.excluded_sets import excluded_set_clause
 from poke_pon_bot.web.collection_api import _max_attack_damage, _to_int_or_zero, _utc_iso
@@ -47,7 +48,9 @@ def _serialize_catalog_summary(
     rarity: RarityClass | None,
     *,
     owned_count: int = 0,
+    web_public_url: str | None = None,
 ) -> dict[str, Any]:
+    small_url, large_url = card_image_urls(card, web_public_url=web_public_url)
     return {
         "id": int(card.id),
         "tcg_card_id": card.tcg_card_id,
@@ -58,8 +61,8 @@ def _serialize_catalog_summary(
         "supertype": card.supertype,
         "tcg_subtypes": getattr(card, "tcg_subtypes", None) or [],
         "dex_numbers": card.dex_numbers or [],
-        "image_small_url": card.image_small_url,
-        "image_large_url": card.image_large_url,
+        "image_small_url": small_url,
+        "image_large_url": large_url,
         "hp": _to_int_or_zero(card.hp),
         "max_damage": _max_attack_damage(card.attacks),
         "tcg_rarity": card.tcg_rarity,
@@ -77,8 +80,11 @@ def _serialize_catalog_detail(
     rarity: RarityClass | None,
     *,
     owned_copies: list[dict[str, Any]],
+    web_public_url: str | None = None,
 ) -> dict[str, Any]:
-    payload = _serialize_catalog_summary(card, rarity, owned_count=len(owned_copies))
+    payload = _serialize_catalog_summary(
+        card, rarity, owned_count=len(owned_copies), web_public_url=web_public_url
+    )
     payload.update(
         {
             "types": card.tcg_types or [],
@@ -198,11 +204,13 @@ def register_catalog_public_api(app: web.Application, *, bot: Any) -> None:
             _LOG.exception("catalog_api list")
             return web.json_response({"error": "database_error"}, status=500)
 
+        public_base = getattr(settings, "web_public_url", None)
         items = [
             _serialize_catalog_summary(
                 card,
                 rarity,
                 owned_count=owned_map.get(int(card.id), 0),
+                web_public_url=public_base,
             )
             for card, rarity in rows
         ]
@@ -248,7 +256,12 @@ def register_catalog_public_api(app: web.Application, *, bot: Any) -> None:
             return web.json_response({"error": "database_error"}, status=500)
 
         return web.json_response(
-            _serialize_catalog_detail(card, rarity, owned_copies=owned)
+            _serialize_catalog_detail(
+                card,
+                rarity,
+                owned_copies=owned,
+                web_public_url=getattr(settings, "web_public_url", None),
+            )
         )
 
     app.router.add_get("/api/catalog/facets", handle_facets)

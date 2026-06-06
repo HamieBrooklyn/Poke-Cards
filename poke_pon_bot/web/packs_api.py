@@ -96,10 +96,13 @@ def register_packs_public_api(app: web.Application, *, bot: Any) -> None:
 
         for s in series_list:
 
-            if q and q not in (s.display_name or "").lower() and q not in (s.code or "").lower():
-
-                if s.description and q not in s.description.lower():
-
+            if q:
+                haystack = (
+                    (s.display_name or "").lower()
+                    + " " + (s.code or "").lower()
+                    + " " + (s.description or "").lower()
+                )
+                if q not in haystack:
                     continue
 
             items.append(

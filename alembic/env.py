@@ -6,13 +6,13 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from dotenv import load_dotenv
+from poke_pon_bot.env_loader import load_pokepon_dotenv
 from sqlalchemy import engine_from_config, pool
 
 from poke_pon_bot.db.base import Base
 import poke_pon_bot.models  # noqa: F401 — register models on metadata
 
-load_dotenv()
+load_pokepon_dotenv()
 
 config = context.config
 if config.config_file_name is not None:

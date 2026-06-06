@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, String
+from sqlalchemy import BigInteger, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from poke_pon_bot.db.base import Base
@@ -22,3 +22,4 @@ class UserTutorial(Base):
     )
     #: Guild where Member role should be granted on completion (main server).
     guild_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    crystals_earned: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")

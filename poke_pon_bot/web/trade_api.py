@@ -12,6 +12,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.models.known_user import KnownUser
+from poke_pon_bot.models.card import Card
+from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.services.trade_user_search import (
     resolve_username_in_bot_guilds,
     search_members_shared_with_bot,
@@ -33,6 +35,8 @@ from poke_pon_bot.services.web_trades import (
     toggle_ready,
     update_trade_side,
 )
+from poke_pon_bot.services.notification_delivery import PREF_TRADES, schedule_notification
+from poke_pon_bot.services.wishlist_market_alerts import schedule_wishlist_trade_alerts
 from poke_pon_bot.web.sessions import read_session
 from poke_pon_bot.web.trade_ws import notify_trade_room
 
@@ -64,14 +68,28 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
     async def _push_trade(trade_id: int) -> None:
         await notify_trade_room(session_factory, bot, int(trade_id))
 
-    async def _try_dm(user_id: int, content: str) -> None:
-        try:
-            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-            await user.send(content)
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
-        except Exception:
-            _LOG.debug("DM to %s failed", user_id)
+    async def _notify_trade(
+        user_id: int,
+        *,
+        kind: str,
+        title: str,
+        body: str,
+        discord_body: str,
+        trade_id: int | None = None,
+    ) -> None:
+        href = None
+        if public_url and trade_id is not None:
+            href = f"{public_url}/trades/?id={trade_id}"
+        schedule_notification(
+            bot,
+            user_id=int(user_id),
+            kind=kind,
+            title=title,
+            body=body,
+            href=href,
+            discord_pref=PREF_TRADES,
+            discord_body=discord_body,
+        )
 
     # POST /api/me/trades — create invite
     async def handle_create(request: web.Request) -> web.StreamResponse:
@@ -127,12 +145,21 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
             _LOG.exception("trade create uid=%s", uid)
             return web.json_response({"error": "database_error"}, status=500)
 
-        trade_link = f"{public_url}/trades.html" if public_url else ""
+        trade_link = f"{public_url}/trades/" if public_url else ""
         init_name = sess.global_name or sess.username or str(uid)
-        await _try_dm(
-            partner_id,
-            f"**{init_name}** wants to trade with you!"
-            + (f"\nOpen the trade on the website: {trade_link}" if trade_link else ""),
+        tid = int(payload.get("id") or 0)
+        discord_body = f"**{init_name}** wants to trade with you!"
+        if trade_link and tid:
+            discord_body += f"\nOpen the trade on the website: {public_url}/trades/?id={tid}"
+        elif trade_link:
+            discord_body += f"\nOpen the trade on the website: {trade_link}"
+        await _notify_trade(
+            int(partner_id),
+            kind="trade_invite",
+            title="Trade invite",
+            body=f"{init_name} invited you to trade.",
+            discord_body=discord_body,
+            trade_id=tid or None,
         )
         return web.json_response(payload, status=201)
 
@@ -205,7 +232,14 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 await db.commit()
                 partner_name = sess.global_name or sess.username or str(uid)
                 if ts:
-                    await _try_dm(ts.initiator_id, f"**{partner_name}** accepted your trade invite! Head to the website to start adding cards.")
+                    await _notify_trade(
+                        int(ts.initiator_id),
+                        kind="trade_update",
+                        title="Trade accepted",
+                        body=f"{partner_name} accepted your trade invite.",
+                        discord_body=f"**{partner_name}** accepted your trade invite! Head to the website to start adding cards.",
+                        trade_id=tid,
+                    )
                 await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade accept tid=%s", tid)
@@ -230,11 +264,30 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 await db.commit()
                 if ts:
                     partner_name = sess.global_name or sess.username or str(uid)
-                    await _try_dm(ts.initiator_id, f"**{partner_name}** declined your trade invite.")
+                    await _notify_trade(
+                        int(ts.initiator_id),
+                        kind="trade_update",
+                        title="Trade declined",
+                        body=f"{partner_name} declined your trade invite.",
+                        discord_body=f"**{partner_name}** declined your trade invite.",
+                        trade_id=tid,
+                    )
         except SQLAlchemyError:
             _LOG.exception("trade decline tid=%s", tid)
             return web.json_response({"error": "database_error"}, status=500)
         return web.json_response({"ok": True})
+
+    async def _cards_for_instance_ids(db, instance_ids: set[int]) -> list[tuple[int, str]]:
+        if not instance_ids:
+            return []
+        rows = (
+            await db.execute(
+                select(UserCardInstance, Card)
+                .join(Card, UserCardInstance.card_id == Card.id)
+                .where(UserCardInstance.id.in_(instance_ids))
+            )
+        ).all()
+        return [(int(inst.card_id), str(card.name)) for inst, card in rows]
 
     # POST /api/me/trades/{id}/update — update caller's side
     async def handle_update(request: web.Request) -> web.StreamResponse:
@@ -263,13 +316,32 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
 
         try:
             async with session_factory() as db:
+                ts = await db.get(TradeSession, tid)
+                if ts is None:
+                    return web.json_response({"error": "not_found"}, status=404)
+                prev_ids: set[int] = set()
+                if uid == ts.initiator_id:
+                    prev_ids = set(ts.initiator_card_ids or [])
+                elif uid == ts.partner_id:
+                    prev_ids = set(ts.partner_card_ids or [])
                 err = await update_trade_side(
                     db, trade_id=tid, user_id=uid,
                     card_ids=card_ids, pokedollars=pd, crystals=cr,
                 )
                 if err:
                     return web.json_response({"error": "trade_error", "message": err}, status=400)
+                added_ids = set(card_ids) - prev_ids
+                trade_cards = await _cards_for_instance_ids(db, added_ids)
+                exclude = frozenset({ts.initiator_id, ts.partner_id})
                 await db.commit()
+                if trade_cards:
+                    schedule_wishlist_trade_alerts(
+                        bot,
+                        offerer_id=uid,
+                        trade_id=tid,
+                        cards=trade_cards,
+                        exclude_user_ids=exclude,
+                    )
                 await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade update tid=%s", tid)
@@ -327,7 +399,14 @@ def register_trade_api(app: web.Application, *, bot: Any, settings: Any) -> None
                 if ts:
                     other_id = ts.partner_id if uid == ts.initiator_id else ts.initiator_id
                     canceller_name = sess.global_name or sess.username or str(uid)
-                    await _try_dm(other_id, f"**{canceller_name}** cancelled the trade.")
+                    await _notify_trade(
+                        int(other_id),
+                        kind="trade_update",
+                        title="Trade cancelled",
+                        body=f"{canceller_name} cancelled the trade.",
+                        discord_body=f"**{canceller_name}** cancelled the trade.",
+                        trade_id=tid,
+                    )
                 await _push_trade(tid)
         except SQLAlchemyError:
             _LOG.exception("trade cancel tid=%s", tid)

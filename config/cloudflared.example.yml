@@ -1,0 +1,12 @@
+# Copy relevant ingress lines into ~/.cloudflared/config.yml
+# (keep your tunnel id and credentials-file paths as-is).
+
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /Users/YOU/.cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: api.pokepon.org
+    service: http://localhost:8080
+  - hostname: api-staging.pokepon.org
+    service: http://localhost:8081
+  - service: http_status:404

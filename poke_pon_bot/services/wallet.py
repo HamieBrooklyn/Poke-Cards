@@ -149,11 +149,14 @@ class WalletService:
         self,
         session: AsyncSession,
         discord_user_id: int,
+        *,
+        daily_multiplier: int = 1,
     ) -> DailyClaimResult:
         row = await self._get_or_create(session, discord_user_id)
         if _claimed_today_utc(row.last_daily_claim_at):
             raise AlreadyClaimedTodayError
-        amount = self._rng.randint(DAILY_CLAIM_MIN, DAILY_CLAIM_MAX)
+        mult = max(1, int(daily_multiplier))
+        amount = self._rng.randint(DAILY_CLAIM_MIN * mult, DAILY_CLAIM_MAX * mult)
         row.balance = row.balance + amount
         row.last_daily_claim_at = datetime.now(UTC)
         return DailyClaimResult(amount=amount, new_balance=row.balance)

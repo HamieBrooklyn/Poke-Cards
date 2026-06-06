@@ -227,6 +227,14 @@ class DuelRuntime:
             body = main_line + "\n" + "\n".join(extra)
         chunk = ansi_colored_battle_line(body, type_factor=factor)
         self.log_lines.append(chunk)
+
+        self._last_move_meta = {
+            "attacker": attacker.name,
+            "defender": defender.name,
+            "move": name,
+            "damage": final_dmg,
+            "factor": float(factor),
+        }
         if winner is not None:
             return winner
 

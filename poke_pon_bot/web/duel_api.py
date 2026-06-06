@@ -32,6 +32,7 @@ from poke_pon_bot.services.web_duels import (
     lock_escrow,
     normalize_duel_currency,
     surrender_duel,
+    validate_duel_accept_prerequisites,
 )
 from poke_pon_bot.web.duel_ws import broadcast_duel_state
 from poke_pon_bot.web.frontend_urls import duel_page_url
@@ -221,6 +222,21 @@ def register_duel_api(app: web.Application, *, bot: Any, settings: Any) -> None:
             return web.json_response({"error": "invalid_id"}, status=400)
         try:
             async with session_factory() as db:
+                ds = await db.get(DuelSession, did)
+                if ds is None:
+                    return web.json_response({"error": "not_found"}, status=404)
+                if uid not in (ds.initiator_id, ds.partner_id):
+                    return web.json_response({"error": "not_found"}, status=404)
+
+                if ds.status == DUEL_STATUS_INVITED:
+                    pre = await validate_duel_accept_prerequisites(
+                        db, row=ds, wallet=wallet, crystals=crystals
+                    )
+                    if pre:
+                        return web.json_response(
+                            {"error": "duel_error", "message": pre}, status=400
+                        )
+
                 err = await accept_duel_invite(db, duel_id=did, user_id=uid)
                 if err:
                     return web.json_response({"error": "duel_error", "message": err}, status=400)

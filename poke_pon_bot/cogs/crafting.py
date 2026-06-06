@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy.exc import SQLAlchemyError
 
-from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.cogs.gacha import _hybrid_ephemeral, _reply_card_id_below
 from poke_pon_bot.services.card_roles import CRAFT_ITEM_COUNT
 from poke_pon_bot.services.crafting import run_craft
@@ -74,7 +74,7 @@ class CraftingCog(commands.Cog):
 
     @commands.hybrid_command(
         name="craft",
-        aliases=[pp_alias("craft")],
+        aliases=[*pp_chat_aliases("craft")],
         description=(
             f"Craft a pack: {CRAFT_ITEM_COUNT} item Card IDs + 1 trainer Card ID "
             "(trainer rarity sets pack tier)."

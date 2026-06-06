@@ -35,7 +35,15 @@ from poke_pon_bot.services.combat_deck import strip_instances_from_deck
 from poke_pon_bot.services.crystals import CrystalsService
 from poke_pon_bot.services.instance_public_id import normalize_public_id
 from poke_pon_bot.services.trades import MAX_TRADE_CRYSTALS, MAX_TRADE_POKEDOLLARS
+from poke_pon_bot.services.crystal_sinks import (
+    AUCTION_SPOTLIGHT_CRYSTAL_COST,
+    apply_spotlight_to_auction,
+    auction_spotlight_active,
+)
+from poke_pon_bot.services.grading import grading_fields_for_instance
 from poke_pon_bot.services.wallet import WalletService
+from poke_pon_bot.services.notification_delivery import schedule_outbid_alert
+from poke_pon_bot.services.wishlist_market_alerts import schedule_wishlist_auction_alert
 from poke_pon_bot.web.sessions import read_session
 from poke_pon_bot.web.user_profiles import resolve_user_profiles
 
@@ -100,6 +108,8 @@ def _serialize_auction_summary(
         "ends_at": _utc_iso(auc.ends_at),
         "created_at": _utc_iso(auc.created_at),
         "bid_count": bid_count,
+        "spotlight_active": auction_spotlight_active(auc),
+        "spotlight_until": _utc_iso(getattr(auc, "spotlight_until", None)),
         "card": {
             "name": card.name,
             "public_id": inst.public_id,
@@ -110,6 +120,7 @@ def _serialize_auction_summary(
             "image_large_url": card.image_large_url,
             "tcg_rarity": card.tcg_rarity,
             "rarity_display": rarity.display_name if rarity else None,
+            **grading_fields_for_instance(inst),
         },
     }
 
@@ -123,6 +134,8 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
     session_ttl = settings.web_session_ttl_seconds
     wallet = WalletService()
     crystals = CrystalsService()
+    public_url = (settings.web_frontend_url or "").rstrip("/")
+    auctions_url = f"{public_url}/auctions/" if public_url else ""
 
     def _require_session(request: web.Request):
         sess = read_session(request, session_secret, max_age=session_ttl)
@@ -299,7 +312,56 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
             _LOG.exception("auction detail api id=%s", aid)
             return web.json_response({"error": "database_error"}, status=500)
 
+        sess = read_session(request, session_secret, max_age=session_ttl)
+        if sess is not None:
+            payload["viewer_is_seller"] = int(sess.user_id) == int(auc.seller_discord_id)
+        else:
+            payload["viewer_is_seller"] = False
+        payload["spotlight_crystal_cost"] = AUCTION_SPOTLIGHT_CRYSTAL_COST
+
         return web.json_response(payload)
+
+    async def handle_spotlight(request: web.Request) -> web.StreamResponse:
+        session = _require_session(request)
+        uid = int(session.user_id)
+        try:
+            aid = int(request.match_info["id"])
+        except (KeyError, ValueError):
+            return web.json_response({"error": "invalid_id"}, status=400)
+
+        try:
+            await settle_due_auctions(session_factory, wallet, crystals)
+        except Exception:
+            _LOG.exception("auction settlement during spotlight")
+
+        try:
+            async with session_factory() as db:
+                outcome = await apply_spotlight_to_auction(
+                    db,
+                    crystals,
+                    seller_discord_id=uid,
+                    auction_id=aid,
+                )
+                if not outcome.ok:
+                    status = 403 if outcome.error and "seller" in outcome.error.lower() else 400
+                    return web.json_response(
+                        {"error": "spotlight_failed", "message": outcome.error},
+                        status=status,
+                    )
+                await db.commit()
+        except SQLAlchemyError:
+            _LOG.exception("auction spotlight api id=%s uid=%s", aid, uid)
+            return web.json_response({"error": "database_error"}, status=500)
+
+        return web.json_response(
+            {
+                "ok": True,
+                "auction_id": outcome.auction_id,
+                "spotlight_active": True,
+                "spotlight_until": _utc_iso(outcome.spotlight_until),
+                "new_crystal_balance": outcome.new_crystal_balance,
+            }
+        )
 
     async def handle_create(request: web.Request) -> web.StreamResponse:
         session = _require_session(request)
@@ -346,7 +408,7 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
                 first = row.first()
                 if first is None:
                     return web.json_response({"error": "card_not_owned"}, status=404)
-                inst, _card = first
+                inst, card = first
                 dup = await db.scalar(
                     select(CardAuction.id).where(
                         CardAuction.instance_id == inst.id,
@@ -368,12 +430,24 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
                 db.add(listing)
                 await db.flush()
                 lid = listing.id
+                card_name = card.name
+                catalog_card_id = int(inst.card_id)
                 await db.commit()
         except IntegrityError:
             return web.json_response({"error": "already_listed"}, status=409)
         except SQLAlchemyError:
             _LOG.exception("auction create web uid=%s", uid)
             return web.json_response({"error": "database_error"}, status=500)
+
+        schedule_wishlist_auction_alert(
+            bot,
+            seller_id=uid,
+            auction_id=lid,
+            catalog_card_id=catalog_card_id,
+            card_name=card_name,
+            price=starting,
+            currency=cur,
+        )
 
         return web.json_response({"ok": True, "auction_id": lid})
 
@@ -395,8 +469,20 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
         except Exception:
             _LOG.exception("auction settlement during bid")
 
+        prev_bidder: int | None = None
+        card_name = "Card"
+        bid_currency = AUCTION_BID_CURRENCY_POKEDOLLARS
         try:
             async with session_factory() as db:
+                auc = await db.get(CardAuction, aid)
+                if auc is not None:
+                    prev_bidder = auc.high_bidder_discord_id
+                    bid_currency = normalize_auction_bid_currency(auc.bid_currency) or bid_currency
+                    inst = await db.get(UserCardInstance, auc.instance_id)
+                    if inst is not None:
+                        card = await db.get(Card, inst.card_id)
+                        if card is not None:
+                            card_name = str(card.name)
                 err = await place_auction_bid(
                     db,
                     wallet,
@@ -412,10 +498,21 @@ def register_auction_api(app: web.Application, *, bot: Any, settings: Any) -> No
             _LOG.exception("auction bid web uid=%s aid=%s", uid, aid)
             return web.json_response({"error": "database_error"}, status=500)
 
+        if prev_bidder is not None and int(prev_bidder) != uid:
+            schedule_outbid_alert(
+                bot,
+                outbid_user_id=int(prev_bidder),
+                auction_id=aid,
+                card_name=card_name,
+                new_amount_label=auction_amount_display(amount, bid_currency),
+                auctions_url=auctions_url,
+            )
+
         return web.json_response({"ok": True})
 
     app.router.add_get("/api/me/balances", handle_balances)
     app.router.add_get("/api/auctions", handle_list)
     app.router.add_get(r"/api/auctions/{id:\d+}", handle_detail)
     app.router.add_post("/api/auctions", handle_create)
+    app.router.add_post(r"/api/auctions/{id:\d+}/spotlight", handle_spotlight)
     app.router.add_post(r"/api/auctions/{id:\d+}/bid", handle_bid)

@@ -22,7 +22,7 @@ class General(commands.Cog):
             title="PokePon commands",
             description=(
                 "Use **slash** from the **`/`** menu (**`/cd`**, **`/cs`**, **`/auction create`**, **`/drop_boost`**, …) — pick the command so Discord shows the **blue pill**. Typing **`/auction`** as **plain chat text** is **not** a command.\n"
-                "**Chat commands** — just **type the command name directly** (**`cd`**, **`coll`**, **`packd`**, **`trade`**, **`help`**, …). This needs **Message Content Intent** on in the Developer Portal → **Bot** → **Privileged Gateway Intents** (not OAuth2 scopes). The bot requests that intent by default; set **`DISCORD_MESSAGE_CONTENT_INTENT=0`** in `.env` only if you want slash-only."
+                "**Chat commands** — type **`pp`** + the command (**`ppcd`**, **`ppbal`**, **`ppas`** for auction search, …). Shorter forms like **`ppbal`** work instead of **`ppbalance`**. In the official server, bare names like **`balance`** or **`auction as`** also work. Needs **Message Content Intent** (Developer Portal → **Bot**). Set **`DISCORD_MESSAGE_CONTENT_INTENT=0`** in `.env` only for slash-only."
             ),
         )
         e.add_field(
@@ -71,11 +71,13 @@ class General(commands.Cog):
             inline=False,
         )
         e.add_field(
-            name="`duel` / `deck` — **PvP duels**",
+            name="`duel` / `deck` — **PvP & PvE duels**",
             value="**`/deck edit`** — interactive bench (**1–6** Pokémon): slot dropdown, reply with **Card ID**, clear/remove. **`/deck view`** — your bench.\n"
             "**`/duel challenge`** — challenge someone, optional **bet**; both **Accept** / **Ready**; decks stay hidden until the fight. "
             "Turn-based: damage uses each attack’s **energy cost** as its type vs the defender’s **card types** (main-series matchups: **green** = super effective, **red** = not very effective / no effect, **grey** = neutral in the battle log). "
-            "Winner takes the **pot**.",
+            "Winner takes the **pot**.\n"
+            "**`/pd`** / **`pcpd`** — wild **Poke-duel** for ₽. After each fight, **Next fight** starts a new battle on the same message. "
+            "Beat a rare (Illustration Rare+), high-HP (220+), or high-damage (170+) wild for a **💎 Crystal** bonus!",
             inline=False,
         )
         e.add_field(
@@ -89,16 +91,39 @@ class General(commands.Cog):
             name="`auction` — **timed auctions**",
             value="**`/auction create`** — list a card (modal: **Card ID**, starting bid, **duration**). "
             "**`/auction search`** — optional **`seller`** (their listings only) plus name / rarity / Pokédex; in chat you can **reply** to someone instead of **`seller`**. "
-            "**`/auction bid`** · chat: **`auction create`**, **`auction search`**, **`auction bid`**.\n"
+            "**`/auction spotlight`** — feature **your active listing** in search for 24h (**12** 💎). "
+            "**`/auction bid`** · chat: **`auction create`**, **`auction search`**, **`auction bid`**, **`auction spotlight`**.\n"
             "**`/auction bid`** / chat **`auction bid`** — listing **#** or **Card ID** + ₽. "
             "When time ends, highest bidder gets the card; seller receives the winning ₽.",
             inline=False,
         )
         e.add_field(
+            name="**Crystal spends** (optional)",
+            value=(
+                "**`/cd`** — after opening a pack, tap **Reroll 8 💎** (right of the Take buttons) to replace one random unclaimed card.\n"
+                "**`/auction spotlight`** — feature **your active listing** in search for **24h** (**12** 💎).\n"
+                "**Website → Profile → Cosmetics** — preview, unlock, and **select** a **leaderboard avatar frame** (metals, gems, animated effects)."
+            ),
+            inline=False,
+        )
+        e.add_field(
+            name="`grade` — **PSA-style grading**",
+            value="**`/grade`** — slab view for a copy in your collection; **roll** or **reroll** for **15** 💎. "
+            "High grades (**7+**) add a small **shop sell bonus**. Slab badges show on trades, auctions, and leaderboards.",
+            inline=False,
+        )
+        e.add_field(
             name="`leaderboard` — **rankings**",
-            value="**`/leaderboard`** — view **server** or **global** rankings. "
-            "Categories: **strongest** cards (attack damage), **tankiest** (HP), **rarest**, or **top auction sales**. "
+            value="**`/leaderboard`** — **global** or **server** rankings (strongest, tankiest, rarest, auctions, graded). "
+            "Server-only: **packs opened**, **top traders**, **top collectors**. "
+            "**`/servermilestones`** — community pack progress + admin config. "
             "Chat: **`pcleaderboard`** or **`lb`**.",
+            inline=False,
+        )
+        e.add_field(
+            name="`referral` — **invite friends**",
+            value="**`/referral`** — your personal invite link, friends you invited, and your progress if someone referred you. "
+            "First **`/cd`** after a first-time join rewards **both** of you; **25** 💎 more for the inviter at **10** packs (up to **3** friends).",
             inline=False,
         )
         e.add_field(
@@ -110,7 +135,7 @@ class General(commands.Cog):
             inline=False,
         )
         e.set_footer(
-            text="Other slash: /ping, /hello, /daily, /vote, /balance (+optional user), /leaderboard, /wishlist. "
+            text="Other slash: /ping, /hello, /daily, /vote, /balance (+optional user), /leaderboard, /referral, /wishlist. "
             "In chat: type `help` for this embed.",
         )
         await ctx.send(embed=e, ephemeral=False)

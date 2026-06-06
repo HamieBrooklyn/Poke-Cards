@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Select, func, select
+from datetime import UTC, datetime
+
+from sqlalchemy import Select, case, desc, func, select
 
 from poke_pon_bot.models.auction import CardAuction
 from poke_pon_bot.models.card import Card
@@ -56,7 +58,19 @@ async def search_auctions(
     guild_id: int | None = None,
     page_limit: int = 20,
     page_offset: int = 0,
+    sort: str = "newest",
+    browse_all_if_no_card_filters: bool = False,
 ) -> tuple[list[tuple[CardAuction, UserCardInstance, Card]], int]:
+    has_filters = any_auction_filter_set(
+        name_contains=name_contains,
+        rarity_contains=rarity_contains,
+        pokedex=pokedex,
+        seller_discord_id=seller_discord_id,
+        guild_id=guild_id,
+    )
+    if not has_filters and not browse_all_if_no_card_filters:
+        return [], 0
+
     stmt = _base_auction_stmt(seller_discord_id=seller_discord_id, guild_id=guild_id)
     stmt = _apply_filters(
         stmt,
@@ -83,7 +97,31 @@ async def search_auctions(
     )
     total = int(await session.scalar(count_stmt) or 0)
 
-    stmt = stmt.order_by(CardAuction.created_at.desc())
+    sort_key = (sort or "newest").strip().lower()
+    if sort_key == "ending":
+        stmt = stmt.order_by(CardAuction.ends_at.asc())
+    elif sort_key == "popular":
+        from poke_pon_bot.models.auction import AuctionBid
+
+        bid_count = (
+            select(func.count(AuctionBid.id))
+            .where(AuctionBid.auction_id == CardAuction.id)
+            .correlate(CardAuction)
+            .scalar_subquery()
+        )
+        stmt = stmt.order_by(bid_count.desc(), CardAuction.created_at.desc())
+    else:
+        now = datetime.now(UTC)
+        spotlight_rank = case(
+            (
+                (CardAuction.spotlight_until.isnot(None))
+                & (CardAuction.spotlight_until > now),
+                1,
+            ),
+            else_=0,
+        )
+        stmt = stmt.order_by(desc(spotlight_rank), CardAuction.created_at.desc())
+
     safe_limit = max(1, min(int(page_limit), 25))
     off = max(0, int(page_offset))
     stmt = stmt.offset(off).limit(safe_limit)

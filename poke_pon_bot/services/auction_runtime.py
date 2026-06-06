@@ -246,7 +246,12 @@ async def place_auction_bid(
     return None
 
 
-async def _settle_one(session: AsyncSession, wallet: WalletService, auc: CardAuction) -> None:
+async def _settle_one(
+    session: AsyncSession,
+    wallet: WalletService,
+    auc: CardAuction,
+    crystals: CrystalsService | None = None,
+) -> None:
     inst = await session.get(UserCardInstance, auc.instance_id)
     seller_id = auc.seller_discord_id
 
@@ -263,9 +268,17 @@ async def _settle_one(session: AsyncSession, wallet: WalletService, auc: CardAuc
         auc.status = AUCTION_STATUS_ENDED_NO_BIDS
         return
 
+    cur = normalize_auction_bid_currency(auc.bid_currency)
+
     await strip_instances_from_deck(session, seller_id, {inst.id})
     inst.discord_user_id = winner_id
-    await wallet.try_credit(session, seller_id, winning_bid)
+    inst.auction_obtained_at = utc_now()
+
+    if cur == AUCTION_BID_CURRENCY_CRYSTALS and crystals is not None:
+        await crystals.try_credit(session, seller_id, winning_bid)
+    else:
+        await wallet.try_credit(session, seller_id, winning_bid)
+
     auc.status = AUCTION_STATUS_ENDED_SOLD
 
 
@@ -275,7 +288,6 @@ async def settle_due_auctions(
     crystals: CrystalsService | None = None,
 ) -> int:
     """Close expired **active** auctions (sold or no bids). Returns how many were settled."""
-    _ = crystals
     settled = 0
     while True:
         async with async_session_factory() as session:
@@ -290,7 +302,7 @@ async def settle_due_auctions(
             auc = row.scalar_one_or_none()
             if auc is None:
                 break
-            await _settle_one(session, wallet, auc)
+            await _settle_one(session, wallet, auc, crystals=crystals)
             await session.commit()
             settled += 1
     return settled

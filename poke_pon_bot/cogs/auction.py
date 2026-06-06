@@ -16,16 +16,26 @@ from poke_pon_bot.models.auction import CardAuction
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.services.auction_runtime import (
+    auction_amount_display,
     format_auction_time_remaining,
+    normalize_auction_bid_currency,
     parse_auction_duration_minutes,
     place_auction_bid,
     resolve_auction_id_for_bid,
     settle_due_auctions,
 )
+from poke_pon_bot.services.notification_delivery import schedule_outbid_alert
 from poke_pon_bot.services.auction_search import any_auction_filter_set, search_auctions
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
 from poke_pon_bot.services.crystals import CrystalsService
+from poke_pon_bot.services.crystal_sinks import (
+    AUCTION_SPOTLIGHT_CRYSTAL_COST,
+    apply_spotlight_to_auction,
+)
+from poke_pon_bot.services.grading import format_grade_slab_badge
+from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 from poke_pon_bot.services.instance_public_id import compact_public_id_for_line, normalize_public_id
+from poke_pon_bot.services.wishlist_market_alerts import schedule_wishlist_auction_alert
 from poke_pon_bot.services.trades import MAX_TRADE_POKEDOLLARS
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
 
@@ -156,12 +166,23 @@ class ListCardAuctionModal(discord.ui.Modal):
                         ephemeral=True,
                     )
                     return
+            schedule_wishlist_auction_alert(
+                self._bot,
+                seller_id=uid,
+                auction_id=listing_id,
+                catalog_card_id=int(inst.card_id),
+                card_name=card_name,
+                price=amount,
+                currency=listing_row.bid_currency,
+            )
             time_note = format_auction_time_remaining(ends_at)
             await interaction.followup.send(
                 f"Listed **{card_name}** `{pid_line}` · min bid **{format_pokedollars(amount)}** · **{time_note}** "
                 f"(listing **`{listing_id}`**).\n"
                 "Others can **`/auction search`** and **`/auction bid`** with listing **`"
-                f"{listing_id}`** or this card’s **Card ID**.",
+                f"{listing_id}`** or this card’s **Card ID**.\n"
+                f"Feature it in search anytime with **`/auction spotlight {listing_id}`** "
+                f"({format_crystals(AUCTION_SPOTLIGHT_CRYSTAL_COST)}, 24h).",
                 ephemeral=True,
             )
         except SQLAlchemyError:
@@ -214,14 +235,18 @@ class AuctionCog(commands.Cog):
     async def auction_group_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingSubcommand):
             await ctx.send(
-                "Use **`/auction create`** (list a card), **`/auction search`**, or **`/auction bid`**. "
-                "In chat: **`ca create`**, **`ca search`**, **`ca bid`**.",
+                "Use **`/auction create`**, **`/auction search`**, **`/auction bid`**, or **`/auction spotlight`**. "
+                "In chat: **`ca create`**, **`ca search`**, **`ca bid`**, **`ca spotlight`**.",
                 ephemeral=_hybrid_ephemeral(ctx),
             )
             return
         raise error
 
-    @auction_group.command(name="create", description="List a card for auction (opens a form)")
+    @auction_group.command(
+        name="create",
+        description="List a card for auction (opens a form)",
+        aliases=["ac", "alc"],
+    )
     async def auction_create_cmd(self, ctx: commands.Context) -> None:
         if ctx.interaction:
             gid = ctx.interaction.guild_id
@@ -234,7 +259,11 @@ class AuctionCog(commands.Cog):
             ephemeral=_hybrid_ephemeral(ctx),
         )
 
-    @auction_group.command(name="bid", description="Place a bid on an active auction listing")
+    @auction_group.command(
+        name="bid",
+        description="Place a bid on an active auction listing",
+        aliases=["ab", "abd"],
+    )
     @app_commands.describe(
         listing_or_card_id="Listing number from search (e.g. 12) or the card’s Card ID",
         amount="Your bid (must beat the current high bid / meet minimum)",
@@ -253,6 +282,9 @@ class AuctionCog(commands.Cog):
             self.bot.async_session_factory, self._wallet, self._crystals
         )
         resolved_listing_id: int | None = None
+        prev_bidder: int | None = None
+        card_name = "Card"
+        bid_currency = "pokedollars"
         try:
             async with self.bot.async_session_factory() as session:
                 resolved_listing_id, resolve_err = await resolve_auction_id_for_bid(session, listing_or_card_id)
@@ -260,6 +292,15 @@ class AuctionCog(commands.Cog):
                     await ctx.send(resolve_err, ephemeral=ephe)
                     return
                 assert resolved_listing_id is not None
+                auc = await session.get(CardAuction, int(resolved_listing_id))
+                if auc is not None:
+                    prev_bidder = auc.high_bidder_discord_id
+                    bid_currency = normalize_auction_bid_currency(auc.bid_currency) or bid_currency
+                    inst = await session.get(UserCardInstance, auc.instance_id)
+                    if inst is not None:
+                        card = await session.get(Card, inst.card_id)
+                        if card is not None:
+                            card_name = str(card.name)
                 err = await place_auction_bid(
                     session,
                     self._wallet,
@@ -276,12 +317,78 @@ class AuctionCog(commands.Cog):
             _LOG.exception("auction bid user %s raw %r", uid, listing_or_card_id)
             await ctx.send("Could not place bid. Try again.", ephemeral=ephe)
             return
+        if prev_bidder is not None and int(prev_bidder) != uid:
+            base = (self.bot.settings.web_frontend_url or "").rstrip("/")
+            auctions_url = f"{base}/auctions/" if base else ""
+            schedule_outbid_alert(
+                self.bot,
+                outbid_user_id=int(prev_bidder),
+                auction_id=int(resolved_listing_id),
+                card_name=card_name,
+                new_amount_label=auction_amount_display(int(amount), bid_currency),
+                auctions_url=auctions_url,
+            )
         await ctx.send(
             f"You're the high bidder at **{format_pokedollars(int(amount))}** on listing **`{resolved_listing_id}`**.",
             ephemeral=ephe,
         )
 
-    @auction_group.command(name="search", description="Search active auctions")
+    @auction_group.command(
+        name="spotlight",
+        description="Feature your active listing in search for 24h (12 💎)",
+        aliases=["asp"],
+    )
+    @app_commands.describe(
+        listing_or_card_id="Your listing number from search or the card’s Card ID",
+    )
+    async def auction_spotlight_cmd(
+        self,
+        ctx: commands.Context,
+        listing_or_card_id: str,
+    ) -> None:
+        if ctx.interaction:
+            await ctx.defer(ephemeral=True)
+        uid = ctx.author.id
+        await settle_due_auctions(
+            self.bot.async_session_factory, self._wallet, self._crystals
+        )
+        try:
+            async with self.bot.async_session_factory() as session:
+                aid, resolve_err = await resolve_auction_id_for_bid(session, listing_or_card_id)
+                if resolve_err is not None:
+                    await ctx.send(resolve_err, ephemeral=True)
+                    return
+                assert aid is not None
+                outcome = await apply_spotlight_to_auction(
+                    session,
+                    self._crystals,
+                    seller_discord_id=uid,
+                    auction_id=int(aid),
+                )
+                if not outcome.ok:
+                    await ctx.send(outcome.error or "Could not spotlight.", ephemeral=True)
+                    return
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("auction spotlight user %s raw %r", uid, listing_or_card_id)
+            await ctx.send("Could not apply spotlight. Try again.", ephemeral=True)
+            return
+
+        until_note = ""
+        if outcome.spotlight_until is not None:
+            until_note = f" · **{format_auction_time_remaining(outcome.spotlight_until)}**"
+        await ctx.send(
+            f"✨ Listing **`{outcome.auction_id}`** is **spotlighted** for 24h "
+            f"({format_crystals(AUCTION_SPOTLIGHT_CRYSTAL_COST)}){until_note}. "
+            "It will appear at the top of **`/auction search`** while active.",
+            ephemeral=True,
+        )
+
+    @auction_group.command(
+        name="search",
+        description="Search active auctions",
+        aliases=["as", "ahs", "find"],
+    )
     @app_commands.describe(
         scope="Limit to this server or include every server (default: server when in a guild)",
         name="Card name contains",
@@ -380,8 +487,13 @@ class AuctionCog(commands.Cog):
                     )
             else:
                 bid_note = f"no bids yet · min **{format_pokedollars(auc.price_pokedollars)}**"
+            grade = int(inst.grade) if inst.grade is not None else None
+            from poke_pon_bot.services.crystal_sinks import auction_spotlight_active
+
+            spot = " ✨" if auction_spotlight_active(auc) else ""
             lines.append(
-                f"• **`{auc.id}`** **{card.name}** — *{r}* · {card.set_name} `#{card.collector_number}` · "
+                f"• **`{auc.id}`**{spot} **{card.name}** — *{r}* · {card.set_name} `#{card.collector_number}`"
+                f"{format_grade_slab_badge(grade)} · "
                 f"{bid_note} · **{time_left}** · seller <@{auc.seller_discord_id}> · `{pid}`",
             )
         rest = total - len(rows)
@@ -397,4 +509,4 @@ class AuctionCog(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AuctionCog(bot))
-    _LOG.info("Loaded auction cog: `/auction create`, `/auction search`, `/auction bid`.")
+    _LOG.info("Loaded auction cog: `/auction create`, `/auction search`, `/auction bid`, `/auction spotlight`.")

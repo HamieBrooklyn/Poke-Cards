@@ -10,16 +10,30 @@ from typing import Any
 from aiohttp import WSMsgType, web
 from sqlalchemy.exc import SQLAlchemyError
 
-from poke_pon_bot.models.duel_session import DUEL_STATUS_ACTIVE, DuelSession
-from poke_pon_bot.services.web_duels import normalize_duel_currency, payout_escrow
+from poke_pon_bot.models.duel_session import (
+    DUEL_STATUS_ACTIVE,
+    DUEL_STATUS_INVITED,
+    DuelSession,
+)
+from poke_pon_bot.services.web_duels import (
+    expire_stale_duels,
+    mark_duel_room_empty,
+    mark_duel_room_occupied,
+    normalize_duel_currency,
+    payout_escrow,
+)
 from poke_pon_bot.services.web_duel_runtime import DuelRuntimeAdvanced
 from poke_pon_bot.web.sessions import decode_session, read_session
 
 _LOG = logging.getLogger(__name__)
 
-# duel_id -> set(ws)
-_ROOMS: dict[int, set[web.WebSocketResponse]] = {}
+# duel_id -> set of (websocket, user id)
+_ROOMS: dict[int, set[tuple[web.WebSocketResponse, int]]] = {}
 _ROOM_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def duel_has_websocket_clients(duel_id: int) -> bool:
+    return bool(_ROOMS.get(int(duel_id)))
 
 
 def _room_lock(duel_id: int) -> asyncio.Lock:
@@ -61,17 +75,33 @@ async def _broadcast(duel_id: int, payload: dict[str, Any]) -> None:
     if not conns:
         return
     data = json.dumps(payload, separators=(",", ":"))
-    dead: list[web.WebSocketResponse] = []
-    for ws in conns:
+    dead: list[tuple[web.WebSocketResponse, int]] = []
+    for ws, _uid in conns:
         try:
             await ws.send_str(data)
         except Exception:
-            dead.append(ws)
+            dead.append((ws, _uid))
     if dead:
         s = _ROOMS.get(duel_id)
         if s:
-            for ws in dead:
-                s.discard(ws)
+            for entry in dead:
+                s.discard(entry)
+
+
+async def _notify_expired_duels(
+    session_factory: Any,
+    duel_ids: list[int],
+) -> None:
+    if not duel_ids:
+        return
+    try:
+        async with session_factory() as db:
+            for did in duel_ids:
+                ds = await db.get(DuelSession, int(did))
+                if ds is not None:
+                    await broadcast_duel_state(int(did), ds)
+    except SQLAlchemyError:
+        _LOG.exception("duel ws notify expired duels")
 
 
 def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
@@ -81,6 +111,46 @@ def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
     session_factory = bot.async_session_factory
     session_secret = settings.web_session_secret
     session_ttl = settings.web_session_ttl_seconds
+
+    async def _touch_room_occupied(duel_id: int) -> None:
+        try:
+            async with session_factory() as db:
+                ds = await db.get(DuelSession, int(duel_id))
+                if ds is None or ds.status not in (DUEL_STATUS_INVITED, DUEL_STATUS_ACTIVE):
+                    return
+                mark_duel_room_occupied(ds)
+                await db.commit()
+        except SQLAlchemyError:
+            _LOG.exception("duel ws room occupied duel_id=%s", duel_id)
+
+    async def _touch_room_empty(duel_id: int) -> None:
+        if duel_has_websocket_clients(duel_id):
+            return
+        try:
+            async with session_factory() as db:
+                ds = await db.get(DuelSession, int(duel_id))
+                if ds is None or ds.status not in (DUEL_STATUS_INVITED, DUEL_STATUS_ACTIVE):
+                    return
+                mark_duel_room_empty(ds)
+                await db.commit()
+            changed = await expire_stale_duels(session_factory)
+            await _notify_expired_duels(session_factory, changed)
+        except SQLAlchemyError:
+            _LOG.exception("duel ws room empty duel_id=%s", duel_id)
+
+    async def _duel_abandon_sweeper(_app: web.Application) -> None:
+        async def loop() -> None:
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    changed = await expire_stale_duels(session_factory)
+                    await _notify_expired_duels(session_factory, changed)
+                except Exception:
+                    _LOG.exception("duel abandon sweeper")
+
+        asyncio.create_task(loop(), name="duel-abandon-sweeper")
+
+    app.on_startup.append(_duel_abandon_sweeper)
 
     async def handle_ws(request: web.Request) -> web.StreamResponse:
         sess = read_session(request, session_secret, max_age=session_ttl)
@@ -102,128 +172,151 @@ def register_duel_ws(app: web.Application, *, bot: Any, settings: Any) -> None:
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
 
-        _ROOMS.setdefault(duel_id, set()).add(ws)
+        room_entry = (ws, uid)
+        _ROOMS.setdefault(duel_id, set()).add(room_entry)
+        await _touch_room_occupied(duel_id)
 
         async def send(payload: dict[str, Any]) -> None:
             await ws.send_json(payload)
 
         try:
-            async with session_factory() as db:
-                ds = await db.get(DuelSession, duel_id)
-                if ds is None or uid not in (ds.initiator_id, ds.partner_id):
-                    await send({"type": "error", "message": "not_found"})
-                    return ws
-                await send(duel_state_message(ds))
-        except SQLAlchemyError:
-            _LOG.exception("duel ws initial load duel_id=%s", duel_id)
-            await send({"type": "error", "message": "database_error"})
-            return ws
-
-        async for msg in ws:
-            if msg.type == WSMsgType.ERROR:
-                break
-            if msg.type != WSMsgType.TEXT:
-                continue
             try:
-                body = json.loads(msg.data)
-            except Exception:
-                await send({"type": "error", "message": "invalid_json"})
-                continue
-            if not isinstance(body, dict):
-                await send({"type": "error", "message": "invalid_body"})
-                continue
+                async with session_factory() as db:
+                    ds = await db.get(DuelSession, duel_id)
+                    if ds is None or uid not in (ds.initiator_id, ds.partner_id):
+                        await send({"type": "error", "message": "not_found"})
+                        return ws
+                    await send(duel_state_message(ds))
+            except SQLAlchemyError:
+                _LOG.exception("duel ws initial load duel_id=%s", duel_id)
+                await send({"type": "error", "message": "database_error"})
+                return ws
 
-            mtype = str(body.get("type") or "").strip().lower()
-            expected_version = body.get("expected_version")
-            if expected_version is not None:
+            async for msg in ws:
+                if msg.type == WSMsgType.ERROR:
+                    break
+                if msg.type != WSMsgType.TEXT:
+                    continue
                 try:
-                    expected_version = int(expected_version)
+                    body = json.loads(msg.data)
                 except Exception:
-                    expected_version = None
+                    await send({"type": "error", "message": "invalid_json"})
+                    continue
+                if not isinstance(body, dict):
+                    await send({"type": "error", "message": "invalid_body"})
+                    continue
 
-            async with _room_lock(duel_id):
-                try:
-                    async with session_factory() as db:
-                        ds = await db.get(DuelSession, duel_id)
-                        if ds is None or uid not in (ds.initiator_id, ds.partner_id):
-                            await send({"type": "error", "message": "not_found"})
-                            continue
-                        if ds.status != DUEL_STATUS_ACTIVE:
-                            await send({"type": "error", "message": "duel_not_active"})
-                            continue
-                        if expected_version is not None and int(ds.version or 0) != expected_version:
-                            await send({"type": "error", "message": "version_conflict", "version": int(ds.version or 0)})
-                            await send({"type": "state", "duel": {"id": int(ds.id), "status": ds.status, "version": int(ds.version or 0)}, "state": ds.state or {}})
-                            continue
+                mtype = str(body.get("type") or "").strip().lower()
+                expected_version = body.get("expected_version")
+                if expected_version is not None:
+                    try:
+                        expected_version = int(expected_version)
+                    except Exception:
+                        expected_version = None
 
-                        rt = DuelRuntimeAdvanced.from_state(
-                            ds.state or {},
-                            duel_id=int(ds.id),
-                            initiator_id=int(ds.initiator_id),
-                            partner_id=int(ds.partner_id),
-                            bet_currency=normalize_duel_currency(ds.bet_currency),
-                            bet_amount=int(ds.bet_amount or 0),
-                        )
+                async with _room_lock(duel_id):
+                    try:
+                        async with session_factory() as db:
+                            ds = await db.get(DuelSession, duel_id)
+                            if ds is None or uid not in (ds.initiator_id, ds.partner_id):
+                                await send({"type": "error", "message": "not_found"})
+                                continue
+                            if ds.status != DUEL_STATUS_ACTIVE:
+                                await send({"type": "error", "message": "duel_not_active"})
+                                continue
+                            if expected_version is not None and int(ds.version or 0) != expected_version:
+                                await send(
+                                    {
+                                        "type": "error",
+                                        "message": "version_conflict",
+                                        "version": int(ds.version or 0),
+                                    }
+                                )
+                                await send(
+                                    {
+                                        "type": "state",
+                                        "duel": {
+                                            "id": int(ds.id),
+                                            "status": ds.status,
+                                            "version": int(ds.version or 0),
+                                        },
+                                        "state": ds.state or {},
+                                    }
+                                )
+                                continue
 
-                        if mtype == "draw":
-                            src = body.get("from")
-                            count = int(body.get("count") or 0)
-                            ev = rt.apply_draw(actor_id=uid, source=str(src), count=count)
-                            rt.append_log_event(ev)
-                        elif mtype == "attack":
-                            attacker_slot = int(body.get("attacker_slot") or 0)
-                            attack_index = int(body.get("attack_index") or 0)
-                            defender_slot = int(body.get("defender_slot") or 0)
-                            ev = rt.apply_attack(
-                                actor_id=uid,
-                                attacker_slot=attacker_slot,
-                                attack_index=attack_index,
-                                defender_slot=defender_slot,
+                            rt = DuelRuntimeAdvanced.from_state(
+                                ds.state or {},
+                                duel_id=int(ds.id),
+                                initiator_id=int(ds.initiator_id),
+                                partner_id=int(ds.partner_id),
+                                bet_currency=normalize_duel_currency(ds.bet_currency),
+                                bet_amount=int(ds.bet_amount or 0),
                             )
-                            rt.append_log_event(ev)
-                        elif mtype == "use_item":
-                            item_id = str(body.get("item_id") or "")
-                            target_slot = int(body.get("target_slot") or 0)
-                            ev = rt.apply_item(actor_id=uid, item_id=item_id, target_slot=target_slot)
-                            rt.append_log_event(ev)
-                        elif mtype == "end_turn":
-                            ev = rt.end_turn(actor_id=uid)
-                            rt.append_log_event(ev)
-                        elif mtype == "surrender":
-                            ev = rt.surrender(actor_id=uid)
-                            rt.append_log_event(ev)
-                        else:
-                            await send({"type": "error", "message": "unknown_type"})
-                            continue
 
-                        # persist + broadcast
-                        ds.state = rt.to_state()
-                        ds.version = int(ds.version or 0) + 1
-                        if rt.winner_id is not None and ds.winner_id is None:
-                            ds.winner_id = int(rt.winner_id)
-                            ds.status = "completed"
-                            await payout_escrow(db, ds, winner_id=int(rt.winner_id))
-                        await db.commit()
+                            if mtype == "draw":
+                                src = body.get("from")
+                                count = int(body.get("count") or 0)
+                                ev = rt.apply_draw(actor_id=uid, source=str(src), count=count)
+                                rt.append_log_event(ev)
+                            elif mtype == "attack":
+                                attacker_slot = int(body.get("attacker_slot") or 0)
+                                attack_index = int(body.get("attack_index") or 0)
+                                defender_slot = int(body.get("defender_slot") or 0)
+                                ev = rt.apply_attack(
+                                    actor_id=uid,
+                                    attacker_slot=attacker_slot,
+                                    attack_index=attack_index,
+                                    defender_slot=defender_slot,
+                                )
+                                rt.append_log_event(ev)
+                            elif mtype == "use_item":
+                                item_id = str(body.get("item_id") or "")
+                                target_slot = int(body.get("target_slot") or 0)
+                                ev = rt.apply_item(
+                                    actor_id=uid, item_id=item_id, target_slot=target_slot
+                                )
+                                rt.append_log_event(ev)
+                            elif mtype == "end_turn":
+                                ev = rt.end_turn(actor_id=uid)
+                                rt.append_log_event(ev)
+                            elif mtype == "surrender":
+                                ev = rt.surrender(actor_id=uid)
+                                rt.append_log_event(ev)
+                            else:
+                                await send({"type": "error", "message": "unknown_type"})
+                                continue
 
-                        payload = duel_state_message(ds)
-                        payload["event"] = rt.last_event
-                except ValueError as e:
-                    await send({"type": "error", "message": str(e)})
-                    continue
-                except SQLAlchemyError:
-                    _LOG.exception("duel ws action duel_id=%s type=%s", duel_id, mtype)
-                    await send({"type": "error", "message": "database_error"})
-                    continue
+                            ds.state = rt.to_state()
+                            ds.version = int(ds.version or 0) + 1
+                            if rt.winner_id is not None and ds.winner_id is None:
+                                ds.winner_id = int(rt.winner_id)
+                                ds.status = "completed"
+                                await payout_escrow(db, ds, winner_id=int(rt.winner_id))
+                            await db.commit()
 
-            await _broadcast(duel_id, payload)
+                            payload = duel_state_message(ds)
+                            payload["event"] = rt.last_event
+                    except ValueError as e:
+                        await send({"type": "error", "message": str(e)})
+                        continue
+                    except SQLAlchemyError:
+                        _LOG.exception("duel ws action duel_id=%s type=%s", duel_id, mtype)
+                        await send({"type": "error", "message": "database_error"})
+                        continue
 
-        # disconnect
-        try:
-            s = _ROOMS.get(duel_id)
-            if s:
-                s.discard(ws)
-        except Exception:
-            pass
+                    await _broadcast(duel_id, payload)
+        finally:
+            try:
+                s = _ROOMS.get(duel_id)
+                if s:
+                    s.discard(room_entry)
+                    if not s:
+                        _ROOMS.pop(duel_id, None)
+            except Exception:
+                pass
+            await _touch_room_empty(duel_id)
+
         return ws
 
     app.router.add_get("/ws/duels/{id}", handle_ws)

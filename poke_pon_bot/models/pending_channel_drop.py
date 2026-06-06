@@ -34,6 +34,7 @@ class PendingChannelDrop(Base):
     slot_claimer: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
     slot_public_ids: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
     finished: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    reroll_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

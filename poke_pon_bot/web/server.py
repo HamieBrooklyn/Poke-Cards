@@ -143,7 +143,11 @@ async def start_web_server(bot: Any) -> WebServer | None:
         from poke_pon_bot.web.assembly_api import register_assembly_api
         from poke_pon_bot.web.craft_api import register_craft_api
         from poke_pon_bot.web.deck_api import register_deck_api
+        from poke_pon_bot.web.guild_milestones_api import register_guild_milestones_api
         from poke_pon_bot.web.leaderboard_api import register_leaderboard_api
+        from poke_pon_bot.web.notifications_api import register_notifications_api
+        from poke_pon_bot.web.activity_api import register_activity_api
+        from poke_pon_bot.web.missions_api import register_missions_api
         from poke_pon_bot.web.oauth import register_oauth_routes
         from poke_pon_bot.web.packs_api import register_packs_api
         from poke_pon_bot.web.profile_api import register_profile_api
@@ -168,6 +172,11 @@ async def start_web_server(bot: Any) -> WebServer | None:
         register_duel_ws(app, bot=bot, settings=settings)
         register_profile_api(app, bot=bot, settings=settings)
         register_leaderboard_api(app, bot=bot, settings=settings)
+        register_guild_milestones_api(app, bot=bot, settings=settings)
+        register_missions_api(app, bot=bot, settings=settings)
+        register_activity_api(app, bot=bot, settings=settings)
+        if settings.web_notifications_enabled:
+            register_notifications_api(app, bot=bot, settings=settings)
         register_shop_api(app, bot=bot, settings=settings)
         _LOG.info(
             "Discord OAuth + Collection / Deck / Auction / Trade / Profile / "

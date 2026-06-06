@@ -11,6 +11,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from poke_pon_bot.services.drops import DropService
+from poke_pon_bot.services.missions import MissionService
+from poke_pon_bot.services.mission_notifications import schedule_mission_completion_dms
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +46,7 @@ from poke_pon_bot.services.pack_collage import (
     render_single_card_png_from_url,
     render_url_vs_collage_png,
 )
+from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 from poke_pon_bot.services.wallet import (
     InsufficientPokedollarsError,
     WalletService,
@@ -64,6 +67,16 @@ def _deck_web_footer() -> str:
 
 _PVE_LOSS_MIN = 20
 _PVE_LOSS_MAX = 70
+
+_PVE_CRYSTAL_RARITY_MIN = 7   # Illustration Rare or higher
+_PVE_CRYSTAL_HP_MIN = 220
+_PVE_CRYSTAL_DMG_MIN = 170
+_PVE_CRYSTAL_REWARD = 1
+
+
+def _wild_max_attack_damage(card: Card) -> int:
+    attacks = normalized_attacks(card)
+    return max((int(a.get("damage_int") or 0) for a in attacks), default=0)
 
 
 async def _render_vs_collage_file(
@@ -174,11 +187,47 @@ def _attack_button_label(move: dict, *, defender: Fighter | None) -> str:
     return _truncate(f"{nm} ({eff} ×{fs})", 80)
 
 
-def _ansi_log_block(lines: list[str], *, max_inner: int = 3200) -> str:
-    body = "\n\n".join(lines)
-    if len(body) > max_inner:
-        body = body[: max_inner - 1] + "…"
-    return f"```ansi\n{body}\n```"
+_HP_BAR_LEN = 10
+
+
+def _hp_bar(current: int, maximum: int) -> str:
+    """Visual HP bar: ``[████████░░] 120/200``."""
+    ratio = max(0.0, min(1.0, current / maximum)) if maximum > 0 else 0.0
+    filled = round(ratio * _HP_BAR_LEN)
+    empty = _HP_BAR_LEN - filled
+    if ratio > 0.5:
+        bar = "🟩" * filled + "⬛" * empty
+    elif ratio > 0.2:
+        bar = "🟨" * filled + "⬛" * empty
+    else:
+        bar = "🟥" * filled + "⬛" * empty
+    return f"{bar} **{max(0, current)}**/{maximum}"
+
+
+def _type_eff_indicator(factor: float) -> str:
+    """Emoji + label for type effectiveness."""
+    if factor >= 2.0:
+        return "🔥 **Super effective!**"
+    if factor > 1.0:
+        return "💥 **Super effective!**"
+    if factor < 0.5:
+        return "🛡️ **Barely effective…**"
+    if factor < 1.0:
+        return "🛡️ **Not very effective…**"
+    return ""
+
+
+def _last_move_line(combat: DuelRuntime) -> str:
+    """Compact single-line summary of the most recent attack (from metadata)."""
+    meta = getattr(combat, "_last_move_meta", None)
+    if meta is None:
+        return ""
+    eff = _type_eff_indicator(meta["factor"])
+    eff_part = f"\n{eff}" if eff else ""
+    return (
+        f"**{meta['attacker']}** used **{meta['move']}** → "
+        f"**{meta['damage']}** dmg to **{meta['defender']}**{eff_part}"
+    )
 
 
 def _combat_embeds(combat: DuelRuntime) -> list[discord.Embed] | None:
@@ -187,24 +236,23 @@ def _combat_embeds(combat: DuelRuntime) -> list[discord.Embed] | None:
     ca = combat.challenger_lineup[0]
     oa = combat.opponent_lineup[0]
     turn_uid = combat.current_turn_user_id()
-    log_block = _ansi_log_block(combat.log_lines[-6:])
-    main = discord.Embed(
-        title="Duel — battle",
-        description=_truncate(f"**Turn:** <@{turn_uid}>\n\n{log_block}", 4096),
-    )
+    last_move = _last_move_line(combat)
+    desc = f"**Turn:** <@{turn_uid}>"
+    if last_move:
+        desc += f"\n\n{last_move}"
+    main = discord.Embed(title="Duel — battle", description=_truncate(desc, 4096))
     main.add_field(
-        name="Challenger (active)",
-        value=f"**{ca.name}** · **{ca.current_hp}** / {ca.max_hp} HP · bench ×{len(combat.challenger_lineup) - 1}",
+        name=f"⚔️ {ca.name}",
+        value=f"{_hp_bar(ca.current_hp, ca.max_hp)}\nbench ×{len(combat.challenger_lineup) - 1}",
         inline=True,
     )
     main.add_field(
-        name="Opponent (active)",
-        value=f"**{oa.name}** · **{oa.current_hp}** / {oa.max_hp} HP · bench ×{len(combat.opponent_lineup) - 1}",
+        name=f"🎯 {oa.name}",
+        value=f"{_hp_bar(oa.current_hp, oa.max_hp)}\nbench ×{len(combat.opponent_lineup) - 1}",
         inline=True,
     )
     if combat.bet > 0:
         main.set_footer(text=f"Pot: {format_pokedollars(combat.bet * 2)}")
-    # Image set by caller (attached vs collage) to show both cards side-by-side.
     return [main]
 
 
@@ -212,14 +260,11 @@ def _victory_embed(combat: DuelRuntime, winner_id: int) -> discord.Embed:
     pot = ""
     if combat.bet > 0:
         pot = f"\n**Winnings:** {format_pokedollars(combat.bet * 2)} (both stakes)."
-    log_block = _ansi_log_block(combat.log_lines[-8:], max_inner=3000)
-    return discord.Embed(
-        title="Duel over",
-        description=_truncate(
-            f"<@{winner_id}> **wins**!{pot}\n\n{log_block}",
-            4096,
-        ),
-    )
+    last_move = _last_move_line(combat)
+    desc = f"<@{winner_id}> **wins**!{pot}"
+    if last_move:
+        desc += f"\n\n{last_move}"
+    return discord.Embed(title="Duel over", description=_truncate(desc, 4096))
 
 
 def _difficulty_reward_range(*, rarity_class_id: int, hp: int) -> tuple[int, int]:
@@ -256,23 +301,24 @@ def _pve_embeds(combat: DuelRuntime, *, wild_name: str, wild_image: str | None, 
     player = combat.challenger_lineup[0]
     wild = combat.opponent_lineup[0]
     turn_label = f"<@{user_id}>" if combat.turn == "challenger" else f"**{wild_name}**"
-    log_block = _ansi_log_block(combat.log_lines[-6:])
+    last_move = _last_move_line(combat)
+    desc = f"**Turn:** {turn_label}"
+    if last_move:
+        desc += f"\n\n{last_move}"
     main = discord.Embed(
         title="Poke-duel — battle",
-        description=_truncate(f"**Turn:** {turn_label}\n\n{log_block}", 4096),
+        description=_truncate(desc, 4096),
     )
     main.add_field(
-        name="You (active)",
-        value=f"**{player.name}** · **{player.current_hp}** / {player.max_hp} HP",
+        name=f"⚔️ {player.name}",
+        value=_hp_bar(player.current_hp, player.max_hp),
         inline=True,
     )
     main.add_field(
-        name=f"{wild_name} (active)",
-        value=f"**{wild.name}** · **{wild.current_hp}** / {wild.max_hp} HP",
+        name=f"🎯 {wild_name}",
+        value=_hp_bar(wild.current_hp, wild.max_hp),
         inline=True,
     )
-
-    # Image set by caller (attached vs collage) to show both cards side-by-side.
     return [main]
 
 
@@ -512,6 +558,30 @@ class PveTurnView(discord.ui.View):
 
             button.callback = btn_cb
             self.add_item(button)
+
+
+class NextFightView(discord.ui.View):
+    """Post-fight view with a 'Next Fight' button to instantly re-queue /pd."""
+
+    def __init__(self, cog: "DuelCog", user_id: int) -> None:
+        super().__init__(timeout=120.0)
+        self.cog = cog
+        self.user_id = user_id
+
+    @discord.ui.button(label="Next Fight", style=discord.ButtonStyle.success, emoji="⚔️")
+    async def next_fight(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your fight.", ephemeral=True)
+            return
+        self.stop()
+        button.disabled = True
+        await interaction.response.defer()
+        await self.cog._start_pve_from_interaction(interaction, edit_message=interaction.message)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
 
 
 class DeckEditView(discord.ui.View):
@@ -851,16 +921,27 @@ class DuelCog(commands.Cog):
             return
 
         if winner is not None:
+            duel_win_notices: list = []
             try:
                 async with self.bot.async_session_factory() as session:
                     if combat.bet > 0:
                         await self._wallet.try_credit(session, winner, combat.bet * 2)
+                    try:
+                        duel_win_notices = await MissionService().record_duel_win(
+                            session, winner
+                        )
+                    except Exception:
+                        _LOG.exception("mission record_duel_win failed user=%s", winner)
                     await session.commit()
             except SQLAlchemyError:
                 _LOG.exception("duel payout")
                 await interaction.followup.send(
                     "Duel finished but payout failed — contact an admin.",
                     ephemeral=False,
+                )
+            else:
+                schedule_mission_completion_dms(
+                    self.bot, user_id=winner, notices=duel_win_notices
                 )
             ve = _victory_embed(combat, winner)
             win_file = await _winner_card_file(combat=combat, winner_id=winner)
@@ -932,6 +1013,7 @@ class DuelCog(commands.Cog):
         wild_name = str(meta.get("wild_name") or "Wild")
         wild_rarity = int(meta.get("wild_rarity_class_id") or 1)
         wild_hp = int(meta.get("wild_hp") or 1)
+        wild_max_dmg = int(meta.get("wild_max_dmg") or 0)
 
         if interaction is not None:
             uid = interaction.user.id
@@ -946,11 +1028,40 @@ class DuelCog(commands.Cog):
                     lo, hi = _difficulty_reward_range(rarity_class_id=wild_rarity, hp=wild_hp)
                     reward = self._rng.randint(lo, hi)
                     new_bal = await self._wallet.try_credit(session, uid, reward)
+
+                    crystal_bonus = 0
+                    if (
+                        wild_rarity >= _PVE_CRYSTAL_RARITY_MIN
+                        or wild_hp >= _PVE_CRYSTAL_HP_MIN
+                        or wild_max_dmg >= _PVE_CRYSTAL_DMG_MIN
+                    ):
+                        crystal_bonus = _PVE_CRYSTAL_REWARD
+                        try:
+                            await CrystalsService().try_credit(session, uid, crystal_bonus)
+                        except Exception:
+                            _LOG.exception("crystal bonus credit failed user=%s", uid)
+                            crystal_bonus = 0
+
+                    try:
+                        duel_win_notices = await MissionService().record_duel_win(
+                            session, uid
+                        )
+                    except Exception:
+                        _LOG.exception("mission record_duel_win failed user=%s", uid)
+                        duel_win_notices = []
                     await session.commit()
+                    schedule_mission_completion_dms(
+                        self.bot, user_id=uid, notices=duel_win_notices
+                    )
+
+                    bonus_line = ""
+                    if crystal_bonus > 0:
+                        bonus_line = f"\n**Bonus:** {format_crystals(crystal_bonus)} for beating a rare/strong wild!"
+
                     embed = discord.Embed(
                         title="Poke-duel — Victory",
                         description=(
-                            f"You defeated **{wild_name}** and earned **{format_pokedollars(reward)}**!\n"
+                            f"You defeated **{wild_name}** and earned **{format_pokedollars(reward)}**!{bonus_line}\n"
                             f"**Balance:** {format_pokedollars(new_bal)}"
                         ),
                     )
@@ -990,40 +1101,163 @@ class DuelCog(commands.Cog):
         if win_file is not None:
             embed.set_image(url="attachment://winner.png")
 
+        next_view = NextFightView(self, uid)
+
         # Slash `/pd` uses defer → ``interaction.message`` is usually ``None``; component turns use the battle msg.
         # Prefix **`pcpd`** / **`pd`** passes ``ctx`` so we **send** the outcome when there is no webhook to edit.
         try:
             if interaction is not None:
                 if interaction.message is not None:
                     if win_file is not None:
-                        await interaction.message.edit(embed=embed, view=None, attachments=[win_file])
+                        await interaction.message.edit(embed=embed, view=next_view, attachments=[win_file])
                     else:
-                        await interaction.message.edit(embed=embed, view=None)
+                        await interaction.message.edit(embed=embed, view=next_view)
                 else:
                     if win_file is not None:
-                        await interaction.edit_original_response(embed=embed, view=None, attachments=[win_file])
+                        await interaction.edit_original_response(embed=embed, view=next_view, attachments=[win_file])
                     else:
-                        await interaction.edit_original_response(embed=embed, view=None)
+                        await interaction.edit_original_response(embed=embed, view=next_view)
             elif ctx is not None:
                 if win_file is not None:
-                    await ctx.send(embed=embed, file=win_file, ephemeral=False)
+                    await ctx.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
                 else:
-                    await ctx.send(embed=embed, ephemeral=False)
+                    await ctx.send(embed=embed, view=next_view, ephemeral=False)
         except discord.HTTPException:
             _LOG.exception("pve finish: edit failed (interaction_message=%s)", interaction and interaction.message is not None)
             try:
                 if interaction is not None:
                     if win_file is not None:
-                        await interaction.followup.send(embed=embed, file=win_file, ephemeral=False)
+                        await interaction.followup.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
                     else:
-                        await interaction.followup.send(embed=embed, ephemeral=False)
+                        await interaction.followup.send(embed=embed, view=next_view, ephemeral=False)
                 elif ctx is not None:
                     if win_file is not None:
-                        await ctx.send(embed=embed, file=win_file, ephemeral=False)
+                        await ctx.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
                     else:
-                        await ctx.send(embed=embed, ephemeral=False)
+                        await ctx.send(embed=embed, view=next_view, ephemeral=False)
             except discord.HTTPException:
                 _LOG.exception("pve finish followup also failed")
+
+    async def _start_pve_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        *,
+        edit_message: discord.Message | None = None,
+    ) -> None:
+        """Start a new PvE fight triggered by the 'Next Fight' button.
+
+        When *edit_message* is provided the new battle replaces that message
+        in-place (no clutter).  Falls back to ``followup.send`` on failure.
+        """
+        uid = interaction.user.id
+        drop = DropService(rng=self._rng)
+
+        if self._user_busy(uid):
+            await interaction.followup.send("You're already in a duel/battle.", ephemeral=True)
+            return
+
+        try:
+            async with self.bot.async_session_factory() as session:
+                ids = await get_saved_instance_ids(session, uid)
+                if not ids:
+                    await interaction.followup.send(
+                        "You need a combat deck first — use **`/deck edit`**.", ephemeral=True
+                    )
+                    return
+                pairs = await load_fighters_ordered(session, uid, ids)
+                if isinstance(pairs, str):
+                    await interaction.followup.send(pairs, ephemeral=True)
+                    return
+                lead_inst, lead_card = pairs[0]
+                player_line = [Fighter.from_instance(lead_inst, lead_card)]
+                wild_card = await drop.draw_single_pokemon(session, drop_table_code="default")
+        except SQLAlchemyError:
+            _LOG.exception("next fight DB error for user %s", uid)
+            await interaction.followup.send("Database error — try again.", ephemeral=True)
+            return
+        except (LookupError, RuntimeError) as exc:
+            _LOG.exception("next fight wild roll failed for user %s", uid)
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        combat_id = f"pd:{uid}:{secrets.token_hex(4)}"
+        try:
+            wild = _fighter_from_catalog_card(wild_card)
+            combat = DuelRuntime.from_lineups(
+                lobby_id=combat_id,
+                challenger_id=uid,
+                opponent_id=0,
+                bet=0,
+                challenger_lineup=player_line,
+                opponent_lineup=[wild],
+                rng=self._rng,
+            )
+            self._combats[combat_id] = combat
+            self._pve_meta[combat_id] = {
+                "wild_name": wild_card.name,
+                "wild_image": wild_card.image_large_url or wild_card.image_small_url,
+                "wild_rarity_class_id": int(wild_card.rarity_class_id),
+                "wild_hp": int(parse_hp(wild_card.hp)),
+                "wild_max_dmg": _wild_max_attack_damage(wild_card),
+            }
+
+            winner = await self._pve_bot_step(combat_id)
+            if winner is not None:
+                await self._finish_pve(interaction, combat_id, winner, ctx=None)
+                return
+
+            meta = self._pve_meta.get(combat_id) or {}
+            embeds = _pve_embeds(
+                combat,
+                wild_name=str(meta.get("wild_name") or "Wild"),
+                wild_image=meta.get("wild_image") if isinstance(meta.get("wild_image"), str) else None,
+                user_id=uid,
+            )
+            view = PveTurnView(self, combat_id, user_id=uid)
+            file = await _render_vs_collage_file(
+                left_name=combat.challenger_lineup[0].name,
+                left_url=combat.challenger_lineup[0].image_large or combat.challenger_lineup[0].image_small,
+                right_name=str(meta.get("wild_name") or "Wild"),
+                right_url=(meta.get("wild_image") if isinstance(meta.get("wild_image"), str) else None)
+                or (combat.opponent_lineup[0].image_large or combat.opponent_lineup[0].image_small),
+            )
+            if embeds is None:
+                self._combats.pop(combat_id, None)
+                self._pve_meta.pop(combat_id, None)
+                await interaction.followup.send(
+                    "Could not build battle view — try **`/pd`** again.", ephemeral=True
+                )
+                return
+
+            sent = False
+            if edit_message is not None:
+                try:
+                    if file is not None:
+                        embeds[0].set_image(url="attachment://vs.png")
+                        await edit_message.edit(embeds=embeds, view=view, attachments=[file])
+                    else:
+                        await edit_message.edit(embeds=embeds, view=view, attachments=[])
+                    sent = True
+                except discord.HTTPException:
+                    _LOG.debug("edit_message failed, falling back to followup.send")
+
+            if not sent:
+                if file is not None:
+                    embeds[0].set_image(url="attachment://vs.png")
+                    await interaction.followup.send(embeds=embeds, view=view, file=file, ephemeral=False)
+                else:
+                    await interaction.followup.send(embeds=embeds, view=view, ephemeral=False)
+        except Exception:
+            _LOG.exception("next fight runtime error for user %s", uid)
+            self._combats.pop(combat_id, None)
+            self._pve_meta.pop(combat_id, None)
+            try:
+                await interaction.followup.send(
+                    "Something went wrong during Poke-duel. Try **`/pd`** again.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
 
     async def _resolve_pve_attack(self, interaction: discord.Interaction, combat_id: str, attack_index: int) -> None:
         combat = self._combats.get(combat_id)
@@ -1163,6 +1397,7 @@ class DuelCog(commands.Cog):
                 "wild_image": wild_card.image_large_url or wild_card.image_small_url,
                 "wild_rarity_class_id": int(wild_card.rarity_class_id),
                 "wild_hp": int(parse_hp(wild_card.hp)),
+                "wild_max_dmg": _wild_max_attack_damage(wild_card),
             }
 
             # If the bot goes first, play its turn(s) immediately.
@@ -1211,7 +1446,7 @@ class DuelCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    @duel_group.command(name="challenge", aliases=["chal"])
+    @duel_group.command(name="challenge", aliases=["chal", "c", "dc"])
     @app_commands.describe(
         opponent="Player to duel",
         bet="Each player stakes this much (0 = friendly)",

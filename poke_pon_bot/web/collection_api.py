@@ -21,12 +21,14 @@ from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
 from poke_pon_bot.services.collection_sell import (
+    collection_sell_base_payout,
     collection_sell_block_reason,
     collection_sell_block_reasons_for_instances,
     collection_sell_needs_confirm,
     quote_collection_sell_payout,
     run_collection_sell,
 )
+from poke_pon_bot.services.grading import grade_sell_bonus_percent
 from poke_pon_bot.services.card_roles import craft_role_for_card, craft_uses_payload
 from poke_pon_bot.services.collection_evolution_search import build_evolution_line_sections
 from poke_pon_bot.services.collection_search import collection_text_search_clause
@@ -39,6 +41,18 @@ from poke_pon_bot.services.evolution import (
     run_collection_evolution,
 )
 from poke_pon_bot.services.combat_deck import strip_instances_from_deck
+from poke_pon_bot.services.crystals import CrystalsService
+from poke_pon_bot.services.grading import (
+    GRADE_CRYSTAL_COST,
+    build_grade_preview,
+    global_copy_index,
+    grade_label,
+    grading_api_payload,
+    load_owned_instance_for_grading,
+    remove_grade,
+    roll_grade_for_instance,
+)
+from poke_pon_bot.services.grade_slab import render_graded_slab_png
 from poke_pon_bot.services.instance_favorite import toggle_instance_favorite
 from poke_pon_bot.services.instance_public_id import normalize_public_id
 from poke_pon_bot.services.wallet import WalletService
@@ -161,13 +175,19 @@ def _sell_payload_for_copy(
             "blocked_reason": blocked_reason,
             "can_sell": False,
         }
+    base_quote = collection_sell_base_payout(card, rarity, inst)
     quote = quote_collection_sell_payout(card, rarity, inst)
-    return {
+    bonus_pct = grade_sell_bonus_percent(inst.grade)
+    payload: dict[str, Any] = {
         "quote_pokedollars": quote,
         "needs_confirm": collection_sell_needs_confirm(rarity),
         "blocked_reason": blocked_reason,
         "can_sell": blocked_reason is None,
     }
+    if bonus_pct > 0:
+        payload["base_quote_pokedollars"] = base_quote
+        payload["grade_bonus_percent"] = bonus_pct
+    return payload
 
 
 def _serialize_instance(
@@ -210,6 +230,47 @@ def _serialize_instance(
             },
         },
     }
+
+
+async def _grading_payload(
+    db: Any,
+    inst: UserCardInstance,
+    *,
+    full: bool = False,
+) -> dict[str, Any]:
+    """Website ``grading`` object — full preview on card detail, lighter on list pages."""
+    if full:
+        preview = await build_grade_preview(db, inst)
+        payload = grading_api_payload(preview)
+        if preview.graded_at is not None:
+            payload["graded_at"] = _utc_iso(preview.graded_at)
+    else:
+        g = inst.grade
+        payload = {
+            "grade": g,
+            "grade_label": grade_label(g) if g is not None else None,
+            "graded_at": _utc_iso(inst.graded_at),
+            "crystal_cost": GRADE_CRYSTAL_COST,
+            "can_roll": True,
+            "can_remove": g is not None,
+        }
+    if inst.grade is not None and inst.public_id:
+        payload["slab_url"] = f"/api/me/cards/{inst.public_id}/slab"
+    return payload
+
+
+async def _serialize_instance_row(
+    db: Any,
+    inst: UserCardInstance,
+    card: Card,
+    rarity: RarityClass | None,
+    *,
+    sell: dict[str, Any],
+    grading_full: bool = False,
+) -> dict[str, Any]:
+    payload = _serialize_instance(inst, card, rarity, sell=sell)
+    payload["grading"] = await _grading_payload(db, inst, full=grading_full)
+    return payload
 
 
 async def _evo_target_dict(
@@ -455,17 +516,19 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     discord_user_id=session.user_id,
                     instance_ids=instance_ids,
                 )
-                items = [
-                    _serialize_instance(
-                        inst,
-                        card,
-                        rar,
-                        sell=_sell_payload_for_copy(
-                            inst, card, rar, block_map.get(inst.id)
-                        ),
+                items = []
+                for inst, card, rar in sliced:
+                    items.append(
+                        await _serialize_instance_row(
+                            db,
+                            inst,
+                            card,
+                            rar,
+                            sell=_sell_payload_for_copy(
+                                inst, card, rar, block_map.get(inst.id)
+                            ),
+                        )
                     )
-                    for inst, card, rar in sliced
-                ]
         except SQLAlchemyError:
             _LOG.exception(
                 "collection_api user=%s sort=%s q=%r", session.user_id, sort, q
@@ -515,11 +578,13 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     discord_user_id=session.user_id,
                     instance_id=inst.id,
                 )
-                payload = _serialize_instance(
+                payload = await _serialize_instance_row(
+                    db,
                     inst,
                     card,
                     rar,
                     sell=_sell_payload_for_copy(inst, card, rar, blocked),
+                    grading_full=True,
                 )
                 payload["evolution"] = await _build_evolution_payload(
                     db, inst, card, rar
@@ -897,11 +962,13 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     discord_user_id=sess.user_id,
                     instance_id=inst.id,
                 )
-                payload = _serialize_instance(
+                payload = await _serialize_instance_row(
+                    db,
                     inst,
                     card,
                     rar,
                     sell=_sell_payload_for_copy(inst, card, rar, blocked),
+                    grading_full=True,
                 )
                 payload["evolution"] = await _build_evolution_payload(
                     db, inst, card, rar
@@ -943,11 +1010,14 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                             instance_id=inst.id,
                         )
                         items.append(
-                            _serialize_instance(
+                            await _serialize_instance_row(
+                                db,
                                 inst,
                                 card,
                                 rar,
-                                sell=_sell_payload_for_copy(inst, card, rar, sell_blocked),
+                                sell=_sell_payload_for_copy(
+                                    inst, card, rar, sell_blocked
+                                ),
                             )
                         )
                     out.append(
@@ -1017,11 +1087,13 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     discord_user_id=sess.user_id,
                     instance_id=new_inst.id,
                 )
-                card_payload = _serialize_instance(
+                card_payload = await _serialize_instance_row(
+                    db,
                     new_inst,
                     new_card,
                     new_rar,
                     sell=_sell_payload_for_copy(new_inst, new_card, new_rar, blocked),
+                    grading_full=True,
                 )
                 card_payload["evolution"] = await _build_evolution_payload(
                     db, new_inst, new_card, new_rar
@@ -1042,6 +1114,164 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
             )
             return web.json_response({"error": "database error"}, status=500)
 
+    crystals = CrystalsService()
+
+    async def _card_payload_after_mutation(
+        db: Any,
+        *,
+        inst: UserCardInstance,
+        card: Card,
+        rar: RarityClass | None,
+        user_id: int,
+    ) -> dict[str, Any]:
+        blocked = await collection_sell_block_reason(
+            db,
+            discord_user_id=user_id,
+            instance_id=inst.id,
+        )
+        payload = await _serialize_instance_row(
+            db,
+            inst,
+            card,
+            rar,
+            sell=_sell_payload_for_copy(inst, card, rar, blocked),
+            grading_full=True,
+        )
+        payload["evolution"] = await _build_evolution_payload(db, inst, card, rar)
+        return payload
+
+    async def handle_grade_card(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        raw = request.match_info.get("public_id", "")
+        n = normalize_public_id(raw)
+        if n is None:
+            return web.json_response({"error": "invalid card id"}, status=400)
+        try:
+            async with session_factory() as db:
+                loaded = await load_owned_instance_for_grading(
+                    db,
+                    discord_user_id=sess.user_id,
+                    public_id=n,
+                )
+                if loaded is None:
+                    return web.json_response({"error": "not found"}, status=404)
+                inst, card = loaded
+                outcome = await roll_grade_for_instance(
+                    db,
+                    crystals,
+                    discord_user_id=sess.user_id,
+                    instance_id=inst.id,
+                )
+                if not outcome.ok:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": outcome.error,
+                            "message": outcome.error,
+                        },
+                        status=400,
+                    )
+                await db.commit()
+                await db.refresh(inst)
+                rar = await db.get(RarityClass, card.rarity_class_id)
+                payload = await _card_payload_after_mutation(
+                    db,
+                    inst=inst,
+                    card=card,
+                    rar=rar,
+                    user_id=sess.user_id,
+                )
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "card": payload,
+                        "new_crystal_balance": outcome.new_crystal_balance,
+                    }
+                )
+        except SQLAlchemyError:
+            _LOG.exception("grade_card user=%s public_id=%s", sess.user_id, raw)
+            return web.json_response({"error": "database error"}, status=500)
+
+    async def handle_grade_remove(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        raw = request.match_info.get("public_id", "")
+        n = normalize_public_id(raw)
+        if n is None:
+            return web.json_response({"error": "invalid card id"}, status=400)
+        try:
+            async with session_factory() as db:
+                loaded = await load_owned_instance_for_grading(
+                    db,
+                    discord_user_id=sess.user_id,
+                    public_id=n,
+                )
+                if loaded is None:
+                    return web.json_response({"error": "not found"}, status=404)
+                inst, card = loaded
+                err = await remove_grade(
+                    db,
+                    discord_user_id=sess.user_id,
+                    instance_id=inst.id,
+                )
+                if err:
+                    return web.json_response(
+                        {"ok": False, "error": err, "message": err},
+                        status=400,
+                    )
+                await db.commit()
+                await db.refresh(inst)
+                rar = await db.get(RarityClass, card.rarity_class_id)
+                payload = await _card_payload_after_mutation(
+                    db,
+                    inst=inst,
+                    card=card,
+                    rar=rar,
+                    user_id=sess.user_id,
+                )
+                return web.json_response({"ok": True, "card": payload})
+        except SQLAlchemyError:
+            _LOG.exception("grade_remove user=%s public_id=%s", sess.user_id, raw)
+            return web.json_response({"error": "database error"}, status=500)
+
+    async def handle_slab_image(request: web.Request) -> web.StreamResponse:
+        sess = _require_session(request)
+        raw = request.match_info.get("public_id", "")
+        n = normalize_public_id(raw)
+        if n is None:
+            raise web.HTTPNotFound()
+        try:
+            async with session_factory() as db:
+                loaded = await load_owned_instance_for_grading(
+                    db,
+                    discord_user_id=sess.user_id,
+                    public_id=n,
+                )
+                if loaded is None:
+                    raise web.HTTPNotFound()
+                inst, card = loaded
+                if inst.grade is None:
+                    raise web.HTTPNotFound()
+                idx = await global_copy_index(
+                    db,
+                    card_id=inst.card_id,
+                    obtained_at=inst.obtained_at,
+                    instance_id=inst.id,
+                )
+                cert = (inst.public_id or str(inst.id))[:12]
+                png = await render_graded_slab_png(
+                    card,
+                    grade=int(inst.grade),
+                    copy_index=idx.copy_index,
+                    total_copies=idx.total_copies,
+                    cert_suffix=cert,
+                )
+                if png is None:
+                    raise web.HTTPNotFound()
+                return web.Response(body=png.read(), content_type="image/png")
+        except SQLAlchemyError:
+            _LOG.exception("slab_image user=%s public_id=%s", sess.user_id, raw)
+            return web.json_response({"error": "database error"}, status=500)
+
     app.router.add_get("/api/me/collection", handle_collection)
     app.router.add_get("/api/me/collection/evolution-sections", handle_evolution_sections)
     app.router.add_get(r"/api/me/cards/{public_id}", handle_card_detail)
@@ -1050,3 +1280,6 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
     app.router.add_post(r"/api/me/cards/bulk-sell", handle_bulk_sell_commit)
     app.router.add_post(r"/api/me/cards/{public_id}/favorite", handle_favorite_card)
     app.router.add_post(r"/api/me/cards/{public_id}/evolve", handle_evolve_card)
+    app.router.add_post(r"/api/me/cards/{public_id}/grade", handle_grade_card)
+    app.router.add_post(r"/api/me/cards/{public_id}/grade/remove", handle_grade_remove)
+    app.router.add_get(r"/api/me/cards/{public_id}/slab", handle_slab_image)

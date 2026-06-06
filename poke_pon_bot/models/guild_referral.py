@@ -28,3 +28,9 @@ class GuildReferral(Base):
         DateTime(timezone=True), nullable=True
     )
     crystals_awarded: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    invitee_crystals_awarded: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    first_pack_rewarded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

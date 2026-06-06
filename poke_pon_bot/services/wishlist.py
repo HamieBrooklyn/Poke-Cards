@@ -149,19 +149,22 @@ async def wishlist_user_ids_for_cards(
     """Map ``card_id`` → Discord user ids who starred that printing (optional obtainer excluded)."""
     if not card_ids:
         return {}
-    rows = (
-        await session.execute(
-            select(UserCardWishlist.card_id, UserCardWishlist.discord_user_id).where(
-                UserCardWishlist.card_id.in_(card_ids)
-            )
-        )
-    ).all()
     m: dict[int, list[int]] = defaultdict(list)
-    for cid, uid in rows:
-        uid_i = int(uid)
-        if exclude_user_id is not None and uid_i == exclude_user_id:
-            continue
-        m[int(cid)].append(uid_i)
+    for model in (UserCardWishlist, UserWishlist):
+        rows = (
+            await session.execute(
+                select(model.card_id, model.discord_user_id).where(
+                    model.card_id.in_(card_ids)
+                )
+            )
+        ).all()
+        for cid, uid in rows:
+            uid_i = int(uid)
+            if exclude_user_id is not None and uid_i == exclude_user_id:
+                continue
+            bucket = m[int(cid)]
+            if uid_i not in bucket:
+                bucket.append(uid_i)
     return dict(m)
 
 

@@ -250,38 +250,64 @@ async def browse_catalog(
 
 
 async def catalog_facets(session: AsyncSession) -> dict[str, list]:
-    """Distinct filter values for the public catalog UI."""
+    """Distinct filter values for the public catalog UI (Pokédex facet controls)."""
     set_rows = (
         await session.execute(
-            select(Card.set_code, Card.set_name)
+            select(Card.set_code, Card.set_name, func.count(Card.id))
             .where(excluded_set_clause(Card.set_code), Card.set_code.isnot(None))
-            .distinct()
+            .group_by(Card.set_code, Card.set_name)
             .order_by(Card.set_name.asc())
         )
     ).all()
     supertype_rows = (
         await session.execute(
-            select(Card.supertype)
+            select(Card.supertype, func.count(Card.id))
             .where(excluded_set_clause(Card.set_code), Card.supertype.isnot(None))
-            .distinct()
+            .group_by(Card.supertype)
             .order_by(Card.supertype.asc())
         )
     ).all()
     rarity_rows = (
         await session.execute(
-            select(RarityClass.code, RarityClass.display_name, RarityClass.sort_order)
+            select(
+                RarityClass.code,
+                RarityClass.display_name,
+                RarityClass.sort_order,
+                func.count(Card.id),
+            )
             .join(Card, Card.rarity_class_id == RarityClass.id)
             .where(excluded_set_clause(Card.set_code))
-            .distinct()
+            .group_by(
+                RarityClass.code,
+                RarityClass.display_name,
+                RarityClass.sort_order,
+            )
             .order_by(RarityClass.sort_order.asc())
         )
     ).all()
+    rarity_tiers = [
+        {"code": code, "display_name": display_name, "card_count": int(n)}
+        for code, display_name, _sort, n in rarity_rows
+        if code
+    ]
     return {
-        "sets": [{"code": code, "name": name} for code, name in set_rows if code],
-        "supertypes": [s for (s,) in supertype_rows if s],
-        "rarity_tiers": [
-            {"code": code, "display_name": display_name}
-            for code, display_name, _ in rarity_rows
+        "sets": [
+            {
+                "set_code": code,
+                "set_name": name,
+                "card_count": int(n),
+                # Legacy aliases (older frontends)
+                "code": code,
+                "name": name,
+            }
+            for code, name, n in set_rows
             if code
         ],
+        "supertypes": [
+            {"supertype": st, "card_count": int(n)}
+            for st, n in supertype_rows
+            if st
+        ],
+        "rarity_tiers": rarity_tiers,
+        "rarities": rarity_tiers,
     }

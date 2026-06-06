@@ -75,6 +75,40 @@ def grade_label(grade: int) -> str:
     return GRADE_LABELS.get(grade, str(grade))
 
 
+# Grades 7–10 earn +2% shop sell payout per point above 6 (max +8% at GEM MT).
+GRADE_SELL_BONUS_THRESHOLD = 6
+GRADE_SELL_BONUS_PER_POINT = 2
+GRADE_SELL_BONUS_MAX_PERCENT = 8
+
+
+def grade_sell_bonus_percent(grade: int | None) -> int:
+    if grade is None or grade <= GRADE_SELL_BONUS_THRESHOLD:
+        return 0
+    return min(
+        (int(grade) - GRADE_SELL_BONUS_THRESHOLD) * GRADE_SELL_BONUS_PER_POINT,
+        GRADE_SELL_BONUS_MAX_PERCENT,
+    )
+
+
+def grade_sell_multiplier(grade: int | None) -> float:
+    return 1.0 + grade_sell_bonus_percent(grade) / 100.0
+
+
+def format_grade_slab_badge(grade: int | None) -> str:
+    """Compact prestige suffix for list lines (trades, auctions, leaderboards)."""
+    if grade is None:
+        return ""
+    return f" · 🏆 **{int(grade)}** {grade_label(int(grade))}"
+
+
+def grading_fields_for_instance(inst: UserCardInstance) -> dict[str, int | str | None]:
+    g = inst.grade
+    if g is None:
+        return {"grade": None, "grade_label": None}
+    gi = int(g)
+    return {"grade": gi, "grade_label": grade_label(gi)}
+
+
 def roll_grade(*, copy_index: CopyRarityIndex, rng: random.Random | None = None) -> int:
     """Roll a grade 1–10; earlier global copies skew toward higher grades."""
     r = rng or random.Random(secrets.randbits(128))

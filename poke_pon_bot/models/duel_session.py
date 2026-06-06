@@ -22,6 +22,8 @@ DUEL_BID_CURRENCY_CRYSTALS = "crystals"
 
 INVITE_TTL_MINUTES = 30
 ACTIVE_TTL_MINUTES = 45
+# Cancel invited/active duels when nobody is connected to the WS room this long.
+ABANDON_CANCEL_MINUTES = 5
 
 
 class DuelSession(Base):

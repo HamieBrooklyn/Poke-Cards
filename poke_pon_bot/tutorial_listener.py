@@ -106,7 +106,7 @@ def setup_tutorial_listener(bot: commands.Bot) -> None:
         ctx = getattr(interaction, "_baton", None)
         if ctx is None:
             ctx = await bot.get_context(interaction)
-        if ctx.command is None:
+        if getattr(ctx, "command", None) is None:
             wrapped = getattr(command, "wrapped", None)
             ctx.command = wrapped if wrapped is not None else command
         try:

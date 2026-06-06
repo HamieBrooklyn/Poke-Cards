@@ -62,6 +62,7 @@ class OpenedPackResult:
     regular: list[tuple[UserCardInstance, Card]]
     code_cards: list[tuple[UserCardInstance, Card]]
     crystals_credited: int
+    milestone_crossed: list[int]
 
 
 class PackService:
@@ -328,6 +329,16 @@ class PackService:
 
         pack.opened_at = datetime.now(UTC)
 
+        milestone_crossed: list[int] = []
+        if roll_guild is not None:
+            from poke_pon_bot.services.guild_milestones import record_pack_opened
+
+            milestone_crossed = await record_pack_opened(
+                session,
+                guild_id=int(roll_guild),
+                discord_user_id=int(owner_id),
+            )
+
         crystals = int(series.code_cards_per_pack)
         if crystals > 0:
             await self._crystals.try_credit(session, owner_id, crystals)
@@ -339,6 +350,7 @@ class PackService:
             regular=regular_pairs,
             code_cards=code_pairs,
             crystals_credited=crystals,
+            milestone_crossed=milestone_crossed,
         )
 
     async def _save_owned_instance(

@@ -17,6 +17,8 @@ from poke_pon_bot.services.topgg_vote import (
     TopggRateLimitError,
     fetch_active_discord_vote,
 )
+from poke_pon_bot.services.user_notifications import create_notification
+from poke_pon_bot.services.web_preferences import get_or_create_web_preferences
 from poke_pon_bot.services.wallet import (
     AlreadyClaimedVoteRewardError,
     WalletService,
@@ -167,27 +169,57 @@ async def notify_vote_reward_dm(
             url=notice.vote_url,
         )
     )
-    try:
-        dm_user = user if isinstance(user, discord.User) else await bot.fetch_user(user.id)
-    except (discord.NotFound, discord.HTTPException):
-        _LOG.warning("Could not fetch user %s for vote reward DM", user.id)
-        return
 
     text = (
         "Thanks for voting on **Top.gg**!\n\n"
         f"You received **{format_pokedollars(notice.amount)}**{crystal_part}.\n"
         f"**Balance:** {format_pokedollars(notice.new_balance)}"
     )
+    inbox_body = (
+        f"You received {format_pokedollars(notice.amount)}{crystal_part}. "
+        f"Balance: {format_pokedollars(notice.new_balance)}."
+    )
+
+    send_dm = True
+    factory = getattr(bot, "async_session_factory", None)
+    settings = getattr(bot, "settings", None)
+    web_notify = bool(getattr(settings, "web_notifications_enabled", False))
+    if factory is not None and web_notify:
+        try:
+            async with factory() as session:
+                await create_notification(
+                    session,
+                    discord_user_id=int(user.id),
+                    kind="vote_reward",
+                    title="Top.gg vote reward",
+                    body=inbox_body,
+                    href=notice.vote_url,
+                )
+                prefs = await get_or_create_web_preferences(session, int(user.id))
+                send_dm = bool(getattr(prefs, "notify_vote", True))
+                await session.commit()
+        except SQLAlchemyError:
+            _LOG.exception("vote reward inbox user=%s", user.id)
+    elif factory is not None:
+        try:
+            async with factory() as session:
+                prefs = await get_or_create_web_preferences(session, int(user.id))
+                send_dm = bool(getattr(prefs, "notify_vote", True))
+        except SQLAlchemyError:
+            pass
+
+    if not send_dm:
+        return
+
+    try:
+        dm_user = user if isinstance(user, discord.User) else await bot.fetch_user(user.id)
+    except (discord.NotFound, discord.HTTPException):
+        _LOG.warning("Could not fetch user %s for vote reward DM", user.id)
+        return
+
     try:
         await dm_user.send(text, view=view)
     except discord.Forbidden:
         _LOG.info("Vote reward DM blocked for user %s", user.id)
     except discord.HTTPException:
         _LOG.exception("Vote reward DM failed for user %s", user.id)
-
-    try:
-        from poke_pon_bot.services.tutorial import try_complete_vote_step_if_eligible
-
-        await try_complete_vote_step_if_eligible(bot, user.id)
-    except Exception:
-        _LOG.exception("Tutorial vote-step hook failed for user %s", user.id)

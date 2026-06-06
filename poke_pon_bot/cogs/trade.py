@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.pending_trade import PendingTrade
+from poke_pon_bot.services.grading import format_grade_slab_badge
 from poke_pon_bot.services.instance_public_id import compact_public_id_for_line
 from poke_pon_bot.services.trades import (
     MAX_TRADE_POKEDOLLARS,
@@ -23,6 +24,7 @@ from poke_pon_bot.services.trades import (
     resolve_owned_instances,
     split_card_tokens,
 )
+from poke_pon_bot.services.wishlist_market_alerts import schedule_wishlist_trade_alerts
 from poke_pon_bot.services.wallet import WalletService, format_pokedollars
 
 _LOG = logging.getLogger(__name__)
@@ -38,7 +40,8 @@ async def _side_summary(session, instances: list, money: int) -> str:
         card = await session.get(Card, inst.card_id)
         nm = card.name if card else "Unknown"
         pid = compact_public_id_for_line(inst.public_id)
-        lines.append(f"• **{nm}** `{pid}`")
+        grade = int(inst.grade) if getattr(inst, "grade", None) is not None else None
+        lines.append(f"• **{nm}** `{pid}`{format_grade_slab_badge(grade)}")
     if money > 0:
         lines.append(f"• **{format_pokedollars(money)}**")
     if not lines:
@@ -273,13 +276,24 @@ class TradeCog(commands.Cog):
 
                 msg = await ctx.send(content=partner.mention, embed=emb, view=view)
                 pt.message_id = msg.id
+                trade_cards: list[tuple[int, str]] = []
+                for inst in give_inst + recv_inst:
+                    card = await session.get(Card, inst.card_id)
+                    if card is not None:
+                        trade_cards.append((int(inst.card_id), str(card.name)))
                 await session.commit()
                 view.message = msg
+                schedule_wishlist_trade_alerts(
+                    self.bot,
+                    offerer_id=ctx.author.id,
+                    cards=trade_cards,
+                    exclude_user_ids=frozenset({ctx.author.id, partner.id}),
+                )
         except SQLAlchemyError:
             _LOG.exception("trade offer user %s -> %s", ctx.author.id, partner.id)
             await ctx.send("Could not save that trade offer.", ephemeral=ephe)
 
-    @trade_root.command(name="offer")
+    @trade_root.command(name="offer", aliases=["o", "to"])
     @app_commands.describe(
         partner="Who you’re trading with",
         give_cards="Your Card IDs (commas or spaces)",
@@ -306,7 +320,7 @@ class TradeCog(commands.Cog):
             gift_mode=False,
         )
 
-    @trade_root.command(name="gift")
+    @trade_root.command(name="gift", aliases=["g", "tg"])
     @app_commands.describe(
         partner="Who receives the gift",
         give_cards="Card IDs you’re giving",

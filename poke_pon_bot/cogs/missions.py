@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 from sqlalchemy.exc import SQLAlchemyError
 
-from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 from poke_pon_bot.services.missions import (
     MissionService,
@@ -174,7 +174,7 @@ class MissionsCog(commands.Cog):
 
     @commands.hybrid_command(
         name="missions",
-        aliases=[pp_alias("missions")],
+        aliases=[*pp_chat_aliases("missions", "mis")],
         description="Daily and weekly missions for Crystals — chat: ppmissions",
     )
     async def missions_cmd(self, ctx: commands.Context) -> None:

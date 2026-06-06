@@ -16,6 +16,7 @@ from poke_pon_bot.services.drops import (
     CODE_SLOT_LUCK_MULTIPLIER,
     PACK_OPEN_LUCK_PERCENT,
     _CODE_SLOT_RARITY_WEIGHT_MULT,
+    card_pull_weight,
     pack_price_luck_bonus,
     pack_slot_luck_percent,
 )
@@ -138,6 +139,10 @@ async def build_series_pull_odds(
         by_tier[int(card.rarity_class_id)].append(card)
         rarity_meta[int(rarity.id)] = rarity
 
+    tier_total_pull_weight: dict[int, float] = {}
+    for rid, cards_in_tier in by_tier.items():
+        tier_total_pull_weight[rid] = sum(card_pull_weight(c) for c in cards_in_tier) or 1.0
+
     eligible_ids = {rid for rid, lst in by_tier.items() if lst}
     main_luck = pack_slot_luck_percent(
         crystal_price=int(series.crystal_price),
@@ -186,12 +191,13 @@ async def build_series_pull_odds(
     card_rows: list[dict[str, Any]] = []
     for card, rarity in rows:
         rid = int(card.rarity_class_id)
-        n_reg = len(by_tier.get(rid, []))
-        n_code = n_reg
         reg_tier = reg_tier_pct.get(rid, 0.0)
         code_tier = code_tier_pct.get(rid, 0.0)
-        reg_card = (reg_tier / n_reg) if n_reg else 0.0
-        code_card = (code_tier / n_code) if n_code else 0.0
+        w = card_pull_weight(card)
+        tw = tier_total_pull_weight.get(rid, 1.0)
+        card_share = w / tw
+        reg_card = reg_tier * card_share
+        code_card = code_tier * card_share
         reg_pack = _per_pack_any_slot_percent(reg_card, main_slots)
         code_pack = _per_pack_any_slot_percent(code_card, code_slots)
         card_rows.append(
@@ -247,7 +253,7 @@ async def build_series_pull_odds(
         f"Each of the {main_slots} main slots rolls independently (same odds).",
         f"The code card slot ({code_slots} per pack) uses a rarer tier mix and "
         f"**{CODE_SLOT_LUCK_MULTIPLIER:g}×** the pack luck of main slots.",
-        "Within a tier, each printing in this pack pool is equally likely.",
+        "Within a tier, cards are weighted by printed TCG rarity, HP, and max attack damage — stronger/rarer cards pull less often.",
         f"Pack opens include +{luck_percent:g}% base luck"
         + (f" and +{price_bonus:g}% for this pack's crystal price" if price_bonus else "")
         + f" (main slots ≈ +{main_luck:g}%; code slot ≈ +{code_luck:g}%; server boosts may add more).",

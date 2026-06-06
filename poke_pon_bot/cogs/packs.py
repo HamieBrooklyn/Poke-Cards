@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from poke_pon_bot.chat_commands import pp_alias
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.cogs.gacha import (
     _CardIdReplyBinding,
     _collection_view_embed,
@@ -1203,6 +1203,8 @@ class PacksCog(commands.Cog):
         ds = DropService()
         ps = PackService()
         pack_source = ""
+        crossed: list[int] = []
+        open_guild: int | None = None
         try:
             async with self.bot.async_session_factory() as session:
                 pack_row = await session.get(UserPackInstance, pack_instance_id)
@@ -1220,6 +1222,7 @@ class PacksCog(commands.Cog):
                     owner_id=interaction.user.id,
                     guild_id=open_guild,
                 )
+                crossed = list(opened.milestone_crossed)
                 await session.commit()
         except PackNotFoundError:
             await interaction.followup.send(
@@ -1252,13 +1255,15 @@ class PacksCog(commands.Cog):
             )
             return
 
-        if interaction.user is not None and pack_source:
-            from poke_pon_bot.services.tutorial import notify_pack_opened
+        if crossed and open_guild is not None:
+            from poke_pon_bot.services.guild_milestones import announce_milestone_tiers
 
-            await notify_pack_opened(
-                self.bot,
-                interaction.user.id,
-                pack_source=pack_source,
+            asyncio.create_task(
+                announce_milestone_tiers(
+                    self.bot,
+                    guild_id=int(open_guild),
+                    crossed_tiers=crossed,
+                )
             )
 
         instance_ids = [inst.id for inst, _ in all_pairs]
@@ -1309,7 +1314,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packd",
-        aliases=[pp_alias("packd")],
+        aliases=[*pp_chat_aliases("packd")],
         description="Pack drop: buy a random pack with Pokedollars, Crystals, or the pack SKU. Chat: pppackd",
     )
     async def pack_drop_cmd(self, ctx: commands.Context) -> None:
@@ -1451,7 +1456,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packv",
-        aliases=[pp_alias("packv")],
+        aliases=[*pp_chat_aliases("packv", "pvd")],
         description="Search/view packs to buy, or view an owned pack by ID.",
     )
     @app_commands.describe(
@@ -1501,7 +1506,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packcolv",
-        aliases=[pp_alias("packcolv")],
+        aliases=[*pp_chat_aliases("packcolv", "kcol", "packc")],
         description="Flip through your unopened packs (◀▶) — chat: pppackcolv",
     )
     @app_commands.describe(series="Filter by series code (e.g. sv).")
@@ -1569,7 +1574,7 @@ class PacksCog(commands.Cog):
 
     @commands.hybrid_command(
         name="packcat",
-        aliases=[pp_alias("packcat")],
+        aliases=[*pp_chat_aliases("packcat", "pcat")],
         description="Browse the pack catalog as a book-flip view of pack art.",
     )
     @app_commands.describe(

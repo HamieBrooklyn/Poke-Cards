@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy.exc import SQLAlchemyError
 
+from poke_pon_bot.chat_commands import pp_chat_aliases
 from poke_pon_bot.services.crystals import CrystalsService, format_crystals
 from poke_pon_bot.services.topgg_vote import (
     TopggAuthError,
@@ -54,7 +55,7 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(
         name="daily",
-        aliases=["pcdaily"],
+        aliases=["pcdaily", *pp_chat_aliases("daily", "day")],
         description=(
             f"Claim your daily {CURRENCY_NAME} ({DAILY_CLAIM_MIN}–{DAILY_CLAIM_MAX} ₽, once per UTC day)."
         ),
@@ -63,10 +64,23 @@ class EconomyCog(commands.Cog):
         if ctx.interaction:
             await ctx.defer(ephemeral=False)
         uid = ctx.author.id
+        settings = self.bot.settings
         try:
             async with self.bot.async_session_factory() as session:
+                from poke_pon_bot.services.event_scheduler import resolve_active_effects
+
+                effects = await resolve_active_effects(
+                    session,
+                    weekend_luck_enabled=settings.weekend_luck_enabled,
+                    weekend_luck_percent=settings.weekend_luck_percent,
+                    weekend_luck_timezone=settings.weekend_luck_timezone,
+                )
                 try:
-                    result = await self._wallet.try_daily_claim(session, uid)
+                    result = await self._wallet.try_daily_claim(
+                        session,
+                        uid,
+                        daily_multiplier=effects.daily_multiplier,
+                    )
                     await session.commit()
                 except AlreadyClaimedTodayError:
                     await session.rollback()
@@ -99,13 +113,18 @@ class EconomyCog(commands.Cog):
                 f"You received **{format_pokedollars(result.amount)}** "
                 f"({CURRENCY_NAME}).\n"
                 f"**Balance:** {format_pokedollars(result.new_balance)}"
+                + (
+                    f"\n✨ **Double daily** event — rewards are **×{effects.daily_multiplier}** today."
+                    if effects.daily_multiplier > 1
+                    else ""
+                )
             ),
         )
         await ctx.send(embed=embed, ephemeral=False)
 
     @commands.hybrid_command(
         name="balance",
-        aliases=["pcbal"],
+        aliases=["pcbal", *pp_chat_aliases("balance", "bal")],
         description=f"Check {CURRENCY_NAME} balance (yours or another user's).",
     )
     @app_commands.describe(
@@ -144,7 +163,7 @@ class EconomyCog(commands.Cog):
 
     @commands.hybrid_command(
         name="vote",
-        aliases=["pvote", "pcvote"],
+        aliases=["pvote", "pcvote", *pp_chat_aliases("vote")],
         description=(
             f"Top.gg vote reward ({VOTE_CLAIM_MIN}–{VOTE_CLAIM_MAX} ₽). "
             f"Claim here or via webhook if enabled."

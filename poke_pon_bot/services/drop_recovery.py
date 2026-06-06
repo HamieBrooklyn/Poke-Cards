@@ -60,6 +60,7 @@ async def upsert_pending_drop(
         slot_claimer=claimer,
         slot_public_ids=pids,
         finished=bool(view._finished),
+        reroll_used=bool(getattr(view, "_reroll_used", False)),
     )
     await session.merge(row)
 
