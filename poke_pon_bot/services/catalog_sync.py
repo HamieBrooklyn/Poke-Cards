@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 import yaml
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from poke_pon_bot.models.card import Card
@@ -23,6 +25,52 @@ from poke_pon_bot.services.rarity_normalize import normalize_tcg_rarity
 LOG = logging.getLogger(__name__)
 
 TCG_BASE = "https://api.pokemontcg.io/v2"
+
+
+@dataclass
+class TcgSetMeta:
+    set_id: str
+    name: str
+    release_date: str | None
+
+
+@dataclass
+class SetSyncStats:
+    set_code: str
+    set_name: str
+    new_cards: int = 0
+    updated_cards: int = 0
+    is_new_set: bool = False
+    new_card_ids: list[int] = field(default_factory=list)
+    sample_cards: list[dict[str, Any]] = field(default_factory=list)
+
+    def note_new_card(
+        self,
+        *,
+        card_id: int,
+        name: str,
+        image_small_url: str | None,
+        rarity_sort_order: int,
+    ) -> None:
+        self.new_card_ids.append(int(card_id))
+        entry = {
+            "id": int(card_id),
+            "name": name,
+            "image_small_url": image_small_url or "",
+            "rarity_sort_order": int(rarity_sort_order),
+        }
+        self.sample_cards.append(entry)
+        self.sample_cards.sort(
+            key=lambda c: int(c.get("rarity_sort_order") or 0),
+            reverse=True,
+        )
+        del self.sample_cards[5:]  # keep top 5 for Discord/website previews
+
+
+@dataclass
+class CatalogSyncResult:
+    counts: dict[str, int]
+    deltas: dict[str, SetSyncStats]
 
 
 def _collector_sort_key(collector_number: str) -> tuple:
@@ -129,6 +177,62 @@ async def fetch_all_set_ids(api_key: str | None = None) -> list[str]:
         if isinstance(d.get("id"), str)
         and not is_excluded_set_code(str(d["id"]))
     ]
+
+
+async def fetch_sets_released_since(
+    *,
+    api_key: str | None = None,
+    days: int = 60,
+) -> list[TcgSetMeta]:
+    """TCG sets with ``releaseDate`` within the last ``days`` (newest first)."""
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+
+    cutoff = (datetime.now(UTC).date() - timedelta(days=max(1, int(days))))
+    rows: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
+        page = 1
+        page_size = 250
+        while True:
+            resp = await client.get(
+                f"{TCG_BASE}/sets",
+                params={"page": page, "pageSize": page_size},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data") or []
+            rows.extend(d for d in data if isinstance(d, dict))
+            total = int(body.get("totalCount") or 0)
+            if page * page_size >= total or not data:
+                break
+            page += 1
+
+    out: list[TcgSetMeta] = []
+    for d in rows:
+        sid = str(d.get("id") or "").strip()
+        if not sid or is_excluded_set_code(sid):
+            continue
+        release_raw = str(d.get("releaseDate") or "").strip()
+        if release_raw:
+            try:
+                release_day = datetime.fromisoformat(release_raw).date()
+            except ValueError:
+                release_day = None
+        else:
+            release_day = None
+        if release_day is not None and release_day < cutoff:
+            continue
+        out.append(
+            TcgSetMeta(
+                set_id=sid,
+                name=str(d.get("name") or sid),
+                release_date=release_raw or None,
+            )
+        )
+
+    out.sort(key=lambda s: s.release_date or "", reverse=True)
+    return out
 
 
 async def _rarity_lookup(session: AsyncSession) -> tuple[dict[str, int], dict[str, int]]:
@@ -331,8 +435,8 @@ async def sync_curated_sets(
     *,
     set_ids: list[str],
     api_key: str | None = None,
-) -> dict[str, int]:
-    """Fetch all cards for each set ID and upsert into `cards`. Returns per-set counts."""
+) -> CatalogSyncResult:
+    """Fetch all cards for each set ID and upsert into `cards`."""
     set_ids = filter_excluded_set_codes(set_ids)
 
     headers: dict[str, str] = {}
@@ -340,12 +444,31 @@ async def sync_curated_sets(
         headers["X-Api-Key"] = api_key
 
     counts: dict[str, int] = {sid: 0 for sid in set_ids}
+    deltas: dict[str, SetSyncStats] = {}
 
     async with session_factory() as session:
         codes_by_class, rarity_overrides = await _rarity_lookup(session)
+        sort_order_by_id = {
+            int(rc.id): int(rc.sort_order)
+            for rc in (await session.execute(select(RarityClass))).scalars()
+        }
 
         async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
             for set_id in set_ids:
+                had_cards = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(Card)
+                        .where(Card.set_code == set_id)
+                    )
+                    or 0
+                )
+                stats = SetSyncStats(
+                    set_code=set_id,
+                    set_name=set_id,
+                    is_new_set=had_cards == 0,
+                )
+                deltas[set_id] = stats
                 page = 1
                 page_size = 250
 
@@ -377,14 +500,26 @@ async def sync_curated_sets(
                                 rid = codes_by_class["uncommon"]
 
                         values = _card_row_dict(payload, rid)
+                        if values.get("set_name"):
+                            stats.set_name = str(values["set_name"])
                         existing = await session.scalar(
                             select(Card).where(Card.tcg_card_id == values["tcg_card_id"])
                         )
                         if existing:
                             for k, v in values.items():
                                 setattr(existing, k, v)
+                            stats.updated_cards += 1
                         else:
-                            session.add(Card(**values))
+                            card = Card(**values)
+                            session.add(card)
+                            await session.flush()
+                            stats.new_cards += 1
+                            stats.note_new_card(
+                                card_id=int(card.id),
+                                name=str(values.get("name") or "Card"),
+                                image_small_url=values.get("image_small_url"),
+                                rarity_sort_order=sort_order_by_id.get(int(rid), 0),
+                            )
 
                         counts[set_id] += 1
 
@@ -392,9 +527,11 @@ async def sync_curated_sets(
 
                     if page * page_size >= total_count or not data:
                         LOG.info(
-                            "Finished set %s — stored %s cards (API reports %s)",
+                            "Finished set %s — stored %s cards (%s new, %s updated; API reports %s)",
                             set_id,
                             counts[set_id],
+                            stats.new_cards,
+                            stats.updated_cards,
                             total_count,
                         )
                         await _resolve_evolves_for_set(session, set_id)
@@ -402,7 +539,7 @@ async def sync_curated_sets(
                         break
                     page += 1
 
-    return counts
+    return CatalogSyncResult(counts=counts, deltas=deltas)
 
 
 async def sync_query(

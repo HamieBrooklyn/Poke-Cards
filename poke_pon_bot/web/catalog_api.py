@@ -43,6 +43,22 @@ def _parse_int_query(request: web.Request, key: str) -> int | None:
         return None
 
 
+def _parse_card_ids_query(request: web.Request) -> list[int] | None:
+    raw = (request.rel_url.query.get("card_ids") or "").strip()
+    if not raw:
+        return None
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out or None
+
+
 def _serialize_catalog_summary(
     card: Card,
     rarity: RarityClass | None,
@@ -173,6 +189,7 @@ def register_catalog_public_api(app: web.Application, *, bot: Any) -> None:
         rarity_tier = (request.rel_url.query.get("rarity_tier") or "").strip() or None
         sort = (request.rel_url.query.get("sort") or "name").strip().lower()
         pokedex = _parse_int_query(request, "pokedex")
+        card_ids = _parse_card_ids_query(request)
         try:
             page = max(1, int(request.rel_url.query.get("page") or "1"))
         except ValueError:
@@ -195,6 +212,7 @@ def register_catalog_public_api(app: web.Application, *, bot: Any) -> None:
                     sort=sort,
                     page=page,
                     page_size=page_size,
+                    card_ids=card_ids,
                 )
                 owned_map: dict[int, int] = {}
                 if user_id is not None and rows:

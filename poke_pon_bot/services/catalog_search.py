@@ -56,9 +56,12 @@ def _build_catalog_select(
     supertype: str | None,
     rarity_tier: str | None,
     tcg_card_id: str | None = None,
+    card_ids: list[int] | None = None,
 ) -> Select:
     """Primary filtered ``SELECT cards.*`` (may join ``rarity_classes``)."""
     stmt: Select = select(Card).where(excluded_set_clause(Card.set_code))
+    if card_ids:
+        stmt = stmt.where(Card.id.in_([int(x) for x in card_ids]))
     if tcg_card_id and tcg_card_id.strip():
         stmt = stmt.where(Card.tcg_card_id == tcg_card_id.strip())
     stmt = _apply_filters(
@@ -205,6 +208,7 @@ async def browse_catalog(
     sort: str = "name",
     page: int = 1,
     page_size: int = 60,
+    card_ids: list[int] | None = None,
 ) -> tuple[list[tuple[Card, RarityClass | None]], int]:
     """Paginated catalog browse for the public website API."""
     base = _build_catalog_select(
@@ -215,6 +219,7 @@ async def browse_catalog(
         set_name=None,
         supertype=supertype,
         rarity_tier=rarity_tier,
+        card_ids=card_ids,
     )
     subq = base.subquery()
     total = int(await session.scalar(select(func.count()).select_from(subq)) or 0)

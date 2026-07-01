@@ -133,6 +133,14 @@ class Settings:
     pokepon_runtime: str
     """Inbox + notification hooks/API; on in staging, prod needs ``WEB_NOTIFICATIONS_ENABLED=1``."""
     web_notifications_enabled: bool
+    """Poll Pokémon TCG API for recent sets and publish catalog news."""
+    catalog_news_enabled: bool
+    """Discord channel for new-set announcements (optional)."""
+    catalog_news_channel_id: int | None
+    catalog_news_lookback_days: int
+    catalog_news_interval_hours: float
+    catalog_news_min_cards_existing_set: int
+    catalog_news_max_sets_per_run: int
 
 
 def _default_card_sets_path() -> Path:
@@ -545,6 +553,30 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         pokepon_runtime == "staging"
     )
 
+    raw_catalog_news = (os.environ.get("CATALOG_NEWS_ENABLED") or "").strip().lower()
+    catalog_news_enabled = raw_catalog_news in ("1", "true", "yes", "on") or (
+        pokepon_runtime == "staging"
+        and raw_catalog_news not in ("0", "false", "no", "off")
+    )
+    raw_news_channel = (os.environ.get("CATALOG_NEWS_CHANNEL_ID") or "").strip()
+    catalog_news_channel_id: int | None
+    if raw_news_channel:
+        try:
+            catalog_news_channel_id = int(raw_news_channel)
+        except ValueError as exc:
+            raise SystemExit("CATALOG_NEWS_CHANNEL_ID must be numeric.") from exc
+    else:
+        catalog_news_channel_id = None
+
+    catalog_news_lookback_days = _int_env("CATALOG_NEWS_LOOKBACK_DAYS", 60)
+    raw_news_interval = (os.environ.get("CATALOG_NEWS_INTERVAL_HOURS") or "24").strip()
+    try:
+        catalog_news_interval_hours = float(raw_news_interval)
+    except ValueError as exc:
+        raise SystemExit("CATALOG_NEWS_INTERVAL_HOURS must be a number.") from exc
+    catalog_news_min_cards_existing_set = _int_env("CATALOG_NEWS_MIN_CARDS_ADDED", 5)
+    catalog_news_max_sets_per_run = _int_env("CATALOG_NEWS_MAX_SETS_PER_RUN", 8)
+
     return Settings(
         discord_token=token,
         dev_guild_id=dev_guild_id,
@@ -613,4 +645,10 @@ def load_settings(*, require_discord_token: bool = True) -> Settings:
         set_chase_community_reward_crystals=set_chase_community_reward_crystals,
         pokepon_runtime=pokepon_runtime,
         web_notifications_enabled=web_notifications_enabled,
+        catalog_news_enabled=catalog_news_enabled,
+        catalog_news_channel_id=catalog_news_channel_id,
+        catalog_news_lookback_days=catalog_news_lookback_days,
+        catalog_news_interval_hours=catalog_news_interval_hours,
+        catalog_news_min_cards_existing_set=catalog_news_min_cards_existing_set,
+        catalog_news_max_sets_per_run=catalog_news_max_sets_per_run,
     )

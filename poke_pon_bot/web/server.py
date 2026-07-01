@@ -127,11 +127,13 @@ async def start_web_server(bot: Any) -> WebServer | None:
 
     from poke_pon_bot.web.catalog_api import register_catalog_public_api
     from poke_pon_bot.web.events_api import register_events_public_api
+    from poke_pon_bot.web.news_api import register_news_public_api
     from poke_pon_bot.web.packs_api import register_packs_public_api
 
     register_catalog_public_api(app, bot=bot)
     register_packs_public_api(app, bot=bot)
     register_events_public_api(app, bot=bot)
+    register_news_public_api(app, bot=bot)
 
     if (
         settings.web_session_secret

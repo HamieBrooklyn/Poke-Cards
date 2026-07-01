@@ -33,6 +33,7 @@ class _SellQuoteInstance:
     """Stand-in for shop sell quote on catalog printings (no owned copy)."""
 
     evolution_stages = 0
+    grade = None
 
 
 def _max_attack_damage(attacks: Any) -> int:

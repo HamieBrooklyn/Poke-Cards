@@ -47,7 +47,7 @@ async def _run() -> int:
                     set_ids=all_ids,
                     api_key=settings.tcg_api_key,
                 )
-                totals.update(counts)
+                totals.update(counts.counts)
 
         if "query" in plan:
             LOG.info("Importing by query: %s", plan["query"])
@@ -67,7 +67,7 @@ async def _run() -> int:
                 set_ids=set_ids,
                 api_key=settings.tcg_api_key,
             )
-            totals.update(counts)
+            totals.update(counts.counts)
     finally:
         await engine.dispose()
 

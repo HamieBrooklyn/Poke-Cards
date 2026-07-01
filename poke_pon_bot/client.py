@@ -305,6 +305,8 @@ class PokePonBot(commands.Bot):
         await self.load_extension("poke_pon_bot.cogs.trade")
         await self.load_extension("poke_pon_bot.cogs.auction")
         await self.load_extension("poke_pon_bot.cogs.game_events")
+        if self.settings.catalog_news_enabled:
+            await self.load_extension("poke_pon_bot.cogs.catalog_news")
         if self.settings.web_notifications_enabled:
             await self.load_extension("poke_pon_bot.cogs.engagement_notifications")
         await self.load_extension("poke_pon_bot.cogs.set_chase")

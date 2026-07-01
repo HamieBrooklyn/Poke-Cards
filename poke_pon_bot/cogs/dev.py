@@ -1387,6 +1387,163 @@ class DevCog(commands.Cog):
         )
 
     @dev.command(
+        name="catalog_news_sync",
+        description="Run incremental TCG catalog sync and post any new-set announcements.",
+    )
+    async def dev_catalog_news_sync(self, interaction: discord.Interaction) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.", ephemeral=True
+            )
+            return
+        if not self._settings or not self._settings.catalog_news_enabled:
+            await interaction.response.send_message(
+                "Catalog news is disabled — set **`CATALOG_NEWS_ENABLED=1`**.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        cog = self.bot.get_cog("CatalogNewsCog")
+        if cog is None:
+            from poke_pon_bot.services.catalog_news import _site_origin, run_catalog_news_sync
+
+            try:
+                result = await run_catalog_news_sync(
+                    self.bot,
+                    self.bot.async_session_factory,
+                    api_key=self._settings.tcg_api_key,
+                    site_origin=_site_origin(self._settings.web_frontend_url),
+                    lookback_days=self._settings.catalog_news_lookback_days,
+                    min_cards_existing_set=self._settings.catalog_news_min_cards_existing_set,
+                    max_sets_per_run=self._settings.catalog_news_max_sets_per_run,
+                    discord_channel_id=self._settings.catalog_news_channel_id,
+                    post_discord=self._settings.catalog_news_channel_id is not None,
+                )
+                lines = result.messages or ["Done."]
+            except SQLAlchemyError:
+                _LOG.exception("dev catalog_news_sync failed")
+                await interaction.followup.send("Database error — check logs.", ephemeral=True)
+                return
+        else:
+            try:
+                lines = await cog.run_once()
+            except SQLAlchemyError:
+                _LOG.exception("dev catalog_news_sync failed")
+                await interaction.followup.send("Database error — check logs.", ephemeral=True)
+                return
+        body = "\n".join(f"• {line}" for line in lines[:12])
+        await interaction.followup.send(body or "Catalog sync finished.", ephemeral=True)
+
+    @dev.command(
+        name="catalog_news_seed",
+        description="Insert a [TEST] catalog news item for website/Discord smoke tests (staging only).",
+    )
+    @app_commands.describe(
+        kind="Announcement type to simulate",
+        set_code="Real set code for Pokédex/Pack links (default sv2)",
+        post_to_discord="Post embed to CATALOG_NEWS_CHANNEL_ID when set",
+        clear_previous="Delete prior dev-seed test rows first",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="New set", value="new_set"),
+            app_commands.Choice(name="Cards added", value="cards_added"),
+        ]
+    )
+    async def dev_catalog_news_seed(
+        self,
+        interaction: discord.Interaction,
+        kind: app_commands.Choice[str],
+        set_code: str | None = None,
+        post_to_discord: bool = True,
+        clear_previous: bool = False,
+    ) -> None:
+        if not self._dev_ids:
+            await interaction.response.send_message(
+                "Developer commands are disabled until **`DEVELOPER_IDS`** is set.",
+                ephemeral=True,
+            )
+            return
+        if not self._is_dev(interaction.user.id):
+            await interaction.response.send_message(
+                "You don’t have access to **/dev** commands.", ephemeral=True
+            )
+            return
+        if not self._settings or self._settings.pokepon_runtime != "staging":
+            await interaction.response.send_message(
+                "**/dev catalog_news_seed** is staging-only — use the staging bot.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        from poke_pon_bot.models.catalog_announcement import (
+            ANNOUNCE_KIND_CARDS_ADDED,
+            ANNOUNCE_KIND_NEW_SET,
+        )
+        from poke_pon_bot.services.catalog_news import (
+            _site_origin,
+            seed_test_catalog_announcement,
+        )
+
+        kind_value = kind.value
+        if kind_value == "new_set":
+            announce_kind = ANNOUNCE_KIND_NEW_SET
+        elif kind_value == "cards_added":
+            announce_kind = ANNOUNCE_KIND_CARDS_ADDED
+        else:
+            await interaction.followup.send(f"Unknown kind: `{kind_value}`.", ephemeral=True)
+            return
+
+        channel_id = self._settings.catalog_news_channel_id
+        do_discord = bool(post_to_discord and channel_id is not None)
+
+        try:
+            result = await seed_test_catalog_announcement(
+                self.bot,
+                self.bot.async_session_factory,
+                site_origin=_site_origin(self._settings.web_frontend_url),
+                kind=announce_kind,
+                set_code=(set_code.strip().lower() if set_code else None),
+                post_discord=do_discord,
+                discord_channel_id=channel_id,
+                clear_previous=clear_previous,
+            )
+        except SQLAlchemyError:
+            _LOG.exception("dev catalog_news_seed failed")
+            await interaction.followup.send("Database error — check logs.", ephemeral=True)
+            return
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        lines = [
+            f"Created **[TEST]** announcement **#{result.announcement_id}** — {result.title}.",
+            f"API: `{self._settings.web_public_url.rstrip('/')}/api/news`",
+            f"Site: {_site_origin(self._settings.web_frontend_url)}/",
+        ]
+        if clear_previous and result.cleared_previous:
+            lines.append(f"Cleared **{result.cleared_previous}** prior dev-seed row(s).")
+        if post_to_discord and channel_id is None:
+            lines.append("Discord skipped — set **`CATALOG_NEWS_CHANNEL_ID`** in `.env.staging`.")
+        elif do_discord:
+            lines.append(
+                "Discord embed posted."
+                if result.discord_posted
+                else "Discord post failed — check channel ID and bot permissions."
+            )
+        elif not post_to_discord:
+            lines.append("Discord post skipped (`post_to_discord=false`).")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @dev.command(
         name="reset_tutorial",
         description="Clear tutorial progress (and tutorial packs) for testing.",
     )
