@@ -48,10 +48,8 @@ class TutorialCog(commands.Cog):
         )
         await send_current_step_dm(self.bot, uid)
         await ctx.send(
-            "Check your **DMs** from me — the tutorial continues there. "
-            "Use **slash commands** (`/cd`, `/colv`, …) when Discord offers them; "
-            "without `/` use the **`pp`** prefix (e.g. `ppcd`, `ppcolv`).\n\n"
-            "If DMs are closed, enable messages from server members and run **`/tutorial`** again.",
+            "Check your **DMs** — use the **`/`** commands shown in each step. "
+            "If nothing arrives, enable DMs from server members and try again.",
             ephemeral=True,
         )
 

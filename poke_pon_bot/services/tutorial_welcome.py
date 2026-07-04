@@ -31,11 +31,9 @@ def pre_member_channel_mentions(settings: Settings) -> str:
 def build_verify_panel_embed(settings: Settings) -> discord.Embed:
     mentions = pre_member_channel_mentions(settings)
     lines = [
-        "Welcome! Before you can see the rest of the server, complete a **5-step quest chain** in your DMs.",
+        "Complete the **5-step tutorial** in your DMs to unlock the server.",
         "",
-        "1. Press **Verify** below (or run **`/tutorial`**).",
-        "2. Finish each quest (balance → daily → card drop → collection → auctions/trades).",
-        "3. Earn up to **40 💎 Crystals** and receive the **Member** role when done.",
+        "Press **Verify** below (or run **`/tutorial`**) · up to **40 💎** + **Member** role.",
     ]
     if mentions:
         lines.extend(

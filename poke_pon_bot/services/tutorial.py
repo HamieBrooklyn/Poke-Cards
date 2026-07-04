@@ -23,7 +23,7 @@ STEP_BALANCE: Final = "balance"
 STEP_DAILY: Final = "daily"
 STEP_DROP: Final = "drop"
 STEP_COLLECTION: Final = "collection"
-STEP_BROWSE: Final = "browse"
+STEP_PACK: Final = "pack"
 STEP_DONE: Final = "done"
 
 QUEST_STEPS: tuple[str, ...] = (
@@ -31,7 +31,7 @@ QUEST_STEPS: tuple[str, ...] = (
     STEP_DAILY,
     STEP_DROP,
     STEP_COLLECTION,
-    STEP_BROWSE,
+    STEP_PACK,
 )
 
 ORDERED_STEPS: tuple[str, ...] = (STEP_WELCOME, *QUEST_STEPS, STEP_DONE)
@@ -41,12 +41,11 @@ STEP_CRYSTAL_REWARDS: dict[str, int] = {
     STEP_DAILY: 5,
     STEP_DROP: 10,
     STEP_COLLECTION: 10,
-    STEP_BROWSE: 10,
+    STEP_PACK: 10,
 }
 
 TOTAL_QUEST_CRYSTALS = sum(STEP_CRYSTAL_REWARDS.values())
 
-POKEPON_WEBSITE_URL = "https://pokepon.org"
 POKEPON_COLLECTION_URL = "https://pokepon.org/collection/"
 POKEPON_DECK_URL = "https://pokepon.org/deck/"
 
@@ -54,10 +53,11 @@ POKEPON_DECK_URL = "https://pokepon.org/deck/"
 _LEGACY_STEP_MAP: dict[str, str] = {
     "view_global": STEP_COLLECTION,
     "view_collection": STEP_COLLECTION,
-    "deck": STEP_BROWSE,
-    "evolve": STEP_BROWSE,
-    "pack": STEP_BROWSE,
-    "vote": STEP_BROWSE,
+    "browse": STEP_PACK,
+    "deck": STEP_PACK,
+    "evolve": STEP_PACK,
+    "pack": STEP_PACK,
+    "vote": STEP_PACK,
 }
 
 
@@ -70,103 +70,62 @@ class StepContent:
     crystal_reward: int = 0
 
 
-def _pp_chat_display(slash_or_chat: str) -> str:
-    parts = slash_or_chat.lstrip("/").strip().split()
-    if not parts:
-        return pp_alias("help")
-    head = pp_alias(parts[0])
-    if len(parts) > 1:
-        return f"{head} {' '.join(parts[1:])}"
-    return head
-
-
-def _cmd_help(slash: str, *, chat: str | None = None, extra: str = "") -> str:
-    chat_display = _pp_chat_display(chat or slash)
-    line = (
-        f"Use **{slash}** — open Discord's **`/`** menu for autocomplete. "
-        f"Without a slash, type **`{chat_display}`** (not the bare command name)."
-    )
-    return f"{line}\n{extra}" if extra else line
-
-
-def _reward_line(crystals: int) -> str:
+def _reward_suffix(crystals: int) -> str:
     if crystals <= 0:
         return ""
-    return f"\n\n**Reward:** {format_crystals(crystals)} when you complete this step."
+    return f" · {format_crystals(crystals)}"
 
 
 STEP_CONTENT: dict[str, StepContent] = {
     STEP_WELCOME: StepContent(
         title="Welcome to PokePon",
         body=(
-            "Complete **5 quick quests** in your DMs to unlock the server and earn up to "
-            f"**{format_crystals(TOTAL_QUEST_CRYSTALS)}**.\n\n"
-            "Quest order: **balance** → **daily** → **card drop** → **collection** → "
-            "**auctions/trades**.\n\n"
-            "In this **DM**, use **`/cd`**, **`/balance`**, etc. from Discord's **`/`** menu, "
-            "or type **`ppcd`**, **`ppbalance`**, **`ppdaily`** (the **`pp`** prefix is required in DMs). "
-            "You can also run the same commands in the staging server."
+            f"**5 quests** → Member role + up to **{format_crystals(TOTAL_QUEST_CRYSTALS)}**.\n"
+            "Use Discord's **`/`** menu for each step."
         ),
-        try_hint="Press **Start tutorial** below.",
+        try_hint="Press **Start tutorial**.",
     ),
     STEP_BALANCE: StepContent(
-        title="Quest 1 of 5 — Check your balance",
-        body=(
-            _cmd_help("/balance", chat="balance")
-            + "\n\nIn DMs: **`ppbal`** or **`ppbalance`** if slash autocomplete does not appear."
-            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_BALANCE])
-        ),
-        try_hint="Run the command above (your own balance).",
-        copy_example="ppbal",
+        title="1/5 — Balance",
+        body=f"Check your wallet{_reward_suffix(STEP_CRYSTAL_REWARDS[STEP_BALANCE])}.",
+        try_hint="",
+        copy_example="/balance",
         crystal_reward=STEP_CRYSTAL_REWARDS[STEP_BALANCE],
     ),
     STEP_DAILY: StepContent(
-        title="Quest 2 of 5 — Daily reward",
-        body=_cmd_help("/daily", chat="daily")
-        + "\n\nClaim free Pokedollars once per UTC day."
-        + _reward_line(STEP_CRYSTAL_REWARDS[STEP_DAILY]),
-        try_hint="Run **daily** once.",
-        copy_example=pp_alias("daily"),
+        title="2/5 — Daily",
+        body=f"Claim your daily reward{_reward_suffix(STEP_CRYSTAL_REWARDS[STEP_DAILY])}.",
+        try_hint="",
+        copy_example="/daily",
         crystal_reward=STEP_CRYSTAL_REWARDS[STEP_DAILY],
     ),
     STEP_DROP: StepContent(
-        title="Quest 3 of 5 — Card drop",
-        body=(
-            _cmd_help("/cd", chat="cd")
-            + "\n\nWorks in DMs or the server. Pick **one card** from the pack to keep."
-            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_DROP])
-        ),
-        try_hint="Run **cd**, claim a card — I will continue automatically.",
-        copy_example=pp_alias("cd"),
+        title="3/5 — Card drop",
+        body=f"Open a drop and pick a card{_reward_suffix(STEP_CRYSTAL_REWARDS[STEP_DROP])}.",
+        try_hint="I'll continue when you claim a card.",
+        copy_example="/cd",
         crystal_reward=STEP_CRYSTAL_REWARDS[STEP_DROP],
     ),
     STEP_COLLECTION: StepContent(
-        title="Quest 4 of 5 — Your collection",
-        body=(
-            _cmd_help("/colv", chat="colv")
-            + f"\n\nText list: `{pp_alias('coll')}`. "
-            f"One card with art: `{pp_alias('cv')} c` + your **Card ID** from **colv**."
-            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_COLLECTION])
-        ),
-        try_hint="Run **colv** or **coll** (or **cv c** with a Card ID).",
-        copy_example=pp_alias("colv"),
+        title="4/5 — Collection",
+        body=f"View your cards{_reward_suffix(STEP_CRYSTAL_REWARDS[STEP_COLLECTION])}.",
+        try_hint="",
+        copy_example="/colv",
         crystal_reward=STEP_CRYSTAL_REWARDS[STEP_COLLECTION],
     ),
-    STEP_BROWSE: StepContent(
-        title="Quest 5 of 5 — Browse trades & auctions",
+    STEP_PACK: StepContent(
+        title="5/5 — Open a pack",
         body=(
-            _cmd_help("/auction search", chat="auction search")
-            + f"\n\nChat shortcuts: **`ppas`** (auction search), **`ppac`** (create), **`ppab`** (bid). "
-            f"Or **`{pp_alias('trade')}`** / **`/trade offer`** (chat: **`pp to`**)."
-            + _reward_line(STEP_CRYSTAL_REWARDS[STEP_BROWSE])
+            f"A free pack is waiting for you{_reward_suffix(STEP_CRYSTAL_REWARDS[STEP_PACK])}. "
+            "Tap **Open** in the browser."
         ),
-        try_hint="Run **auction search** or **trade** once.",
-        copy_example="ppas",
-        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_BROWSE],
+        try_hint="I'll continue when the pack is opened.",
+        copy_example="/packcolv",
+        crystal_reward=STEP_CRYSTAL_REWARDS[STEP_PACK],
     ),
     STEP_DONE: StepContent(
-        title="Tutorial complete",
-        body="You are all set. Have fun collecting, trading, and dueling!",
+        title="Done!",
+        body="You're in. Have fun collecting!",
         try_hint="",
     ),
 }
@@ -318,11 +277,8 @@ def command_satisfies_step(step: str, ctx: commands.Context) -> bool:
             return True
         if "cv" in names and _arg_scope(ctx) == "c":
             return True
-    if step == STEP_BROWSE:
-        if qname.startswith("auction") or "auction" in names:
-            return True
-        if qname.startswith("trade") or names & {"trade", pp_alias("trade")}:
-            return True
+    if step == STEP_PACK:
+        return False
     return False
 
 
@@ -386,8 +342,8 @@ async def complete_tutorial(
         if row is None:
             return None
         if row.completed_at is None:
-            if row.current_step == STEP_BROWSE:
-                await _grant_step_crystals(session, row, STEP_BROWSE)
+            if normalize_tutorial_step(row.current_step) == STEP_PACK:
+                await _grant_step_crystals(session, row, STEP_PACK)
             row.current_step = STEP_DONE
             row.completed_at = datetime.now(UTC)
             await session.commit()
@@ -479,25 +435,14 @@ def _pre_member_channels_line(settings: Settings) -> str:
 
 
 def build_completion_embed(settings: Settings, *, crystals_earned: int) -> discord.Embed:
-    embed = discord.Embed(
-        title="Tutorial complete — you're in!",
+    return discord.Embed(
+        title="Tutorial complete",
         description=(
-            "You should now have the **Member** role and access to the full server.\n\n"
-            f"You earned **{format_crystals(crystals_earned)}** from the quest chain."
+            f"**Member** role unlocked · earned **{format_crystals(crystals_earned)}**.\n"
+            f"[Collection]({POKEPON_COLLECTION_URL}) · [Deck]({POKEPON_DECK_URL})"
         ),
         colour=discord.Colour.gold(),
     )
-    embed.add_field(
-        name="Handy links",
-        value=(
-            f"[Collection]({POKEPON_COLLECTION_URL}) · "
-            f"[Deck editor]({POKEPON_DECK_URL}) · "
-            f"[Shop]({POKEPON_WEBSITE_URL}/shop/)"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Thanks for playing PokePon!")
-    return embed
 
 
 def build_step_embed(step: str, settings: Settings) -> discord.Embed:
@@ -505,19 +450,15 @@ def build_step_embed(step: str, settings: Settings) -> discord.Embed:
     body = content.body
     if step == STEP_WELCOME:
         body += _pre_member_channels_line(settings)
+    if content.try_hint:
+        body = f"{body}\n\n_{content.try_hint}_"
     embed = discord.Embed(
         title=content.title,
         description=body,
         colour=discord.Colour.blurple(),
     )
     if content.copy_example:
-        embed.add_field(
-            name="Copy & paste",
-            value=f"`{content.copy_example}`",
-            inline=False,
-        )
-    if content.try_hint:
-        embed.add_field(name="Your turn", value=content.try_hint, inline=False)
+        embed.add_field(name="Run", value=f"`{content.copy_example}`", inline=False)
     idx = quest_step_index(step)
     if idx is not None:
         embed.set_footer(text=f"Quest {idx} of {len(QUEST_STEPS)} · up to {format_crystals(TOTAL_QUEST_CRYSTALS)} total")
@@ -560,6 +501,34 @@ class TutorialStartButton(discord.ui.Button):
         await advance_and_notify(self._bot, self._owner_id)
 
 
+async def ensure_tutorial_pack_granted(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    discord_user_id: int,
+) -> None:
+    from poke_pon_bot.models.pack_instance import UserPackInstance
+    from poke_pon_bot.services.drops import DropService
+    from poke_pon_bot.services.packs import PackService
+    from sqlalchemy import select
+
+    async with session_factory() as session:
+        existing = await session.scalar(
+            select(UserPackInstance.id).where(
+                UserPackInstance.discord_user_id == discord_user_id,
+                UserPackInstance.source == "tutorial",
+                UserPackInstance.opened_at.is_(None),
+            )
+        )
+        if existing is not None:
+            return
+        await PackService().grant_tutorial_pack(
+            session,
+            DropService(),
+            discord_user_id=discord_user_id,
+        )
+        await session.commit()
+
+
 async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
     settings: Settings = bot.settings
     crystals_earned = 0
@@ -571,6 +540,11 @@ async def send_current_step_dm(bot: commands.Bot, discord_user_id: int) -> None:
         crystals_earned = int(row.crystals_earned or 0)
         if row.completed_at is not None:
             step = STEP_DONE
+    if step == STEP_PACK:
+        await ensure_tutorial_pack_granted(
+            bot.async_session_factory,
+            discord_user_id=discord_user_id,
+        )
 
     try:
         user = await bot.fetch_user(discord_user_id)
@@ -641,7 +615,7 @@ async def handle_command_for_tutorial(bot: commands.Bot, ctx: commands.Context) 
         step = normalize_tutorial_step(row.current_step)
     if step == STEP_WELCOME:
         return
-    if step == STEP_DROP:
+    if step in (STEP_DROP, STEP_PACK):
         return
     if not command_satisfies_step(step, ctx):
         return
@@ -654,6 +628,16 @@ async def notify_drop_claimed_for_tutorial(bot: commands.Bot, discord_user_id: i
         bot.async_session_factory,
         discord_user_id=discord_user_id,
         force_from_step=STEP_DROP,
+    ):
+        await _after_step_advanced(bot, discord_user_id)
+
+
+async def notify_pack_opened_for_tutorial(bot: commands.Bot, discord_user_id: int) -> None:
+    """Advance the pack quest only after the user opens a booster pack."""
+    if await try_advance_step(
+        bot.async_session_factory,
+        discord_user_id=discord_user_id,
+        force_from_step=STEP_PACK,
     ):
         await _after_step_advanced(bot, discord_user_id)
 

@@ -1310,6 +1310,13 @@ class PacksCog(commands.Cog):
         view.message = msg
         view.bind_card_id_reply(await _reply_card_id_below(msg, first_inst.public_id))
 
+        try:
+            from poke_pon_bot.services.tutorial import notify_pack_opened_for_tutorial
+
+            await notify_pack_opened_for_tutorial(self.bot, interaction.user.id)
+        except Exception:
+            _LOG.exception("tutorial pack-open hook failed for user %s", interaction.user.id)
+
     # ----------------------------------------------------------------------- /packd
 
     @commands.hybrid_command(

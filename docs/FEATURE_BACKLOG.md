@@ -34,7 +34,7 @@ Ideas that fit Poké Pon as a Discord-first TCG economy with a growing web app. 
 |---|---------|--------|-------|
 | 9 | **Guild / server milestones** | shipped | Per-server pack + trade stats, milestone announcements, `/servermilestones`, web **Server** tab + milestone bar, optional top trader/collector roles. |
 | 10 | **Referrals 2.0** | done | `/referral` on Discord; first `/cd` rewards inviter + invitee; milestone **25** 💎 at 10 packs (cap 3). Profile + home copy updated. |
-| 11 | **Tutorial quest chain** | done | 5-step DM quest: balance → daily → drop → collection → auction/trade browse. **40** 💎 total; Member role on completion. Legacy steps auto-mapped. |
+| 11 | **Tutorial quest chain** | done | 5-step DM quest: balance → daily → drop → collection → open pack. **40** 💎 total; Member role on completion. Legacy steps auto-mapped. |
 
 ---
 
