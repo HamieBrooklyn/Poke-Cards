@@ -53,11 +53,17 @@ Verify: `curl -s http://localhost:8080/api/events` should return JSON.
 
 Exposes `localhost:8080` as `https://api.pokepon.org` so the GitHub Pages website can reach the bot API.
 
+Registered as launchd service `org.pokepon.cloudflared` (`~/Library/LaunchAgents/org.pokepon.cloudflared.plist`) with `RunAtLoad` + `KeepAlive` — should start on login and restart if it dies.
+
 ```bash
 # Check if it's running
 pgrep -lf cloudflared
+launchctl list | grep cloudflared
 
-# If not, start it (background)
+# If not loaded
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.pokepon.cloudflared.plist
+
+# Manual fallback (background)
 nohup cloudflared tunnel run pokepon-api >> /Users/hamie/Developer/Poke-Cards/logs/cloudflared.log 2>&1 &
 ```
 

@@ -2,6 +2,7 @@
 
 from poke_pon_bot.models.auction import CardAuction
 from poke_pon_bot.models.card import Card
+from poke_pon_bot.models.card_market import CardInvestment, CardMarketHistory, CardMarketQuote
 from poke_pon_bot.models.catalog_announcement import CatalogAnnouncement
 from poke_pon_bot.models.card_series import CardSeries, CardSeriesSet
 from poke_pon_bot.models.combat_deck import UserCombatDeck
@@ -20,6 +21,9 @@ from poke_pon_bot.models.wishlist import UserWishlist
 __all__ = [
     "CardAuction",
     "Card",
+    "CardInvestment",
+    "CardMarketHistory",
+    "CardMarketQuote",
     "CatalogAnnouncement",
     "CardSeries",
     "CardSeriesSet",

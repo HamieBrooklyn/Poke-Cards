@@ -175,6 +175,11 @@ async def run_collection_sell(
     rarity = await session.get(RarityClass, card.rarity_class_id)
     if rarity is None:
         return CollectionSellOutcome(ok=False, error="Rarity data missing — try again after a sync.")
+    from poke_pon_bot.services.grading import rarity_for_graded_instance
+
+    rarity = await rarity_for_graded_instance(session, card, inst, printed=rarity)
+    if rarity is None:
+        return CollectionSellOutcome(ok=False, error="Rarity data missing — try again after a sync.")
 
     blocked = await collection_sell_block_reason(session, discord_user_id=discord_user_id, instance_id=instance_id)
     if blocked is not None:

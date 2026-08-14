@@ -515,6 +515,30 @@ class CombatTurnView(discord.ui.View):
             button.callback = btn_cb
             self.add_item(button)
 
+    async def on_timeout(self) -> None:
+        combat = self.cog._combats.pop(self.combat_id, None)
+        if combat is not None and combat.bet > 0:
+            try:
+                async with self.cog.bot.async_session_factory() as session:
+                    await self.cog._wallet.try_credit(session, combat.challenger_id, combat.bet)
+                    await self.cog._wallet.try_credit(session, combat.opponent_id, combat.bet)
+                    await session.commit()
+            except Exception:
+                _LOG.exception("duel timeout refund failed combat=%s", self.combat_id)
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        msg = getattr(self, "message", None)
+        if msg:
+            try:
+                await msg.edit(
+                    content="Duel **timed out** — stakes returned. Challenge again with **`/duel challenge`**.",
+                    embed=None,
+                    view=self,
+                )
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
 
 class PveTurnView(discord.ui.View):
     def __init__(self, cog: "DuelCog", combat_id: str, *, user_id: int) -> None:
@@ -559,29 +583,22 @@ class PveTurnView(discord.ui.View):
             button.callback = btn_cb
             self.add_item(button)
 
-
-class NextFightView(discord.ui.View):
-    """Post-fight view with a 'Next Fight' button to instantly re-queue /pd."""
-
-    def __init__(self, cog: "DuelCog", user_id: int) -> None:
-        super().__init__(timeout=120.0)
-        self.cog = cog
-        self.user_id = user_id
-
-    @discord.ui.button(label="Next Fight", style=discord.ButtonStyle.success, emoji="⚔️")
-    async def next_fight(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This isn't your fight.", ephemeral=True)
-            return
-        self.stop()
-        button.disabled = True
-        await interaction.response.defer()
-        await self.cog._start_pve_from_interaction(interaction, edit_message=interaction.message)
-
     async def on_timeout(self) -> None:
+        self.cog._combats.pop(self.combat_id, None)
+        self.cog._pve_meta.pop(self.combat_id, None)
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
+        msg = getattr(self, "message", None)
+        if msg:
+            try:
+                await msg.edit(
+                    content="Wild fight **ended** (timed out). Run **`/pd`** or **`pcpd`** to spawn another.",
+                    embed=None,
+                    view=self,
+                )
+            except (discord.HTTPException, discord.NotFound):
+                pass
 
 
 class DeckEditView(discord.ui.View):
@@ -800,14 +817,30 @@ class DuelCog(commands.Cog):
         except (discord.HTTPException, discord.NotFound):
             pass
 
-    def _user_busy(self, user_id: int) -> bool:
+    @staticmethod
+    def _is_pve_combat(combat: DuelRuntime) -> bool:
+        return combat.opponent_id == 0 or str(combat.lobby_id).startswith("pd:")
+
+    def _pvp_busy(self, user_id: int) -> bool:
         for l in self._lobbies.values():
             if user_id in (l.challenger_id, l.opponent_id):
                 return True
         for c in self._combats.values():
+            if self._is_pve_combat(c):
+                continue
             if user_id in (c.challenger_id, c.opponent_id):
                 return True
         return False
+
+    def _release_pve_for_user(self, user_id: int) -> None:
+        stale = [
+            cid
+            for cid, c in self._combats.items()
+            if self._is_pve_combat(c) and c.challenger_id == user_id
+        ]
+        for cid in stale:
+            self._combats.pop(cid, None)
+            self._pve_meta.pop(cid, None)
 
     async def _start_combat_from_lobby(self, interaction: discord.Interaction, lobby: DuelLobby) -> None:
         assert lobby.message_id is not None
@@ -1020,6 +1053,8 @@ class DuelCog(commands.Cog):
         elif ctx is not None:
             uid = ctx.author.id
         else:
+            self._combats.pop(combat_id, None)
+            self._pve_meta.pop(combat_id, None)
             _LOG.error("_finish_pve called with neither interaction nor ctx")
             return
         try:
@@ -1101,7 +1136,9 @@ class DuelCog(commands.Cog):
         if win_file is not None:
             embed.set_image(url="attachment://winner.png")
 
-        next_view = NextFightView(self, uid)
+        embed.description = (embed.description or "") + (
+            "\n\nRun **`/pd`** or **`pcpd`** to spawn another wild fight."
+        )
 
         # Slash `/pd` uses defer → ``interaction.message`` is usually ``None``; component turns use the battle msg.
         # Prefix **`pcpd`** / **`pd`** passes ``ctx`` so we **send** the outcome when there is no webhook to edit.
@@ -1109,155 +1146,34 @@ class DuelCog(commands.Cog):
             if interaction is not None:
                 if interaction.message is not None:
                     if win_file is not None:
-                        await interaction.message.edit(embed=embed, view=next_view, attachments=[win_file])
+                        await interaction.message.edit(embed=embed, view=None, attachments=[win_file])
                     else:
-                        await interaction.message.edit(embed=embed, view=next_view)
+                        await interaction.message.edit(embed=embed, view=None)
                 else:
                     if win_file is not None:
-                        await interaction.edit_original_response(embed=embed, view=next_view, attachments=[win_file])
+                        await interaction.edit_original_response(embed=embed, view=None, attachments=[win_file])
                     else:
-                        await interaction.edit_original_response(embed=embed, view=next_view)
+                        await interaction.edit_original_response(embed=embed, view=None)
             elif ctx is not None:
                 if win_file is not None:
-                    await ctx.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
+                    await ctx.send(embed=embed, file=win_file, ephemeral=False)
                 else:
-                    await ctx.send(embed=embed, view=next_view, ephemeral=False)
+                    await ctx.send(embed=embed, ephemeral=False)
         except discord.HTTPException:
             _LOG.exception("pve finish: edit failed (interaction_message=%s)", interaction and interaction.message is not None)
             try:
                 if interaction is not None:
                     if win_file is not None:
-                        await interaction.followup.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
+                        await interaction.followup.send(embed=embed, file=win_file, ephemeral=False)
                     else:
-                        await interaction.followup.send(embed=embed, view=next_view, ephemeral=False)
+                        await interaction.followup.send(embed=embed, ephemeral=False)
                 elif ctx is not None:
                     if win_file is not None:
-                        await ctx.send(embed=embed, file=win_file, view=next_view, ephemeral=False)
+                        await ctx.send(embed=embed, file=win_file, ephemeral=False)
                     else:
-                        await ctx.send(embed=embed, view=next_view, ephemeral=False)
+                        await ctx.send(embed=embed, ephemeral=False)
             except discord.HTTPException:
                 _LOG.exception("pve finish followup also failed")
-
-    async def _start_pve_from_interaction(
-        self,
-        interaction: discord.Interaction,
-        *,
-        edit_message: discord.Message | None = None,
-    ) -> None:
-        """Start a new PvE fight triggered by the 'Next Fight' button.
-
-        When *edit_message* is provided the new battle replaces that message
-        in-place (no clutter).  Falls back to ``followup.send`` on failure.
-        """
-        uid = interaction.user.id
-        drop = DropService(rng=self._rng)
-
-        if self._user_busy(uid):
-            await interaction.followup.send("You're already in a duel/battle.", ephemeral=True)
-            return
-
-        try:
-            async with self.bot.async_session_factory() as session:
-                ids = await get_saved_instance_ids(session, uid)
-                if not ids:
-                    await interaction.followup.send(
-                        "You need a combat deck first — use **`/deck edit`**.", ephemeral=True
-                    )
-                    return
-                pairs = await load_fighters_ordered(session, uid, ids)
-                if isinstance(pairs, str):
-                    await interaction.followup.send(pairs, ephemeral=True)
-                    return
-                lead_inst, lead_card = pairs[0]
-                player_line = [Fighter.from_instance(lead_inst, lead_card)]
-                wild_card = await drop.draw_single_pokemon(session, drop_table_code="default")
-        except SQLAlchemyError:
-            _LOG.exception("next fight DB error for user %s", uid)
-            await interaction.followup.send("Database error — try again.", ephemeral=True)
-            return
-        except (LookupError, RuntimeError) as exc:
-            _LOG.exception("next fight wild roll failed for user %s", uid)
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-
-        combat_id = f"pd:{uid}:{secrets.token_hex(4)}"
-        try:
-            wild = _fighter_from_catalog_card(wild_card)
-            combat = DuelRuntime.from_lineups(
-                lobby_id=combat_id,
-                challenger_id=uid,
-                opponent_id=0,
-                bet=0,
-                challenger_lineup=player_line,
-                opponent_lineup=[wild],
-                rng=self._rng,
-            )
-            self._combats[combat_id] = combat
-            self._pve_meta[combat_id] = {
-                "wild_name": wild_card.name,
-                "wild_image": wild_card.image_large_url or wild_card.image_small_url,
-                "wild_rarity_class_id": int(wild_card.rarity_class_id),
-                "wild_hp": int(parse_hp(wild_card.hp)),
-                "wild_max_dmg": _wild_max_attack_damage(wild_card),
-            }
-
-            winner = await self._pve_bot_step(combat_id)
-            if winner is not None:
-                await self._finish_pve(interaction, combat_id, winner, ctx=None)
-                return
-
-            meta = self._pve_meta.get(combat_id) or {}
-            embeds = _pve_embeds(
-                combat,
-                wild_name=str(meta.get("wild_name") or "Wild"),
-                wild_image=meta.get("wild_image") if isinstance(meta.get("wild_image"), str) else None,
-                user_id=uid,
-            )
-            view = PveTurnView(self, combat_id, user_id=uid)
-            file = await _render_vs_collage_file(
-                left_name=combat.challenger_lineup[0].name,
-                left_url=combat.challenger_lineup[0].image_large or combat.challenger_lineup[0].image_small,
-                right_name=str(meta.get("wild_name") or "Wild"),
-                right_url=(meta.get("wild_image") if isinstance(meta.get("wild_image"), str) else None)
-                or (combat.opponent_lineup[0].image_large or combat.opponent_lineup[0].image_small),
-            )
-            if embeds is None:
-                self._combats.pop(combat_id, None)
-                self._pve_meta.pop(combat_id, None)
-                await interaction.followup.send(
-                    "Could not build battle view — try **`/pd`** again.", ephemeral=True
-                )
-                return
-
-            sent = False
-            if edit_message is not None:
-                try:
-                    if file is not None:
-                        embeds[0].set_image(url="attachment://vs.png")
-                        await edit_message.edit(embeds=embeds, view=view, attachments=[file])
-                    else:
-                        await edit_message.edit(embeds=embeds, view=view, attachments=[])
-                    sent = True
-                except discord.HTTPException:
-                    _LOG.debug("edit_message failed, falling back to followup.send")
-
-            if not sent:
-                if file is not None:
-                    embeds[0].set_image(url="attachment://vs.png")
-                    await interaction.followup.send(embeds=embeds, view=view, file=file, ephemeral=False)
-                else:
-                    await interaction.followup.send(embeds=embeds, view=view, ephemeral=False)
-        except Exception:
-            _LOG.exception("next fight runtime error for user %s", uid)
-            self._combats.pop(combat_id, None)
-            self._pve_meta.pop(combat_id, None)
-            try:
-                await interaction.followup.send(
-                    "Something went wrong during Poke-duel. Try **`/pd`** again.",
-                    ephemeral=True,
-                )
-            except discord.HTTPException:
-                pass
 
     async def _resolve_pve_attack(self, interaction: discord.Interaction, combat_id: str, attack_index: int) -> None:
         combat = self._combats.get(combat_id)
@@ -1351,9 +1267,10 @@ class DuelCog(commands.Cog):
         uid = ctx.author.id
         drop = DropService(rng=self._rng)
 
-        if self._user_busy(uid):
-            await ctx.send("You’re already in a duel/battle.", ephemeral=False)
+        if self._pvp_busy(uid):
+            await ctx.send("You’re already in a PvP duel or challenge.", ephemeral=False)
             return
+        self._release_pve_for_user(uid)
 
         try:
             async with self.bot.async_session_factory() as session:
@@ -1466,8 +1383,8 @@ class DuelCog(commands.Cog):
             await ctx.send("Pick a human opponent.", ephemeral=_hybrid_ephemeral(ctx))
             return
         uid = ctx.author.id
-        if self._user_busy(uid) or self._user_busy(opponent.id):
-            await ctx.send("You or your opponent is already in a duel or challenge.", ephemeral=_hybrid_ephemeral(ctx))
+        if self._pvp_busy(uid) or self._pvp_busy(opponent.id):
+            await ctx.send("You or your opponent is already in a PvP duel or challenge.", ephemeral=_hybrid_ephemeral(ctx))
             return
 
         lid = secrets.token_hex(4)

@@ -1,0 +1,102 @@
+---
+description: Push staging by default; production only when the user asks
+alwaysApply: true
+---
+
+# Staging before production (mandatory)
+
+Ship to **staging** by default. **Production** only when the user explicitly asks (e.g. “push to production”, “ship to prod”, “promote to live”).
+
+## Stacks
+
+| | Staging (default) | Production (user request only) |
+|---|---|---|
+| Env | `.env.staging` | `.env` |
+| Port | 8081 | 8080 |
+| API | `https://api-staging.pokepon.org` | `https://api.pokepon.org` |
+| DB | `data/poke_cards_staging.db` | `data/poke_cards.db` |
+| Bot deploy | `scripts/start-bot-staging.sh` / `deploy-mac-staging.sh` | `scripts/deploy-mac.sh` |
+| Website | **https://staging.pokepon.org** | **https://pokepon.org** |
+| Website push | `hamiebrooklyn.github.io` → `bash scripts/deploy-website-staging.sh` | `bash scripts/promote-website-to-production.sh` |
+
+Setup: `docs/STAGING.md` · Website: `hamiebrooklyn.github.io/docs/WEBSITE_STAGING.md`
+
+## Agent workflow (every feature / fix)
+
+1. **Code** in this repo (and `hamiebrooklyn.github.io` if the site UI changes).
+2. **Restart staging bot** (mandatory after bot/API changes — you run it in the background; do not ask the user):
+   ```bash
+   cd ~/Developer/Poke-Cards
+   bash scripts/start-bot-staging.sh
+   ```
+   - Runs `alembic upgrade head`, restarts on `:8081`.
+   - Uncommitted bot work: `bash scripts/deploy-mac-staging.sh --no-pull`.
+   - **Never** end a bot/API feature turn without restarting staging.
+3. **Push to the staging website** when HTML/JS/CSS changed:
+   ```bash
+   cd ~/Documents/GitHub/hamiebrooklyn.github.io
+   git checkout staging
+   bash scripts/deploy-website-staging.sh
+   ```
+4. **Report staging ready** — site **https://staging.pokepon.org**, API on **api-staging**.
+5. **Stop** — do not promote to production unless the user asked in that message.
+
+## Why production can pick up staging work (read this)
+
+Production and staging **share one codebase folder** (`~/Developer/Poke-Cards`). The production **launchd** job runs `python -m poke_pon_bot` from that folder — any local file edit is what production loads on its **next restart**.
+
+- **Schema:** `deploy-mac.sh` and the bot’s startup auto-migration run Alembic against **production** `data/poke_cards.db` unless you explicitly source `.env.staging`.
+- **Behavior:** New features must be gated until promotion. Notification/inbox code uses `POKEPON_RUNTIME=staging` or `WEB_NOTIFICATIONS_ENABLED=1` (set the latter in `.env` only when the user asks to ship notifications to prod).
+
+**Never** run bare `alembic upgrade head` without sourcing the right env file.
+
+## Push to production (only when the user says so)
+
+**Website** (hamiebrooklyn.github.io):
+```bash
+bash scripts/promote-website-to-production.sh
+```
+
+**Bot** (this repo):
+```bash
+bash scripts/deploy-mac.sh
+```
+
+When promoting notification features, add to production `.env`:
+```
+WEB_NOTIFICATIONS_ENABLED=1
+```
+Then run `deploy-mac.sh` (or restart the production launchd job).
+
+## Forbidden without user asking for production
+
+- `deploy-mac.sh` or production bot restart for feature work
+- `promote-website-to-production.sh` or `git push origin main` on the website repo
+- Claiming the feature is “live on pokepon.org” when only staging was pushed
+
+## Allowed without staging
+
+- Comments, docs-only, no runtime change
+- Emergency production hotfix **only** if the user explicitly says skip staging — note what was not tested
+
+## Do not
+
+- Point `.env.staging` at production `DATABASE_URL` or `DISCORD_TOKEN`
+- Use `stop-bot.sh` for staging (port 8080 = production only)
+- Tell the user to restart the staging bot — use `scripts/start-bot-staging.sh` yourself
+
+## Keep staging running
+
+Prefer the launchd service (survives logout / reboot):
+
+```bash
+bash scripts/install-bot-staging-service.sh
+```
+
+Or one-off:
+
+```bash
+bash scripts/start-bot-staging.sh
+```
+
+Tunnel: `api-staging.pokepon.org` → `:8081` in `~/.cloudflared/config.yml`.

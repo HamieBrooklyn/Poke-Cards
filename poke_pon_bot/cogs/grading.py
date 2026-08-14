@@ -20,6 +20,7 @@ from poke_pon_bot.cogs.gacha import (
 )
 from poke_pon_bot.services.collection_sell import collection_sell_block_reason
 from poke_pon_bot.services.crystals import CrystalsService, format_crystals
+from poke_pon_bot.services.grade_enchantments import enchantment_or_default
 from poke_pon_bot.services.grading import (
     GRADE_CRYSTAL_COST,
     build_grade_preview,
@@ -45,6 +46,19 @@ def _grading_embed_note(preview) -> str:
             0,
             f"**Grade:** **{preview.grade}** — **{preview.grade_label}**",
         )
+        ench = enchantment_or_default(preview.enchantment_code)
+        bits.append(f"**Enchantment:** **{ench.name}**")
+        if preview.rarity_bump > 0 and preview.effective_rarity_name:
+            printed = preview.printed_rarity_name or "printed"
+            if preview.effective_rarity_name != printed:
+                bits.append(
+                    f"**Rarity:** {printed} → **{preview.effective_rarity_name}**"
+                )
+            else:
+                bits.append(
+                    f"**Rarity:** **{preview.effective_rarity_name}** "
+                    f"(already top of ladder)"
+                )
     else:
         bits.insert(0, "**Not graded yet** — roll to seal this copy in a slab.")
     if preview.has_grade and preview.grade is not None:
@@ -113,6 +127,8 @@ class GradeCardView(_CardIdReplyBinding, discord.ui.View):
             inst,
             card,
             rank_note=_grading_embed_note(preview),
+            display_rarity=preview.effective_rarity_name,
+            printed_rarity=preview.printed_rarity_name,
         )
         view = GradeCardView(
             self._cog,
@@ -130,6 +146,8 @@ class GradeCardView(_CardIdReplyBinding, discord.ui.View):
                 copy_index=preview.copy_index.copy_index,
                 total_copies=preview.copy_index.total_copies,
                 cert_suffix=inst.public_id,
+                enchantment_code=getattr(inst, "grade_enchantment", None),
+                rarity_name=preview.effective_rarity_name,
             )
             if png is not None:
                 embed.set_image(url="attachment://slab.png")
@@ -177,8 +195,17 @@ class GradeCardView(_CardIdReplyBinding, discord.ui.View):
 
         note = (
             f"**New grade:** **{outcome.grade}** — **{outcome.grade_label}**\n"
-            f"Balance: {format_crystals(outcome.new_crystal_balance or 0)}"
+            f"**Enchantment:** **{outcome.enchantment_name}**"
         )
+        if outcome.rarity_bump > 0 and outcome.effective_rarity_name:
+            printed = outcome.printed_rarity_name or "printed"
+            if outcome.effective_rarity_name != printed:
+                note += (
+                    f"\n**Rarity:** {printed} → **{outcome.effective_rarity_name}**"
+                )
+            else:
+                note += f"\n**Rarity:** **{outcome.effective_rarity_name}**"
+        note += f"\nBalance: {format_crystals(outcome.new_crystal_balance or 0)}"
         await interaction.followup.send(note, ephemeral=True)
         await self._refresh_message(interaction)
 
@@ -273,6 +300,8 @@ class GradingCog(commands.Cog):
             inst,
             card,
             rank_note=_grading_embed_note(preview),
+            display_rarity=preview.effective_rarity_name,
+            printed_rarity=preview.printed_rarity_name,
         )
         view = GradeCardView(
             self,
@@ -290,6 +319,8 @@ class GradingCog(commands.Cog):
                 copy_index=preview.copy_index.copy_index,
                 total_copies=preview.copy_index.total_copies,
                 cert_suffix=inst.public_id,
+                enchantment_code=getattr(inst, "grade_enchantment", None),
+                rarity_name=preview.effective_rarity_name,
             )
             if png is not None:
                 embed.set_image(url="attachment://slab.png")

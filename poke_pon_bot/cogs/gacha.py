@@ -118,6 +118,21 @@ async def _edit_flip_message(
         await interaction.response.edit_message(**kwargs)
 
 
+def _patch_embed_rarity(
+    embed: discord.Embed,
+    printed_name: str | None,
+    effective_name: str | None,
+) -> None:
+    """Swap the Rarity field to graded/effective name when it differs from printed."""
+    printed = (printed_name or "—").strip() or "—"
+    display = (effective_name or printed).strip() or printed
+    value = f"**{display}**\nPrinted: {printed}" if display != printed else display
+    for i, field in enumerate(embed.fields):
+        if field.name in ("Rarity", "Printed rarity", "Graded rarity"):
+            embed.set_field_at(i, name="Rarity", value=value, inline=True)
+            return
+
+
 async def _graded_slab_files(
     session: AsyncSession,
     embed: discord.Embed,
@@ -125,6 +140,10 @@ async def _graded_slab_files(
     card: Card,
 ) -> list[discord.File]:
     """Replace embed art with a PSA-style slab when this copy is graded."""
+    from poke_pon_bot.services.grading import rarity_name_pair
+
+    printed_name, effective_name = await rarity_name_pair(session, card, inst)
+    _patch_embed_rarity(embed, printed_name, effective_name)
     if getattr(inst, "grade", None) is None:
         return []
     from poke_pon_bot.services.grading import build_grade_preview
@@ -137,6 +156,8 @@ async def _graded_slab_files(
         copy_index=preview.copy_index.copy_index,
         total_copies=preview.copy_index.total_copies,
         cert_suffix=inst.public_id,
+        enchantment_code=getattr(inst, "grade_enchantment", None),
+        rarity_name=effective_name,
     )
     if png is None:
         return []
@@ -374,7 +395,7 @@ def _coll_one_line(rank: int, inst: UserCardInstance, card: Card) -> str:
     cn = _truncate(card.collector_number, 10)
     pid = compact_public_id_for_line(inst.public_id)
     grade = int(inst.grade) if getattr(inst, "grade", None) is not None else None
-    return f"`{rank}.` **{nm}** `{sc}` #{cn} `{pid}`{format_grade_slab_badge(grade)}"
+    return f"`{rank}.` **{nm}** `{sc}` #{cn} `{pid}`{format_grade_slab_badge(grade, enchantment_code=getattr(inst, 'grade_enchantment', None))}"
 
 
 def _coll_pages(lines: list[str]) -> list[str]:
@@ -488,6 +509,8 @@ def _collection_view_embed(
     rank_note: str | None = None,
     collection_owner_id: int | None = None,
     viewer_id: int | None = None,
+    display_rarity: str | None = None,
+    printed_rarity: str | None = None,
 ) -> discord.Embed:
     """Rich embed for one owned card (catalog + when you saved it)."""
     e = discord.Embed(title=card.name)
@@ -509,11 +532,13 @@ def _collection_view_embed(
 
     e.add_field(name="Set", value=f"{card.set_name}\n`{card.set_code}`", inline=True)
     e.add_field(name="Card #", value=f"`{card.collector_number}`", inline=True)
-    e.add_field(
-        name="Printed rarity",
-        value=card.tcg_rarity or "—",
-        inline=True,
-    )
+    printed = (printed_rarity or card.tcg_rarity or "—").strip() or "—"
+    display = (display_rarity or printed).strip() or printed
+    if display != printed:
+        rarity_value = f"**{display}**\nPrinted: {printed}"
+    else:
+        rarity_value = display
+    e.add_field(name="Rarity", value=rarity_value, inline=True)
 
     if card.dex_numbers:
         dex_txt = ", ".join(str(n) for n in card.dex_numbers)
@@ -538,6 +563,7 @@ def _collection_view_embed(
         )
     grade_val = getattr(inst, "grade", None)
     if grade_val is not None:
+        from poke_pon_bot.services.grade_enchantments import enchantment_or_default
         from poke_pon_bot.services.grading import grade_label
 
         e.add_field(
@@ -545,6 +571,8 @@ def _collection_view_embed(
             value=f"**{grade_val}** — **{grade_label(int(grade_val))}**",
             inline=True,
         )
+        ench = enchantment_or_default(getattr(inst, "grade_enchantment", None))
+        e.add_field(name="Enchantment", value=ench.name, inline=True)
 
     from poke_pon_bot.services.card_roles import format_craft_uses_discord
 
@@ -1702,38 +1730,57 @@ class PackPickView(discord.ui.View):
         uid = interaction.user.id
         card = self._cards[idx] if 0 <= idx < len(self._cards) else None
 
-        # ---- Phase 1: validate + reserve the slot (under lock, no I/O). ----
+        # ---- Phase 1: validate + reserve the slot (under lock, no Discord I/O). ----
+        reject: str | None = None
         async with self._lock:
             if self._finished:
-                await self._reply_ephemeral(interaction, "This pack is already finished.")
-                return
-            now = int(time.time())
-            if now >= self._deadline_unix:
-                await self._reply_ephemeral(interaction, "This pack has expired.")
-                return
-            if interaction.user.bot:
-                await self._reply_ephemeral(interaction, "Bots can’t claim cards.")
-                return
-            if card is None:
-                await self._reply_ephemeral(interaction, "That slot no longer exists.")
-                return
-            grabs = self._user_grab_count(uid)
-            if grabs >= self._max_grabs_per_user:
-                limit = self._max_grabs_per_user
-                msg = (
-                    "You already claimed **one** card from this pack."
-                    if limit == 1
-                    else f"You already claimed **{limit}** card(s) from this pack "
-                    "(your limit for this drop)."
-                )
-                await self._reply_ephemeral(interaction, msg)
-                return
-            if idx in self._slot_claimer:
-                await self._reply_ephemeral(interaction, "That slot was already taken.")
-                return
-            # Tentative reservation — releases the lock immediately so the next
-            # clicker doesn't queue behind our DB write + Discord round-trip.
-            self._slot_claimer[idx] = uid
+                reject = "This pack is already finished."
+            elif int(time.time()) >= self._deadline_unix:
+                reject = "This pack has expired."
+            elif interaction.user.bot:
+                reject = "Bots can’t claim cards."
+            elif card is None:
+                reject = "That slot no longer exists."
+            else:
+                grabs = self._user_grab_count(uid)
+                if grabs >= self._max_grabs_per_user:
+                    limit = self._max_grabs_per_user
+                    reject = (
+                        "You already claimed **one** card from this pack."
+                        if limit == 1
+                        else f"You already claimed **{limit}** card(s) from this pack "
+                        "(your limit for this drop)."
+                    )
+                elif idx in self._slot_claimer:
+                    reject = "That slot was already taken."
+                else:
+                    # Tentative reservation — release lock before Discord/DB I/O.
+                    self._slot_claimer[idx] = uid
+
+        if reject is not None:
+            await self._reply_ephemeral(interaction, reject)
+            return
+
+        # Ack within Discord's ~3s window before DB / mission / chase writes.
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except discord.NotFound:
+            _LOG.warning(
+                "claim interaction already expired user=%s slot=%s; releasing reservation",
+                uid,
+                idx,
+            )
+            async with self._lock:
+                if self._slot_claimer.get(idx) == uid:
+                    self._slot_claimer.pop(idx, None)
+            return
+        except discord.HTTPException:
+            _LOG.exception("claim defer failed user=%s slot=%s", uid, idx)
+            async with self._lock:
+                if self._slot_claimer.get(idx) == uid:
+                    self._slot_claimer.pop(idx, None)
+            return
 
         # ---- Phase 2: DB work outside the lock. ----
         drop_result = None
@@ -1779,7 +1826,7 @@ class PackPickView(discord.ui.View):
             )
             return
 
-        # ---- Phase 3: finalize view + respond to the interaction. ----
+        # ---- Phase 3: finalize view + update the deferred interaction. ----
         async with self._lock:
             self._slot_pid[idx] = drop_result.public_id
             button.disabled = True
@@ -1802,10 +1849,9 @@ class PackPickView(discord.ui.View):
             )
             new_content = self.full_content(extra)
 
-        # The interaction is still fresh because the lock only held in-memory state.
         edited = False
         try:
-            await interaction.response.edit_message(content=new_content, view=self)
+            await interaction.edit_original_response(content=new_content, view=self)
             edited = True
         except discord.NotFound:
             _LOG.warning(
@@ -1813,7 +1859,7 @@ class PackPickView(discord.ui.View):
                 uid,
             )
         except discord.HTTPException:
-            _LOG.exception("response.edit_message failed for user=%s claim", uid)
+            _LOG.exception("edit_original_response failed for user=%s claim", uid)
 
         if not edited:
             msg_obj = getattr(self, "message", None) or interaction.message
@@ -3191,6 +3237,8 @@ class GachaCog(commands.Cog):
     ) -> None:
         """Shared ``/cd`` pack flow (collage, claim buttons, missions, wishlist pings)."""
         uid = ctx.author.id
+        # Discord slash/components must be acknowledged within ~3s. Cooldown is a
+        # fast read; defer before writes, referrals, and pack roll.
         if apply_drop_accounting and not skip_cooldown:
             per = await self._effective_drop_cooldown_seconds(ctx, uid)
             now = time.time()
@@ -3206,6 +3254,12 @@ class GachaCog(commands.Cog):
                     else:
                         await ctx.send(msg, ephemeral=_hybrid_ephemeral(ctx))
                     return
+
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer(ephemeral=is_private)
+
+        if apply_drop_accounting and not skip_cooldown:
+            async with self.bot.async_session_factory() as session:
                 await self._wallet.record_drop(session, uid)
                 await clear_drop_reminder_after_drop(session, uid)
                 drop_use_notices = await MissionService().record_drop_use(session, uid)
@@ -3223,9 +3277,6 @@ class GachaCog(commands.Cog):
                     await notify_referral_first_pack(self.bot, referral_result.first_pack)
                 if referral_result.threshold is not None:
                     await notify_referral_reward(self.bot, referral_result.threshold)
-
-        if ctx.interaction and not ctx.interaction.response.is_done():
-            await ctx.defer(ephemeral=is_private)
 
         drop = DropService()
         guild_id = ctx.guild.id if ctx.guild is not None else None

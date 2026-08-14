@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 from discord.ext import commands, tasks
-from sqlalchemy.exc import SQLAlchemyError
 
 from poke_pon_bot.services.catalog_news import _site_origin, run_catalog_news_sync
 
@@ -46,7 +45,7 @@ class CatalogNewsCog(commands.Cog):
             messages = await self.run_once()
             for msg in messages:
                 _LOG.info("catalog news: %s", msg)
-        except SQLAlchemyError:
+        except Exception:
             _LOG.exception("catalog news sync failed")
 
     @_catalog_news_loop.before_loop
@@ -60,7 +59,7 @@ class CatalogNewsCog(commands.Cog):
             messages = await self.run_once()
             for msg in messages:
                 _LOG.info("catalog news startup: %s", msg)
-        except SQLAlchemyError:
+        except Exception:
             _LOG.exception("catalog news startup sync failed")
 
 

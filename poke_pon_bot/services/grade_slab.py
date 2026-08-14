@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
+from poke_pon_bot.services.grade_enchantments import (
+    GradeEnchantment,
+    enchantment_or_default,
+)
 from poke_pon_bot.services.grading import grade_label
 
 if TYPE_CHECKING:
@@ -51,6 +55,30 @@ def _truncate(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, m
     return (t + ell) if t else ell
 
 
+def _apply_enchantment_film(art: Image.Image, ench: GradeEnchantment) -> Image.Image:
+    """Bake a colored foil / film over card art for Discord slabs."""
+    w, h = art.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    r, g, b, a = ench.film
+    draw.rectangle((0, 0, w, h), fill=(r, g, b, max(18, min(a, 110))))
+    stripe_w = max(8, w // 18)
+    for i, x in enumerate(range(-h, w + h, stripe_w * 2)):
+        alpha = 28 + (i % 3) * 10
+        draw.polygon(
+            [(x, 0), (x + stripe_w, 0), (x + stripe_w + h, h), (x + h, h)],
+            fill=(255, 255, 255, alpha),
+        )
+    gloss = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(gloss)
+    gdraw.polygon(
+        [(0, 0), (int(w * 0.62), 0), (int(w * 0.28), h), (0, h)],
+        fill=(255, 255, 255, 40),
+    )
+    film = Image.alpha_composite(overlay, gloss)
+    return Image.alpha_composite(art.convert("RGBA"), film)
+
+
 async def render_graded_slab_png(
     card: Card,
     *,
@@ -58,6 +86,8 @@ async def render_graded_slab_png(
     copy_index: int,
     total_copies: int,
     cert_suffix: str,
+    enchantment_code: str | None = None,
+    rarity_name: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> io.BytesIO | None:
     """Build a slab composite PNG; returns file-like buffer for Discord ``File``."""
@@ -87,6 +117,10 @@ async def render_graded_slab_png(
     else:
         card_w, card_h = art.size
 
+    ench = enchantment_or_default(enchantment_code)
+    art = _apply_enchantment_film(art, ench)
+    accent = (*ench.accent, 255)
+
     inner_w = card_w + FRAME * 2
     canvas_w = inner_w + PAD * 2
     canvas_h = LABEL_H + card_h + FRAME * 2 + PAD * 2
@@ -112,8 +146,9 @@ async def render_graded_slab_png(
     ty += 30
 
     name_line = card.name.upper()
-    if card.tcg_rarity:
-        name_line += f" — {card.tcg_rarity.upper()}"
+    rarity_label = (rarity_name or card.tcg_rarity or "").strip()
+    if rarity_label:
+        name_line += f" — {rarity_label.upper()}"
     line2 = _truncate(draw, name_line, sub_font, rx - lx - 80)
     draw.text((lx, ty), line2, fill=TEXT, font=sub_font)
     ty += 26
@@ -124,9 +159,13 @@ async def render_graded_slab_png(
     gtxt = str(grade)
     glab = grade_label(grade)
     gw = draw.textlength(gtxt, font=grade_font)
-    draw.text((rx - gw, label_top + 22), gtxt, fill=ACCENT, font=grade_font)
+    draw.text((rx - gw, label_top + 22), gtxt, fill=accent, font=grade_font)
     lw = draw.textlength(glab, font=sub_font)
     draw.text((rx - lw, label_top + 88), glab, fill=MUTED, font=sub_font)
+
+    ench_line = _truncate(draw, ench.name.upper(), small_font, 220)
+    ew = draw.textlength(ench_line, font=small_font)
+    draw.text((rx - ew, label_top + 118), ench_line, fill=accent, font=small_font)
 
     cert = f"PP-{cert_suffix[:12].upper()}"
     cw = draw.textlength(cert, font=small_font)

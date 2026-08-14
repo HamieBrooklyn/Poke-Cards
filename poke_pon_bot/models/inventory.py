@@ -43,6 +43,7 @@ class UserCardInstance(Base):
     is_favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     grade: Mapped[int | None] = mapped_column(Integer, nullable=True)
     graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    grade_enchantment: Mapped[str | None] = mapped_column(String(32), nullable=True)
     craft_uses_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auction_obtained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

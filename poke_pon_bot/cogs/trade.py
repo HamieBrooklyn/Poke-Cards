@@ -41,7 +41,7 @@ async def _side_summary(session, instances: list, money: int) -> str:
         nm = card.name if card else "Unknown"
         pid = compact_public_id_for_line(inst.public_id)
         grade = int(inst.grade) if getattr(inst, "grade", None) is not None else None
-        lines.append(f"• **{nm}** `{pid}`{format_grade_slab_badge(grade)}")
+        lines.append(f"• **{nm}** `{pid}`{format_grade_slab_badge(grade, enchantment_code=getattr(inst, 'grade_enchantment', None))}")
     if money > 0:
         lines.append(f"• **{format_pokedollars(money)}**")
     if not lines:

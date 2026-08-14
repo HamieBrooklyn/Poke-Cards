@@ -174,7 +174,7 @@ class MissionsCog(commands.Cog):
 
     @commands.hybrid_command(
         name="missions",
-        aliases=[*pp_chat_aliases("missions", "mis")],
+        aliases=[*pp_chat_aliases("missions")],
         description="Daily and weekly missions for Crystals — chat: ppmissions",
     )
     async def missions_cmd(self, ctx: commands.Context) -> None:

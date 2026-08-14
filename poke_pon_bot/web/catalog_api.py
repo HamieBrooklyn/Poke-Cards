@@ -164,6 +164,11 @@ async def _owned_copies_for_card(
         }
         if inst.grade is not None:
             entry["grade_label"] = grade_label(int(inst.grade))
+            from poke_pon_bot.services.grade_enchantments import enchantment_api_payload
+
+            entry["enchantment"] = enchantment_api_payload(
+                getattr(inst, "grade_enchantment", None), graded=True
+            )
         out.append(entry)
     return out
 

@@ -301,6 +301,7 @@ class PokePonBot(commands.Bot):
         await self.load_extension("poke_pon_bot.cogs.dev")
         await self.load_extension("poke_pon_bot.cogs.gacha")
         await self.load_extension("poke_pon_bot.cogs.grading")
+        await self.load_extension("poke_pon_bot.cogs.market")
         await self.load_extension("poke_pon_bot.cogs.duel")
         await self.load_extension("poke_pon_bot.cogs.trade")
         await self.load_extension("poke_pon_bot.cogs.auction")

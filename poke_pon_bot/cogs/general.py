@@ -76,7 +76,7 @@ class General(commands.Cog):
             "**`/duel challenge`** — challenge someone, optional **bet**; both **Accept** / **Ready**; decks stay hidden until the fight. "
             "Turn-based: damage uses each attack’s **energy cost** as its type vs the defender’s **card types** (main-series matchups: **green** = super effective, **red** = not very effective / no effect, **grey** = neutral in the battle log). "
             "Winner takes the **pot**.\n"
-            "**`/pd`** / **`pcpd`** — wild **Poke-duel** for ₽. After each fight, **Next fight** starts a new battle on the same message. "
+            "**`/pd`** / **`pcpd`** — wild **Poke-duel** for ₽. Run the command again to spawn a new fight. "
             "Beat a rare (Illustration Rare+), high-HP (220+), or high-damage (170+) wild for a **💎 Crystal** bonus!",
             inline=False,
         )
@@ -107,8 +107,16 @@ class General(commands.Cog):
             inline=False,
         )
         e.add_field(
+            name="`marketcolv` — **card investing**",
+            value="**`/marketcolv`** / **`ppmarketcolv`** — flip **your collection** with live **TCGPlayer** chart; pass a **Card ID** (`ppmarketcolv <id>`) to jump to that copy. **Buy** opens a ₽ amount prompt, **Sell** closes the position. "
+            "**`/marketinveststatus`** / **`ppmis`** — list open investments. "
+            "You can only invest in printings you own. Same panel is on the website collection card → **Market** tab.",
+            inline=False,
+        )
+        e.add_field(
             name="`grade` — **PSA-style grading**",
             value="**`/grade`** — slab view for a copy in your collection; **roll** or **reroll** for **15** 💎. "
+            "High grades (**7+**) can **bump display rarity** (never drops). Each roll also grants a random **enchantment film** (rarer films are harder to hit). "
             "High grades (**7+**) add a small **shop sell bonus**. Slab badges show on trades, auctions, and leaderboards.",
             inline=False,
         )

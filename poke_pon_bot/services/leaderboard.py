@@ -11,7 +11,11 @@ from poke_pon_bot.models.auction import AUCTION_STATUS_ENDED_SOLD, CardAuction
 from poke_pon_bot.models.card import Card
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.rarity import RarityClass
-from poke_pon_bot.services.grading import grade_label, grading_fields_for_instance
+from poke_pon_bot.services.grading import (
+    effective_rarity_sort_order,
+    grade_label,
+    grading_fields_for_instance,
+)
 from poke_pon_bot.services.guild_milestones import (
     GUILD_STAT_CATEGORIES,
     GUILD_STAT_TITLES,
@@ -144,7 +148,7 @@ async def leaderboard_rarest(
 
     best: dict[int, tuple[str, str, int, int | None]] = {}
     for uid, name, rarity_name, sort_order, grade in rows:
-        order = int(sort_order) if sort_order else 0
+        order = effective_rarity_sort_order(int(sort_order) if sort_order else 0, grade)
         prev = best.get(uid)
         if prev is None or order > prev[2]:
             best[uid] = (
@@ -360,7 +364,9 @@ async def leaderboard_rarest_web(
     best: dict[int, tuple[str, str, int, dict[str, Any]]] = {}
     for inst, card, rarity_name, sort_order in rows:
         uid = int(inst.discord_user_id)
-        order = int(sort_order) if sort_order else 0
+        order = effective_rarity_sort_order(
+            int(sort_order) if sort_order else 0, inst.grade
+        )
         prev = best.get(uid)
         if prev is None or order > prev[2]:
             best[uid] = (

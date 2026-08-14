@@ -49,6 +49,7 @@ from poke_pon_bot.services.grading import (
     grade_label,
     grading_api_payload,
     load_owned_instance_for_grading,
+    rarity_for_graded_instance,
     remove_grade,
     roll_grade_for_instance,
 )
@@ -161,13 +162,15 @@ def _apply_collection_sort(base, *, sort: str, duplicates_only: bool):
     return base.order_by(desc(UserCardInstance.obtained_at))
 
 
-def _sell_payload_for_copy(
+async def _sell_payload_for_copy(
+    db: Any,
     inst: UserCardInstance,
     card: Card,
     rarity: RarityClass | None,
     blocked_reason: str | None,
 ) -> dict[str, Any]:
     """Shop sell terms — same quote and block rules as Discord ``/colv``."""
+    rarity = await rarity_for_graded_instance(db, card, inst, printed=rarity)
     if rarity is None:
         return {
             "quote_pokedollars": None,
@@ -209,6 +212,7 @@ def _serialize_instance(
         "craft_uses": craft_uses_payload(inst, card),
         "sell": sell,
         "card": {
+            "id": int(card.id),
             "name": card.name,
             "set_code": card.set_code,
             "set_name": card.set_name,
@@ -254,6 +258,13 @@ async def _grading_payload(
             "can_roll": True,
             "can_remove": g is not None,
         }
+        from poke_pon_bot.services.grade_enchantments import enchantment_api_payload
+        from poke_pon_bot.services.grading import grade_rarity_bump
+
+        payload["enchantment"] = enchantment_api_payload(
+            getattr(inst, "grade_enchantment", None), graded=g is not None
+        )
+        payload["rarity_bump"] = grade_rarity_bump(g)
     if inst.grade is not None and inst.public_id:
         payload["slab_url"] = f"/api/me/cards/{inst.public_id}/slab"
     return payload
@@ -268,8 +279,18 @@ async def _serialize_instance_row(
     sell: dict[str, Any],
     grading_full: bool = False,
 ) -> dict[str, Any]:
+    printed = rarity
+    if printed is None:
+        printed = await db.get(RarityClass, card.rarity_class_id)
+    rarity = await rarity_for_graded_instance(db, card, inst, printed=printed)
     payload = _serialize_instance(inst, card, rarity, sell=sell)
     payload["grading"] = await _grading_payload(db, inst, full=grading_full)
+    if printed is not None:
+        payload["card"]["printed_rarity"] = {
+            "code": printed.code,
+            "display_name": printed.display_name,
+            "sort_order": int(printed.sort_order),
+        }
     return payload
 
 
@@ -524,8 +545,8 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                             inst,
                             card,
                             rar,
-                            sell=_sell_payload_for_copy(
-                                inst, card, rar, block_map.get(inst.id)
+                            sell=await _sell_payload_for_copy(
+                                db, inst, card, rar, block_map.get(inst.id)
                             ),
                         )
                     )
@@ -583,7 +604,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     inst,
                     card,
                     rar,
-                    sell=_sell_payload_for_copy(inst, card, rar, blocked),
+                    sell=await _sell_payload_for_copy(db, inst, card, rar, blocked),
                     grading_full=True,
                 )
                 payload["evolution"] = await _build_evolution_payload(
@@ -635,6 +656,12 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                 if row is None:
                     return web.json_response({"error": "not found"}, status=404)
                 inst, card, rar = row
+                if rar is None:
+                    return web.json_response(
+                        {"error": "rarity data missing — try again after a sync."},
+                        status=400,
+                    )
+                rar = await rarity_for_graded_instance(db, card, inst, printed=rar)
                 if rar is None:
                     return web.json_response(
                         {"error": "rarity data missing — try again after a sync."},
@@ -766,6 +793,12 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                             {"public_id": pid, "ok": False, "error": "rarity_missing"}
                         )
                         continue
+                    rar = await rarity_for_graded_instance(db, card, inst, printed=rar)
+                    if rar is None:
+                        out_items.append(
+                            {"public_id": pid, "ok": False, "error": "rarity_missing"}
+                        )
+                        continue
                     blocked = blocked_map.get(int(inst.id))
                     if blocked is not None:
                         out_items.append(
@@ -873,6 +906,11 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                         return web.json_response(
                             {"error": "rarity_missing", "public_id": pid}, status=400
                         )
+                    rar = await rarity_for_graded_instance(db, card, inst, printed=rar)
+                    if rar is None:
+                        return web.json_response(
+                            {"error": "rarity_missing", "public_id": pid}, status=400
+                        )
                     blocked = blocked_map.get(int(inst.id))
                     if blocked is not None:
                         return web.json_response(
@@ -967,7 +1005,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     inst,
                     card,
                     rar,
-                    sell=_sell_payload_for_copy(inst, card, rar, blocked),
+                    sell=await _sell_payload_for_copy(db, inst, card, rar, blocked),
                     grading_full=True,
                 )
                 payload["evolution"] = await _build_evolution_payload(
@@ -1015,8 +1053,8 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                                 inst,
                                 card,
                                 rar,
-                                sell=_sell_payload_for_copy(
-                                    inst, card, rar, sell_blocked
+                                sell=await _sell_payload_for_copy(
+                                    db, inst, card, rar, sell_blocked
                                 ),
                             )
                         )
@@ -1092,7 +1130,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     new_inst,
                     new_card,
                     new_rar,
-                    sell=_sell_payload_for_copy(new_inst, new_card, new_rar, blocked),
+                    sell=await _sell_payload_for_copy(db, new_inst, new_card, new_rar, blocked),
                     grading_full=True,
                 )
                 card_payload["evolution"] = await _build_evolution_payload(
@@ -1134,7 +1172,7 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
             inst,
             card,
             rar,
-            sell=_sell_payload_for_copy(inst, card, rar, blocked),
+            sell=await _sell_payload_for_copy(db, inst, card, rar, blocked),
             grading_full=True,
         )
         payload["evolution"] = await _build_evolution_payload(db, inst, card, rar)
@@ -1258,12 +1296,17 @@ def register_collection_api(app: web.Application, *, bot: Any, settings: Any) ->
                     instance_id=inst.id,
                 )
                 cert = (inst.public_id or str(inst.id))[:12]
+                from poke_pon_bot.services.grading import rarity_name_pair
+
+                _printed, effective_name = await rarity_name_pair(db, card, inst)
                 png = await render_graded_slab_png(
                     card,
                     grade=int(inst.grade),
                     copy_index=idx.copy_index,
                     total_copies=idx.total_copies,
                     cert_suffix=cert,
+                    enchantment_code=getattr(inst, "grade_enchantment", None),
+                    rarity_name=effective_name,
                 )
                 if png is None:
                     raise web.HTTPNotFound()

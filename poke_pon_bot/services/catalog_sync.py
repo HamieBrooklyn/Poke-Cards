@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -214,14 +214,9 @@ async def fetch_sets_released_since(
         if not sid or is_excluded_set_code(sid):
             continue
         release_raw = str(d.get("releaseDate") or "").strip()
-        if release_raw:
-            try:
-                release_day = datetime.fromisoformat(release_raw).date()
-            except ValueError:
-                release_day = None
-        else:
-            release_day = None
-        if release_day is not None and release_day < cutoff:
+        release_day = _parse_tcg_release_date(release_raw)
+        # Skip undated sets — otherwise lookback is useless and we sync noise.
+        if release_day is None or release_day < cutoff:
             continue
         out.append(
             TcgSetMeta(
@@ -231,8 +226,27 @@ async def fetch_sets_released_since(
             )
         )
 
-    out.sort(key=lambda s: s.release_date or "", reverse=True)
+    out.sort(
+        key=lambda s: _parse_tcg_release_date(s.release_date) or date.min,
+        reverse=True,
+    )
     return out
+
+
+def _parse_tcg_release_date(raw: str | None) -> date | None:
+    """Pokémon TCG API uses ``YYYY/MM/DD``; also accept ISO ``YYYY-MM-DD``."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        return None
 
 
 async def _rarity_lookup(session: AsyncSession) -> tuple[dict[str, int], dict[str, int]]:
@@ -453,7 +467,7 @@ async def sync_curated_sets(
             for rc in (await session.execute(select(RarityClass))).scalars()
         }
 
-        async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
+        async with httpx.AsyncClient(headers=headers, timeout=120.0) as client:
             for set_id in set_ids:
                 had_cards = int(
                     await session.scalar(

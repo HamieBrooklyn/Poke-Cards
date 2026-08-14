@@ -493,7 +493,7 @@ class AuctionCog(commands.Cog):
             spot = " ✨" if auction_spotlight_active(auc) else ""
             lines.append(
                 f"• **`{auc.id}`**{spot} **{card.name}** — *{r}* · {card.set_name} `#{card.collector_number}`"
-                f"{format_grade_slab_badge(grade)} · "
+                f"{format_grade_slab_badge(grade, enchantment_code=getattr(inst, 'grade_enchantment', None))} · "
                 f"{bid_note} · **{time_left}** · seller <@{auc.seller_discord_id}> · `{pid}`",
             )
         rest = total - len(rows)

@@ -27,7 +27,7 @@ PP_BARE_SHORTCUTS: dict[str, str] = {
     "ev": "cevolve",
     "gr": "grade",
     "tut": "tutorial",
-    "mis": "missions",
+    "mis": "marketinveststatus",
     "kcol": "packcolv",
     "packc": "packcolv",
     "pcat": "packcat",

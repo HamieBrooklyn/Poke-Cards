@@ -1,0 +1,26 @@
+---
+description: Commit and push website changes to the website repository when finished
+globs: /Users/hamie/Documents/GitHub/hamiebrooklyn.github.io/**
+alwaysApply: true
+---
+
+# Website Repository Workflow
+
+The public website lives in a **separate repository** at `/Users/hamie/Documents/GitHub/hamiebrooklyn.github.io`.
+
+When changes in this bot repo affect the website (new API endpoints, data format changes, new features with a web UI), apply the corresponding frontend changes to the website repo too.
+
+**Before any production deploy or website push:** follow `.cursor/rules/staging-before-production.mdc` — `deploy-mac-staging.sh`, verify on `https://pokepon.org/.../?api=https://api-staging.pokepon.org`, then promote.
+
+When you finish making changes to any file inside that repository (HTML, CSS, JS, images, etc.):
+
+1. **Confirm staging test passed** for this change set.
+2. Stage the changed files: `git add` the relevant paths.
+3. Commit with a concise message describing the change.
+4. **Push (sync) to the remote** on branch **`main`** (GitHub Pages deploys from `main`) — committing alone is not enough:
+   `git push origin main`
+   If you also maintain `master`, keep it in sync: `git push origin main:master`
+4. If commits already exist locally but were not pushed yet, push them before ending the task.
+5. After pushing, confirm the live file changed if the user reports stale UI (hard refresh may still be needed for browser cache).
+
+Always commit **and** push automatically at the end of the task — do not wait for the user to ask.
