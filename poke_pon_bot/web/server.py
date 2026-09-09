@@ -174,6 +174,9 @@ async def start_web_server(bot: Any) -> WebServer | None:
         register_trade_ws(app, bot=bot, settings=settings)
         register_duel_api(app, bot=bot, settings=settings)
         register_duel_ws(app, bot=bot, settings=settings)
+        from poke_pon_bot.web.tcg_api import register_tcg_api
+
+        register_tcg_api(app, bot=bot, settings=settings)
         register_profile_api(app, bot=bot, settings=settings)
         register_leaderboard_api(app, bot=bot, settings=settings)
         register_guild_milestones_api(app, bot=bot, settings=settings)

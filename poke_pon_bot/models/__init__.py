@@ -9,6 +9,8 @@ from poke_pon_bot.models.combat_deck import UserCombatDeck
 from poke_pon_bot.models.crystals import UserCrystals
 from poke_pon_bot.models.drops import DropTable, DropWeight
 from poke_pon_bot.models.duel_session import DuelSession
+from poke_pon_bot.models.tcg_card import TcgCardDefinition
+from poke_pon_bot.models.tcg_match import TcgLobby, TcgSavedDeck, TcgCommand
 from poke_pon_bot.models.inventory import UserCardInstance
 from poke_pon_bot.models.pack_instance import UserPackInstance
 from poke_pon_bot.models.pending_trade import PendingTrade
@@ -32,6 +34,10 @@ __all__ = [
     "DropTable",
     "DropWeight",
     "DuelSession",
+    "TcgCardDefinition",
+    "TcgLobby",
+    "TcgSavedDeck",
+    "TcgCommand",
     "RarityClass",
     "TcgRarityMapping",
     "UserCardInstance",
